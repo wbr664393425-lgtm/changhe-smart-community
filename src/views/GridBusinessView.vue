@@ -2529,4 +2529,53 @@ onBeforeUnmount(() => clearInterval(patrolTimer))
   background: var(--sunken);
   font-size: 12.5px;
 }
+
+@media (max-width: 768px) {
+  .inbox-list {
+    max-height: 280px;
+  }
+  .dual-photo-box {
+    grid-template-columns: 1fr;
+  }
+  .bldg-main-panel {
+    height: 520px;
+  }
+  .bldg-detail-panel {
+    max-height: none;
+  }
+  .bldg-scroll-viewport {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .bldg-roof,
+  .bldg-unit-header,
+  .bldg-elevation-body {
+    min-width: 500px;
+  }
+  .bldg-toolbar,
+  .bldg-legend-bar,
+  .status-switch-row,
+  .rc-head {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .biz-floor {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .bs-meta {
+    margin-left: 0;
+    width: 100%;
+  }
+  .district-selected-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+@media (max-width: 460px) {
+  .podium-shops-grid {
+    grid-template-columns: 1fr;
+  }
+}
 </style>

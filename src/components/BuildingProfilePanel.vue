@@ -2068,4 +2068,40 @@ const AID_ITEM_META = [
   font-size: 12px;
   color: var(--ink-soft);
 }
+
+@media (max-width: 768px) {
+  .bpd-split {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  .bpd-detail-col {
+    position: static;
+    padding: 12px;
+  }
+  .bpd-matrix-col {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .bpd-unit-head,
+  .bpd-m-row:not(.simple) {
+    min-width: 480px;
+  }
+  .bpd-matrix-rows {
+    max-height: 360px;
+  }
+  .bpd-shop-grid {
+    grid-template-columns: 1fr;
+  }
+  .bpd-foot {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .bp-quad-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .bp-cat-pills {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 </style>

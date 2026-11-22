@@ -1,9 +1,9 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import {
   Compass, Database, BookOpen, Shield, Layers, Table2,
-  Smartphone, Server, WifiOff, PanelLeftClose, PanelLeftOpen, Monitor
+  Smartphone, Server, WifiOff, PanelLeftClose, PanelLeftOpen, Monitor, Menu, X
 } from 'lucide-vue-next'
 import AppSelect from './AppSelect.vue'
 import BrandLogo from './BrandLogo.vue'
@@ -26,6 +26,20 @@ const collapsedGroups = ref({})
 const dropdownOpen = ref(false)
 const accountBtnRef = ref(null)
 const dropdownStyle = ref({})
+const isMobileNav = ref(false)
+const mobileNavOpen = ref(false)
+let mobileMq = null
+
+const isSidebarCollapsed = computed(() => !isMobileNav.value && store.sidebarCollapsed)
+
+function updateMobileMq(e) {
+  isMobileNav.value = !!e.matches
+  if (!isMobileNav.value) mobileNavOpen.value = false
+}
+
+function closeMobileNav() {
+  mobileNavOpen.value = false
+}
 
 const currentRole = computed(() => getCurrentRole())
 const effectiveScope = computed(() => getEffectiveCommunity())
@@ -139,10 +153,19 @@ function isItemActive(it) {
 }
 
 function goNav(it) {
+  closeMobileNav()
   router.push(it.query ? { path: it.path, query: it.query } : it.path)
 }
 
 function toggleSidebar() {
+  if (isMobileNav.value) {
+    mobileNavOpen.value = !mobileNavOpen.value
+    if (mobileNavOpen.value) {
+      dropdownOpen.value = false
+      window.dispatchEvent(new CustomEvent('rui:close-popovers', { detail: { source: 'mobile-nav' } }))
+    }
+    return
+  }
   store.sidebarCollapsed = !store.sidebarCollapsed
   setTimeout(() => {
     window.dispatchEvent(new Event('resize'))
@@ -201,6 +224,7 @@ function handleSwitchRole(roleId) {
 
 function goLogout() {
   dropdownOpen.value = false
+  closeMobileNav()
   store.loggedIn = false
   router.push('/login')
 }
@@ -213,10 +237,11 @@ function toggleAccountMenu() {
   window.dispatchEvent(new CustomEvent('rui:close-popovers', { detail: { source: 'account-menu' } }))
   if (accountBtnRef.value) {
     const r = accountBtnRef.value.getBoundingClientRect()
-    const w = 264
+    const w = Math.min(264, window.innerWidth - 24)
     dropdownStyle.value = {
       top: `${Math.round(r.bottom + 8)}px`,
       left: `${Math.max(12, Math.min(r.right - w, window.innerWidth - w - 12))}px`,
+      width: `${w}px`,
       right: 'auto'
     }
   }
@@ -237,9 +262,13 @@ function onDocClick(e) {
 }
 
 function onGlobalKey(e) {
-  if (e.key === 'Escape' && dropdownOpen.value) {
-    dropdownOpen.value = false
-    accountBtnRef.value?.focus()
+  if (e.key === 'Escape') {
+    if (dropdownOpen.value) {
+      dropdownOpen.value = false
+      accountBtnRef.value?.focus()
+    } else if (mobileNavOpen.value) {
+      closeMobileNav()
+    }
   }
 }
 
@@ -249,14 +278,24 @@ function onGlobalClosePopovers(e) {
   }
 }
 
+watch(() => route.fullPath, () => {
+  closeMobileNav()
+})
+
 onMounted(() => {
   document.body.classList.remove('view-cockpit', 'cockpit-dark')
+  if (typeof window !== 'undefined' && window.matchMedia) {
+    mobileMq = window.matchMedia('(max-width: 960px)')
+    isMobileNav.value = mobileMq.matches
+    mobileMq.addEventListener?.('change', updateMobileMq)
+  }
   document.addEventListener('click', onDocClick)
   document.addEventListener('keydown', onGlobalKey)
   window.addEventListener('rui:close-popovers', onGlobalClosePopovers)
 })
 
 onBeforeUnmount(() => {
+  mobileMq?.removeEventListener?.('change', updateMobileMq)
   document.removeEventListener('click', onDocClick)
   document.removeEventListener('keydown', onGlobalKey)
   window.removeEventListener('rui:close-popovers', onGlobalClosePopovers)
@@ -265,30 +304,55 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="admin-stage">
-    <div class="app-frame" :class="{ 'sidebar-collapsed': store.sidebarCollapsed }">
-      <!-- 左侧菜单栏（支持完整 266px 导航与 68px 精致图标轨自由收起） -->
-      <aside class="pg-sidebar" :class="{ collapsed: store.sidebarCollapsed }" aria-label="全量业务功能目录">
-        <div
-          class="pg-brand"
-          style="cursor: pointer"
-          :title="store.sidebarCollapsed ? '长河街道智慧社区 · 返回工作总览' : ''"
-          @click="router.push('/portal')"
-        >
-          <BrandLogo :size="store.sidebarCollapsed ? 32 : 36" />
-          <div v-if="!store.sidebarCollapsed" class="pg-brand-text">
-            <strong>长河街道智慧社区</strong>
-            <small>天衢新区 · 综合治理平台</small>
+    <div class="app-frame" :class="{ 'sidebar-collapsed': isSidebarCollapsed, 'mobile-nav-open': mobileNavOpen }">
+      <!-- 移动端侧滑抽屉遮罩 -->
+      <div
+        v-if="isMobileNav && mobileNavOpen"
+        class="pg-mobile-scrim"
+        aria-hidden="true"
+        @click="closeMobileNav"
+      ></div>
+
+      <!-- 左侧菜单栏（桌面端支持 266px / 68px 自由收起，移动端 <=960px 转为滑出式抽屉） -->
+      <aside
+        class="pg-sidebar"
+        :class="{ collapsed: isSidebarCollapsed, 'mobile-open': mobileNavOpen }"
+        :role="isMobileNav ? 'dialog' : undefined"
+        :aria-modal="isMobileNav && mobileNavOpen ? 'true' : undefined"
+        aria-label="全量业务功能目录"
+      >
+        <div class="pg-brand-row">
+          <div
+            class="pg-brand"
+            style="cursor: pointer"
+            :title="isSidebarCollapsed ? '长河街道智慧社区 · 返回工作总览' : ''"
+            @click="closeMobileNav(); router.push('/portal')"
+          >
+            <BrandLogo :size="isSidebarCollapsed ? 32 : 36" />
+            <div v-if="!isSidebarCollapsed" class="pg-brand-text">
+              <strong>长河街道智慧社区</strong>
+              <small>天衢新区 · 综合治理平台</small>
+            </div>
           </div>
+          <button
+            v-if="isMobileNav"
+            type="button"
+            class="pg-mobile-close"
+            aria-label="关闭导航菜单"
+            @click="closeMobileNav"
+          >
+            <X :size="18" />
+          </button>
         </div>
 
         <button
           v-if="currentRole.allowedRoutes.includes('/cockpit')"
           type="button"
           class="pg-cockpit-entry"
-          :title="store.sidebarCollapsed ? '领导驾驶舱大屏' : ''"
-          @click="router.push('/cockpit')"
+          :title="isSidebarCollapsed ? '领导驾驶舱大屏' : ''"
+          @click="closeMobileNav(); router.push('/cockpit')"
         >
-          <template v-if="!store.sidebarCollapsed">
+          <template v-if="!isSidebarCollapsed">
             <div>
               <strong>领导驾驶舱大屏</strong>
               <small>一屏双态 · 14 社区治理一张图</small>
@@ -301,7 +365,7 @@ onBeforeUnmount(() => {
         </button>
 
         <!-- 展开态：检索栏 + 分组目录 -->
-        <template v-if="!store.sidebarCollapsed">
+        <template v-if="!isSidebarCollapsed">
           <div class="pg-menu-tools">
             <input
               v-model="menuSearch"
@@ -405,11 +469,13 @@ onBeforeUnmount(() => {
             <button
               type="button"
               class="sidebar-toggle-btn"
-              :title="store.sidebarCollapsed ? '展开左侧菜单栏' : '收起左侧菜单栏'"
-              :aria-label="store.sidebarCollapsed ? '展开左侧菜单栏' : '收起左侧菜单栏'"
+              :title="isMobileNav ? (mobileNavOpen ? '关闭菜单' : '打开导航菜单') : (store.sidebarCollapsed ? '展开左侧菜单栏' : '收起左侧菜单栏')"
+              :aria-label="isMobileNav ? (mobileNavOpen ? '关闭菜单' : '打开导航菜单') : (store.sidebarCollapsed ? '展开左侧菜单栏' : '收起左侧菜单栏')"
+              :aria-expanded="isMobileNav ? mobileNavOpen : undefined"
               @click="toggleSidebar"
             >
-              <PanelLeftOpen v-if="store.sidebarCollapsed" :size="16" />
+              <Menu v-if="isMobileNav" :size="18" />
+              <PanelLeftOpen v-else-if="store.sidebarCollapsed" :size="16" />
               <PanelLeftClose v-else :size="16" />
             </button>
             <div class="pg-top-title">
@@ -440,7 +506,7 @@ onBeforeUnmount(() => {
             </div>
 
             <AppSelect
-              style="width: 152px"
+              class="pg-scope-select"
               aria-label="切换辖区范围"
               :model-value="effectiveScope"
               :options="scopeOptions"
@@ -460,7 +526,7 @@ onBeforeUnmount(() => {
               @click.stop="toggleAccountMenu"
             >
               <span class="account-avatar">{{ currentRole.userName.slice(0, 1) }}</span>
-              <span>{{ currentRole.name }}</span>
+              <span class="account-role-name">{{ currentRole.name }}</span>
             </button>
           </div>
         </header>

@@ -539,4 +539,24 @@ function replyPatrolSupervise(pt) {
   color: var(--brand-2);
   background: var(--brand-soft);
 }
+
+@media (max-width: 640px) {
+  .phone-frame {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    min-height: 460px;
+    border: var(--hair) solid var(--line-strong);
+    border-radius: var(--r-card);
+    box-shadow: var(--e1);
+  }
+  .pf-body {
+    overflow: visible;
+  }
+  .pf-nav {
+    position: sticky;
+    bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
 </style>

@@ -1478,4 +1478,67 @@ function submitMaterial() {
   border-color: var(--army-green);
   background: var(--brand-soft);
 }
+
+@media (max-width: 768px) {
+  .comm-search-wrap {
+    width: 100%;
+  }
+  .party-ruler {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .funnel-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .armed-map-box,
+  .armed-map-box.tall {
+    min-height: 290px;
+    height: 300px;
+  }
+  .photo-strip.cols-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .place-card {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 10px 12px;
+  }
+  .pc-nums {
+    flex-wrap: wrap;
+    gap: 8px 12px;
+  }
+  .redhead-paper,
+  .course-paper {
+    padding: 18px 14px;
+  }
+  .rh-org {
+    font-size: 16px;
+    letter-spacing: 1px;
+  }
+  .rh-content {
+    font-size: 13.5px;
+    line-height: 1.75;
+  }
+  .rh-seal {
+    width: 64px;
+    height: 64px;
+    font-size: 9.5px;
+    right: 4px;
+  }
+  .viewer-nav {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .lm-row {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 440px) {
+  .photo-strip.cols-2,
+  .photo-strip.cols-3 {
+    grid-template-columns: 1fr;
+  }
+}
 </style>

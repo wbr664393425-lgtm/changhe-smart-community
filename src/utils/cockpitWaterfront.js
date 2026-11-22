@@ -1,8 +1,8 @@
 import * as THREE from 'three'
 import { Reflector } from 'three/addons/objects/Reflector.js'
 import layout from './changheWaterfront.json'
-import { buildCockpitBridges } from './cockpitBridges'
-import { buildCockpitGroves } from './cockpitGroves'
+import { buildCockpitBridges, buildCockpitBridgesAsync } from './cockpitBridges'
+import { buildCockpitGroves, buildCockpitGrovesAsync } from './cockpitGroves'
 
 // 倒影只绘制静态桥岸与树冠。主相机仍使用默认图层。
 export const WATER_REFLECTION_LAYER = 1
@@ -247,6 +247,156 @@ function getOrBuildWaterfrontGeos(xWest, zNorth, xEast, zSouth, point, scaleX, s
 
   cachedWaterfrontGeos = { waterGeometry, bankGeometry }
   return cachedWaterfrontGeos
+}
+
+async function getOrBuildWaterfrontGeosAsync(xWest, zNorth, xEast, zSouth, point, scaleX, scaleZ, width, height, yieldFn) {
+  if (cachedWaterfrontGeos) return cachedWaterfrontGeos
+
+  const wPos = [], wNorm = [], wUvs = [], wRiver = [], wIdx = []
+  let wvOffset = 0
+  const bPos = [], bNorm = [], bColors = [], bIdx = []
+  let bvOffset = 0
+  const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3()
+
+  function roundedBank(pixels) {
+    const ring = pixels.map(point)
+    return ring.flatMap((v, i) => {
+      const [x, y] = pixels[i]
+      if (x === 0 || y === 0 || x === width - 1 || y === height - 1) return [v]
+      const prev = ring[(i + ring.length - 1) % ring.length], next = ring[(i + 1) % ring.length]
+      const radius = Math.min(1.22, v.distanceTo(prev) * 0.23, v.distanceTo(next) * 0.23)
+      const a = v.clone().lerp(prev, radius / v.distanceTo(prev))
+      const b = v.clone().lerp(next, radius / v.distanceTo(next))
+      return [a, v.clone().multiplyScalar(0.5).addScaledVector(a, 0.25).addScaledVector(b, 0.25), b]
+    })
+  }
+
+  let sliceStart = performance.now()
+  for (const [index, polygon] of layout.water.entries()) {
+    const river = index === layout.riverIndex
+    const rings = polygon.map(roundedBank)
+    const vertices = rings.flat()
+    const baseW = wvOffset
+    for (let vi = 0; vi < vertices.length; vi++) {
+      const { x, y: z } = vertices[vi]
+      wPos.push(x, -z, 0)
+      wNorm.push(0, 0, 1)
+      wRiver.push(river ? 1 : 0)
+      wUvs.push((x - xWest) / (xEast - xWest), (zSouth - z) / (zSouth - zNorth))
+      wvOffset++
+    }
+    for (const face of THREE.ShapeUtils.triangulateShape(rings[0], rings.slice(1))) {
+      wIdx.push(baseW + face[2], baseW + face[1], baseW + face[0])
+    }
+    if (yieldFn && performance.now() - sliceStart >= 3.5) {
+      await yieldFn()
+      sliceStart = performance.now()
+    }
+
+    for (const ring of rings) {
+      const offsets = ring.map((v, i) => {
+        const prev = ring[(i + ring.length - 1) % ring.length], next = ring[(i + 1) % ring.length]
+        const a = new THREE.Vector2(v.y - prev.y, prev.x - v.x).normalize()
+        const b = new THREE.Vector2(next.y - v.y, v.x - next.x).normalize()
+        const miter = a.clone().add(b).normalize()
+        return miter.multiplyScalar(1 / Math.max(0.63, miter.dot(b)))
+      })
+      const section = river
+        ? [[-0.48,0.03,0.69], [-0.24,0.12,0.78], [0.19,0.055,0.72], [0.25,0.045,0.60]]
+        : [[-0.34,0.03,0.69], [-0.16,0.36,0.82], [0.14,0.36,1.00],
+          [0.16,0.17,0.55], [0.36,0.12,0.79], [0.40,0.045,0.58]]
+      for (let i = 0; i < ring.length; i++) {
+        const j = (i + 1) % ring.length, a = ring[i], b = ring[j]
+        if ((Math.abs(a.x - b.x) < 0.001 && (a.x < xWest + scaleX || a.x > xEast - scaleX)) ||
+            (Math.abs(a.y - b.y) < 0.001 && (a.y < zNorth + scaleZ || a.y > zSouth - scaleZ))) continue
+        for (let k = 0; k < section.length - 1; k++) {
+          const [off0, y0, shade] = section[k]
+          const [off1, y1] = section[k + 1]
+          const ax0 = ring[i].x + offsets[i].x * off0, az0 = ring[i].y + offsets[i].y * off0
+          const bx0 = ring[j].x + offsets[j].x * off0, bz0 = ring[j].y + offsets[j].y * off0
+          const bx1 = ring[j].x + offsets[j].x * off1, bz1 = ring[j].y + offsets[j].y * off1
+          const ax1 = ring[i].x + offsets[i].x * off1, az1 = ring[i].y + offsets[i].y * off1
+          e1.set(bx0 - ax0, y0 - y0, bz0 - az0)
+          e2.set(bx1 - ax0, y1 - y0, bz1 - az0)
+          fn.crossVectors(e1, e2).normalize()
+          const r = shade * (river ? 0.72 : 1), g = shade, bl = shade * (river ? 0.77 : 1)
+          const base = bvOffset
+          bPos.push(ax0, y0, az0, bx0, y0, bz0, bx1, y1, bz1, ax1, y1, az1)
+          bNorm.push(fn.x, fn.y, fn.z, fn.x, fn.y, fn.z, fn.x, fn.y, fn.z, fn.x, fn.y, fn.z)
+          bColors.push(r, g, bl, r, g, bl, r, g, bl, r, g, bl)
+          bIdx.push(base, base + 1, base + 2, base, base + 2, base + 3)
+          bvOffset += 4
+        }
+      }
+      if (yieldFn && performance.now() - sliceStart >= 3.5) {
+        await yieldFn()
+        sliceStart = performance.now()
+      }
+    }
+  }
+
+  const waterGeometry = new THREE.BufferGeometry()
+  waterGeometry.setAttribute('position', new THREE.Float32BufferAttribute(wPos, 3))
+  waterGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(wNorm, 3))
+  waterGeometry.setAttribute('riverMask', new THREE.Float32BufferAttribute(wRiver, 1))
+  waterGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(wUvs, 2))
+  waterGeometry.setIndex(wvOffset <= 65535 ? new THREE.Uint16BufferAttribute(wIdx, 1) : new THREE.Uint32BufferAttribute(wIdx, 1))
+  waterGeometry.computeBoundingSphere()
+
+  const bankGeometry = new THREE.BufferGeometry()
+  bankGeometry.setAttribute('position', new THREE.Float32BufferAttribute(bPos, 3))
+  bankGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(bNorm, 3))
+  bankGeometry.setAttribute('color', new THREE.Float32BufferAttribute(bColors, 3))
+  bankGeometry.setIndex(bvOffset <= 65535 ? new THREE.Uint16BufferAttribute(bIdx, 1) : new THREE.Uint32BufferAttribute(bIdx, 1))
+  bankGeometry.computeBoundingSphere()
+
+  cachedWaterfrontGeos = { waterGeometry, bankGeometry }
+  return cachedWaterfrontGeos
+}
+
+export async function createCockpitWaterfrontAsync(xWest, zNorth, xEast, zSouth, shoreDistance, compact, yieldFn) {
+  const group = new THREE.Group()
+  const [width, height] = layout.size
+  const scaleX = (xEast - xWest) / width, scaleZ = (zSouth - zNorth) / height
+  const point = ([x, y]) => new THREE.Vector2(xWest + (x + 0.5) * scaleX, zNorth + (y + 0.5) * scaleZ)
+
+  const { waterGeometry, bankGeometry } = await getOrBuildWaterfrontGeosAsync(
+    xWest, zNorth, xEast, zSouth, point, scaleX, scaleZ, width, height, yieldFn
+  )
+  if (yieldFn) await yieldFn()
+  const water = createWater(waterGeometry, shoreDistance, compact)
+  const bankMaterial = new THREE.MeshStandardMaterial({ roughness: 0.89, vertexColors: true })
+  const bank = new THREE.Mesh(bankGeometry, bankMaterial)
+  bank.receiveShadow = bank.castShadow = true
+  bank.userData.sharedGeo = true
+  if (yieldFn) await yieldFn()
+
+  const bridges = await buildCockpitBridgesAsync(layout, point, scaleX, yieldFn)
+  if (yieldFn) await yieldFn()
+
+  const groves = await buildCockpitGrovesAsync(layout.trees, point, scaleX, yieldFn)
+  if (yieldFn) await yieldFn()
+
+  for (const obj of [bank, bridges.group, groves.group]) {
+    obj.traverse(part => { if (part.isMesh && !part.material.transparent) part.layers.enable(WATER_REFLECTION_LAYER) })
+  }
+  group.add(water.mesh, bank, bridges.group, groves.group)
+  const [west, east] = layout.bridges.find(b => b.name === '东方红路').ends.map(point)
+  return {
+    group,
+    bridgeFocus: west.lerp(east, 0.5),
+    parkFocus: point([457, 366]),
+    advance: water.advance,
+    setReflectionPaused: water.setReflectionPaused,
+    updateTreeDetail: groves.updateDetail,
+    disposeInactive: groves.disposeInactive,
+    setTheme(theme, night, satellite) {
+      water.setTheme(theme, night, satellite)
+      bankMaterial.color.set(night ? theme.outerTop : '#c7c6af')
+      bridges.setTheme(theme, night)
+      groves.setTheme(theme, night)
+    }
+  }
 }
 
 export function createCockpitWaterfront(xWest, zNorth, xEast, zSouth, shoreDistance, compact) {

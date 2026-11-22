@@ -37,7 +37,7 @@ function runSyncReconcile() {
 <template>
   <AppShell title="安全与信创保障中心" subtitle="外网断联矢量兜底 · 越权隔离加水印 · 独立达梦库与新区对账">
     <!-- 顶部全栈信创体检带（沿用原版 sit-card 珍珠卡） -->
-    <div class="grid-4" style="margin-bottom: 0">
+    <div class="grid-4 xc-kpi-grid" style="margin-bottom: 0">
       <div class="sit-card">
         <span>街道独立信创数据库</span>
         <strong style="font-size: 20px">达梦主备集群</strong>
@@ -81,7 +81,7 @@ function runSyncReconcile() {
             </button>
           </div>
         </div>
-        <div style="height: 330px; overflow: hidden; flex-shrink: 0">
+        <div class="xc-map-box">
           <ChangheCity3D
             v-if="xcMapView === 'city3d'"
             mode="hub"
@@ -274,9 +274,28 @@ function runSyncReconcile() {
   color: var(--ink);
 }
 
+.xc-map-box {
+  height: 330px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
 :deep(.data-table th),
 :deep(.data-table td) {
   padding: 8px 9px;
   font-size: 12.5px;
+}
+
+@media (max-width: 768px) {
+  .xc-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .xc-kpi-grid .sit-card strong {
+    font-size: 16px !important;
+  }
+  .xc-map-box {
+    height: 260px;
+  }
 }
 </style>

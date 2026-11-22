@@ -83,9 +83,7 @@ function finalizeBucket(bucket) {
   return geo
 }
 
-function getOrBuildBridgeGeos(layout, point, pixelScale) {
-  if (cachedBridgeGeos) return cachedBridgeGeos
-
+function createBridgeBuilder(layout, point, pixelScale) {
   const buckets = {
     stone: createBucket(),
     steel: createBucket(),
@@ -219,18 +217,49 @@ function getOrBuildBridgeGeos(layout, point, pixelScale) {
     }
   }
 
-  for (const { ends, width, kind } of layout.bridges) {
-    const [a, b] = ends.map(point)
-    build(new THREE.LineCurve(a, b), width * pixelScale, kind)
+  return {
+    buckets,
+    buildBridge(bridge) {
+      const [a, b] = bridge.ends.map(point)
+      build(new THREE.LineCurve(a, b), bridge.width * pixelScale, bridge.kind)
+    },
+    buildWalk() {
+      const walk = new THREE.SplineCurve(layout.footbridge.map(point))
+      build(walk, 0.56, 'walk')
+    },
+    finalize() {
+      cachedBridgeGeos = {}
+      for (const [key, bucket] of Object.entries(buckets)) {
+        cachedBridgeGeos[key] = finalizeBucket(bucket)
+      }
+      return cachedBridgeGeos
+    }
   }
-  const walk = new THREE.SplineCurve(layout.footbridge.map(point))
-  build(walk, 0.56, 'walk')
+}
 
-  cachedBridgeGeos = {}
-  for (const [key, bucket] of Object.entries(buckets)) {
-    cachedBridgeGeos[key] = finalizeBucket(bucket)
+function getOrBuildBridgeGeos(layout, point, pixelScale) {
+  if (cachedBridgeGeos) return cachedBridgeGeos
+  const builder = createBridgeBuilder(layout, point, pixelScale)
+  for (const br of layout.bridges) builder.buildBridge(br)
+  builder.buildWalk()
+  return builder.finalize()
+}
+
+async function getOrBuildBridgeGeosAsync(layout, point, pixelScale, yieldFn) {
+  if (cachedBridgeGeos) return cachedBridgeGeos
+  const builder = createBridgeBuilder(layout, point, pixelScale)
+  for (const br of layout.bridges) {
+    builder.buildBridge(br)
+    if (yieldFn) await yieldFn()
   }
-  return cachedBridgeGeos
+  builder.buildWalk()
+  if (yieldFn) await yieldFn()
+  return builder.finalize()
+}
+
+export async function buildCockpitBridgesAsync(layout, point, pixelScale, yieldFn) {
+  await getOrBuildBridgeGeosAsync(layout, point, pixelScale, yieldFn)
+  return buildCockpitBridges(layout, point, pixelScale)
 }
 
 // 将桥面、箱梁、栏杆和墩柱按材质合批。所有断面都跟随同一条道路中心线。

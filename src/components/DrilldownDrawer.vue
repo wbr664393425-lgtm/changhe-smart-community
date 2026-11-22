@@ -626,4 +626,31 @@ function handleExport() {
   padding: 0 4px;
   color: var(--ink-soft);
 }
+
+@media (max-width: 768px) {
+  .dd-select-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+  .dd-filter-item {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .dd-filter-item :deep(.rui-select) {
+    flex: 1;
+    min-width: 0;
+  }
+  .dd-detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .dd-pager {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .dd-pager-left,
+  .dd-pager-right {
+    justify-content: space-between;
+  }
+}
 </style>

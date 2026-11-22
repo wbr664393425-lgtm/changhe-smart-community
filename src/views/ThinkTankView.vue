@@ -689,4 +689,43 @@ function exportCurrentTopic() {
   font-weight: 700;
   border-top: 2px solid var(--line-strong);
 }
+
+@media (max-width: 768px) {
+  .tt-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 2px;
+  }
+  .tt-tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .tt-tab {
+    flex: 0 0 auto;
+    height: 34px;
+    padding: 0 12px;
+    font-size: 12.5px;
+  }
+  .chart-cards-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .env-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .metric-card {
+    padding: 10px;
+  }
+  .metric-card strong {
+    font-size: 18px;
+  }
+}
+
+@media (max-width: 400px) {
+  .env-card-grid {
+    grid-template-columns: 1fr;
+  }
+}
 </style>

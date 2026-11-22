@@ -682,4 +682,51 @@ const totals = computed(() => ({
   .auth-card { width: min(420px, 100%); }
   .lg-foot { flex-wrap: wrap; gap: 4px 20px; white-space: normal; text-align: center; }
 }
+
+@media (max-width: 640px) {
+  .lg-head {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 0;
+  }
+  .lg-brand {
+    gap: 10px;
+  }
+  .lg-seal {
+    width: 34px;
+    height: 34px;
+    font-size: 13px;
+  }
+  .lg-org {
+    font-size: 16px;
+    white-space: nowrap;
+  }
+  .lg-main {
+    padding: 18px 14px 20px;
+    gap: 16px;
+  }
+  .lg-intro h1 {
+    font-size: 26px;
+    line-height: 1.25;
+  }
+  .auth-card {
+    padding: 20px 16px 18px;
+    border-radius: var(--r-lg, 14px);
+  }
+  .auth-card h2 {
+    font-size: 19px;
+    margin-bottom: 12px;
+  }
+  .quick-grid {
+    gap: 8px;
+  }
+  .quick-item {
+    font-size: 13px;
+    height: 38px;
+  }
+  .lg-foot {
+    padding: 0 14px calc(18px + env(safe-area-inset-bottom, 0px));
+    font-size: 12px;
+  }
+}
 </style>

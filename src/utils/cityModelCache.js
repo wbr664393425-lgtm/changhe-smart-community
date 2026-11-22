@@ -564,7 +564,12 @@ function finalizeBucketBuffers(b) {
   return { meshGeo: geo, edgeGeo }
 }
 
-function yieldFrame() {
+/**
+ * 绘制后让帧原语（Double-Yield）：
+ * 先等 requestAnimationFrame 进入动画帧，再用宏任务把重活推迟到浏览器完成本帧合成与上屏之后，
+ * 确保加载幕布 60fps 动画帧绝不被后台构建逻辑抢占。
+ */
+export function yieldToPaint(extraDelayMs = 0) {
   return new Promise((resolve) => {
     let settled = false
     let rafId = null
@@ -577,12 +582,19 @@ function yieldFrame() {
       resolve()
     }
     if (typeof requestAnimationFrame === 'function' && (typeof document === 'undefined' || !document.hidden)) {
-      rafId = requestAnimationFrame(done)
-      timerId = setTimeout(done, 48)
+      rafId = requestAnimationFrame(() => {
+        rafId = null
+        timerId = setTimeout(done, extraDelayMs)
+      })
+      timerId = setTimeout(done, 52 + extraDelayMs)
     } else {
-      timerId = setTimeout(done, 0)
+      timerId = setTimeout(done, extraDelayMs)
     }
   })
+}
+
+function yieldFrame() {
+  return yieldToPaint(0)
 }
 
 export function buildMergedAmapBuildingGeometries(buildings) {
@@ -626,9 +638,9 @@ export function buildMergedAmapBuildingGeometriesAsync(buildings, onProgress) {
 
       while (idx < total) {
         const sliceStart = performance.now()
-        const minBatch = 100
+        const minBatch = 20
         let count = 0
-        while (idx < total && (count < minBatch || performance.now() - sliceStart < 5)) {
+        while (idx < total && (count < minBatch || performance.now() - sliceStart < 3.2)) {
           appendBuildingToBuffers(buildings[idx], idx, inner, outer)
           idx++
           count++

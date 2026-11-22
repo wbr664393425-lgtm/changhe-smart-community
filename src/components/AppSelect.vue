@@ -44,10 +44,11 @@ function position() {
   const estH = Math.min(280, items.value.length * 36 + 12)
   const flipUp = window.innerHeight - r.bottom < estH + 14 && r.top > estH + 14
   const maxW = Math.min(460, window.innerWidth - 16)
+  const minW = Math.min(r.width, maxW)
   place.value = {
-    left: `${Math.max(8, Math.min(r.left, window.innerWidth - Math.max(r.width, 160) - 8))}px`,
-    top: `${flipUp ? Math.max(8, r.top - estH - 6) : r.bottom + 6}px`,
-    minWidth: `${r.width}px`,
+    left: `${Math.max(8, Math.min(r.left, window.innerWidth - Math.max(minW, Math.min(160, maxW)) - 8))}px`,
+    top: `${flipUp ? Math.max(8, r.top - estH - 6) : Math.min(window.innerHeight - 56, r.bottom + 6)}px`,
+    minWidth: `${minW}px`,
     maxWidth: `${maxW}px`
   }
 }

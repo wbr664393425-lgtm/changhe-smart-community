@@ -78,13 +78,9 @@ function hashInt(n) {
 }
 
 let cachedIndex = null
+let cachedIndexPromise = null
 
-/**
- * 构建 4,205 栋建筑的语义目录与 50m 空间格网哈希索引（单例缓存，构建 < 25ms）
- */
-export function getCockpitBuildingIndex() {
-  if (cachedIndex) return cachedIndex
-
+function createBuildingIndexBuilder() {
   // 1. 预计算 14 社区 XZ 多边形与质心
   const commPolys = COMMUNITIES.map((c) => {
     const geo = CHANGHE_COMMUNITY_GEO[c.name]
@@ -108,7 +104,10 @@ export function getCockpitBuildingIndex() {
     arr.push(idx)
   }
 
-  amapPolyData.buildings.forEach(([pts, height, isInner], idx) => {
+  const rawList = amapPolyData.buildings
+
+  function processOne(idx) {
+    const [pts, height, isInner] = rawList[idx]
     if (!pts || pts.length < 3) {
       buildings.push(null)
       return
@@ -281,7 +280,9 @@ export function getCockpitBuildingIndex() {
         }
       }
     }
-  })
+  }
+
+  function finalize() {
 
   // 2. 将 4 处核心标杆楼精准锚定到对应社区真实多边形建筑上
   function anchorLandmark({ commName, targetLatLng, preferHigh, preferLow, profileKey, name, landmarkShort, category }) {
@@ -500,6 +501,47 @@ export function getCockpitBuildingIndex() {
     findNearestBuildingXZ
   }
   return cachedIndex
+  }
+
+  return { total: rawList.length, processOne, finalize }
+}
+
+/**
+ * 构建 4,205 栋建筑的语义目录与 50m 空间格网哈希索引（单例缓存）
+ */
+export function getCockpitBuildingIndex() {
+  if (cachedIndex) return cachedIndex
+  const builder = createBuildingIndexBuilder()
+  for (let i = 0; i < builder.total; i++) {
+    builder.processOne(i)
+  }
+  return builder.finalize()
+}
+
+/**
+ * 分片异步构建 4,205 栋建筑空间索引，每片控制在 ~3.2ms，确保加载幕布 60fps 不掉帧
+ */
+export function getCockpitBuildingIndexAsync(yieldFn) {
+  if (cachedIndex) return Promise.resolve(cachedIndex)
+  if (cachedIndexPromise) return cachedIndexPromise
+  cachedIndexPromise = (async () => {
+    const builder = createBuildingIndexBuilder()
+    let idx = 0
+    while (idx < builder.total) {
+      const t0 = performance.now()
+      let cnt = 0
+      while (idx < builder.total && (cnt < 30 || performance.now() - t0 < 3.2)) {
+        builder.processOne(idx++)
+        cnt++
+      }
+      if (idx < builder.total && yieldFn) await yieldFn()
+    }
+    if (yieldFn) await yieldFn()
+    return builder.finalize()
+  })().finally(() => {
+    cachedIndexPromise = null
+  })
+  return cachedIndexPromise
 }
 
 let cachedEventMapSig = ''

@@ -1430,6 +1430,23 @@ onBeforeUnmount(() => {
   }
 }
 
+@media (max-width: 1100px) {
+  .geo-legend-card.is-cockpit,
+  .geo-compass-scale.is-cockpit {
+    display: none;
+  }
+  .geo-base-switch {
+    top: 8px;
+    right: 8px;
+    max-width: calc(100% - 16px);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .geo-base-switch::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 .geo-base-switch {
   position: absolute;
   top: 10px;

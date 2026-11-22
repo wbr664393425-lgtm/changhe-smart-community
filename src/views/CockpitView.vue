@@ -62,6 +62,7 @@ const viewMode = ref('report') // report | dispatch
 const activeChapter = ref(0)
 const activeSlice = ref('safety')
 const narrowPanel = ref('map')
+const mobileCommOpen = ref(false)
 const previewPose = ref('hero')
 const previewRoot = import.meta.env.BASE_URL + 'model-previews/'
 const previewViews = { hero: '全景鸟瞰', park: '长河公园', bridge: '岔河桥景' }
@@ -98,9 +99,9 @@ let revisitSafetyTimer = null
 let revealTimers = []
 let prefersReducedMotion = false
 
-const MIN_CURTAIN_MS = 2500
-const CURTAIN_HOLD_MS = 400
-const LOAD_TIMEOUT_MS = 15000
+const MIN_CURTAIN_MS = 3000
+const CURTAIN_HOLD_MS = 460
+const LOAD_TIMEOUT_MS = 16000
 const TOUR_MS = 6000
 
 // 配色方案下拉（顶层挂载实色浮层）
@@ -225,9 +226,10 @@ function beginReveal() {
     city3dLabelsVisible.value = true
   }, 2040)
 
-  // 入场收口（3.25s）：清除临时过渡态，释放所有常规交互
+  // 入场收口（3.25s）：清除临时过渡态，释放所有常规交互后再静默预载楼栋索引
   scheduleRevealTimer(() => {
     entrancePhase.value = 'ready'
+    loadBldgIdxMod()
   }, 3250)
 }
 
@@ -242,7 +244,6 @@ function handleCitySceneReady() {
   if (revealTriggered) return
   loaderSceneReady.value = true
   loaderTargetProgress.value = 100
-  loadBldgIdxMod()
   if (watchdogTimer) {
     clearTimeout(watchdogTimer)
     watchdogTimer = null
@@ -651,6 +652,10 @@ function useFitCount(elRef, deps) {
   const count = ref(99)
   let ro = null
   const measure = () => {
+    if (typeof window !== 'undefined' && window.innerWidth <= 1100) {
+      count.value = 99
+      return
+    }
     const el = unwrapEl(elRef.value)
     if (!el || !el.children) return
     const limit = el.clientHeight + 1
@@ -1359,14 +1364,14 @@ onBeforeUnmount(() => {
         </button>
         <button
           type="button"
-          class="ck-btn sq"
+          class="ck-btn sq ck-btn-tour"
           :class="{ active: tourRunning }"
           :title="tourRunning ? '暂停五章巡演' : '开启五章汇报巡演'"
           @click="toggleTour"
         >
           <component :is="tourRunning ? Pause : Play" :size="15" />
         </button>
-        <button type="button" class="ck-btn sq" title="全屏展示" @click="toggleFullscreen">
+        <button type="button" class="ck-btn sq ck-btn-fullscreen" title="全屏展示" @click="toggleFullscreen">
           <Maximize2 :size="15" />
         </button>
       </div>
@@ -1374,11 +1379,74 @@ onBeforeUnmount(() => {
 
     <!-- 满铺实景地图 + 满载实效双悬浮玻璃轨 -->
     <main class="ck-stage" :data-panel="narrowPanel">
+      <!-- 窄屏地图态左上角辖区切换按钮（点击弹起 14 社区快捷选择器，桌面端隐藏） -->
+      <button
+        type="button"
+        class="ck-mobile-scope-btn"
+        :aria-expanded="mobileCommOpen"
+        @click="mobileCommOpen = true"
+      >
+        <span class="ck-msb-dot" :class="{ active: scope !== '全街道' }"></span>
+        <span>{{ scope === '全街道' ? '全街道 · 14 社区' : scope }}</span>
+        <ChevronDown :size="13" />
+      </button>
+
+      <!-- 窄屏贴底常驻三视图导航栏（地图 / 辖区数据 / 治理事项，桌面端隐藏） -->
       <nav class="ck-narrow-panels ck-nav-tabs" aria-label="驾驶舱内容">
-        <button v-for="item in NARROW_PANEL_TABS"
-          :key="item.key" type="button" :class="{ active: narrowPanel === item.key }" :aria-pressed="narrowPanel === item.key"
-          @click="narrowPanel = item.key">{{ item.label }}</button>
+        <button
+          v-for="item in NARROW_PANEL_TABS"
+          :key="item.key"
+          type="button"
+          :class="{ active: narrowPanel === item.key }"
+          :aria-pressed="narrowPanel === item.key"
+          @click="narrowPanel = item.key; mobileCommOpen = false"
+        >
+          <span>{{ item.label }}</span>
+          <em v-if="item.key === 'events' && stats.openEvents.length > 0" class="ck-np-badge num">{{ stats.openEvents.length }}</em>
+        </button>
       </nav>
+
+      <!-- 窄屏 14 社区快捷底部选择抽屉（桌面端隐藏） -->
+      <div
+        v-if="mobileCommOpen"
+        class="ck-mobile-comm-scrim"
+        @click="mobileCommOpen = false"
+      >
+        <section class="ck-mobile-comm-sheet" role="dialog" aria-modal="true" aria-label="切换辖区社区" @click.stop>
+          <header class="ck-mcs-head">
+            <strong>切换辖区视角（{{ COMMUNITIES.length }} 个社区）</strong>
+            <button type="button" class="ck-mcs-close" aria-label="关闭" @click="mobileCommOpen = false">
+              <X :size="16" />
+            </button>
+          </header>
+          <div class="ck-mcs-grid">
+            <button
+              type="button"
+              class="ck-comm-mini is-all-anchor"
+              :class="{ active: scope === '全街道' }"
+              :disabled="role.scope !== '全街道'"
+              @click="handleResetPanorama(); mobileCommOpen = false"
+            >
+              <span>全街道总览</span>
+              <strong class="num">{{ COMMUNITIES.length }} 个社区</strong>
+            </button>
+            <button
+              v-for="c in COMMUNITIES"
+              :key="'m-' + c.id"
+              type="button"
+              class="ck-comm-mini"
+              :class="['h-' + c.health, 'lv-' + commLevel(c), { active: scope === c.name }]"
+              :disabled="role.scope !== '全街道' && role.scope !== c.name"
+              @click="toggleCommunityLock(c.name); mobileCommOpen = false"
+            >
+              <span class="c14-name">
+                <i class="c14-dot" :class="'d-' + commLevel(c)"></i>{{ shortName(c.name) }}
+              </span>
+              <strong class="num">{{ commChipText(c) }}</strong>
+            </button>
+          </div>
+        </section>
+      </div>
       <div class="ck-map-layer">
         <ChangheCity3D
           v-if="city3dMounted"
@@ -3318,52 +3386,477 @@ button.ck-mini-stat:hover {
   position: absolute; right: clamp(325px,23vw,356px); bottom: 155px; z-index: 5; background: var(--ck-panel-solid);
 }
 .ck-preview-controls span { padding: 0 8px; color: var(--ck-muted); font-size: 11px; }
-.ck-narrow-panels.ck-nav-tabs { display: none; }
-@media (max-width: 1100px) {
-  .ck-shell { padding: 0 6px 6px; grid-template-rows: auto minmax(0,1fr); }
-  .ck-header.ck-header-center {
-    grid-template-columns: auto minmax(0,1fr);
-    grid-template-areas: "brand brand" "mode tools";
-    gap: 3px 6px;
-    padding: 0 4px 5px;
-  }
-  .ck-brand.ck-brand-center { grid-area: brand; height: 46px; }
-  .ck-head-left { grid-area: mode; }
-  .ck-header.ck-header-center .ck-tools {
-    grid-area: tools; max-width: 100%; min-width: 0; gap: 5px; overflow-x: auto; scrollbar-width: none;
-  }
-  .ck-tools > * { flex: none; }
-  .ck-clock { display: none; }
-  .ck-narrow-panels.ck-nav-tabs {
-    display: inline-flex; position: absolute; z-index: 430; top: 8px; left: 8px; background: var(--ck-panel-solid);
-  }
-  .ck-stage .ck-map-topbar, .ck-stage .ck-rail { display: none; }
-  .ck-stage[data-panel="data"] .ck-map-topbar {
-    display: flex; left: 8px; right: 8px; top: 49px; gap: 4px;
-  }
-  .ck-stage[data-panel="data"] .ck-rail-left, .ck-stage[data-panel="events"] .ck-rail-right {
-    display: flex; left: 8px; right: 8px; width: auto; bottom: 8px; background: var(--ck-panel-solid);
-  }
-  .ck-stage[data-panel="data"] .ck-rail-left { top: 197px; }
-  .ck-stage[data-panel="events"] .ck-rail-right { top: 49px; }
-  .ck-stage:not([data-panel="map"]) .ck-map-fab,
-  .ck-stage:not([data-panel="map"]) .ck-collect-bar { display: none; }
-  .ck-stage:not([data-panel="map"]) .ck-map-layer { visibility: hidden; }
-  .ck-map-topbar .ck-kpi-grid {
-    display: grid; grid-template-columns: repeat(6, minmax(104px, 1fr)); overflow-x: auto; scrollbar-width: thin;
-  }
-  .ck-stage .ck-collect-bar { left: 8px; right: 8px; bottom: 8px; }
-  .ck-model-preview .ck-preview-controls { left: 8px; right: auto; bottom: 74px; }
-  .ck-stage .ck-map-fab { bottom: 111px; right: 8px; }
-  .ck-map-layer :deep(.city3d-ctrl.is-cockpit) {
-    bottom: 74px; left: 8px; right: 8px; max-width: max-content; overflow-x: auto; scrollbar-width: none;
-  }
-  .ck-map-layer :deep(.city3d-legend.is-cockpit) { left: 8px; bottom: 111px; width: 200px; }
+.ck-narrow-panels.ck-nav-tabs,
+.ck-mobile-scope-btn,
+.ck-mobile-comm-scrim {
+  display: none;
 }
-@media (max-width: 480px) {
-  .ck-map-layer :deep(.city3d-legend.is-cockpit) { bottom: 153px; }
-  .ck-stage .ck-map-fab { flex-direction: row; align-items: center; flex-wrap: wrap; left: 8px; }
-  .ck-map-topbar .ck-pill { padding-inline: 2px; }
+
+@media (max-width: 1100px) {
+  .ck-shell {
+    padding: env(safe-area-inset-top, 0px) 0 0;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: 100dvh;
+    overflow: hidden;
+  }
+  .ck-header.ck-header-center {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "brand brand" "mode tools";
+    gap: 5px 8px;
+    padding: 4px 10px 7px;
+    height: auto;
+    min-height: 0;
+  }
+  .ck-brand.ck-brand-center {
+    grid-area: brand;
+    height: auto;
+    min-height: 38px;
+    padding: 0;
+    width: 100%;
+    justify-content: center;
+  }
+  .ck-crest-wing {
+    display: none;
+  }
+  .ck-crest-body {
+    height: auto;
+    min-height: 36px;
+    max-width: 100%;
+    padding: 4px 12px;
+    border-radius: var(--r-md, 8px);
+  }
+  .ck-brand-inner {
+    gap: 7px;
+    min-width: 0;
+  }
+  .ck-logo-pedestal {
+    transform: scale(0.82);
+    transform-origin: center;
+    flex-shrink: 0;
+  }
+  .ck-title-group {
+    min-width: 0;
+  }
+  .ck-title-group h1 {
+    font-size: 14.5px !important;
+    gap: 5px !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ck-title-main,
+  .ck-title-sub {
+    font-size: 14.5px !important;
+    letter-spacing: 0.02em !important;
+  }
+  .ck-title-sep {
+    height: 11px !important;
+  }
+  .ck-head-left {
+    grid-area: mode;
+    justify-self: start;
+  }
+  .ck-head-left .ck-nav-tabs button {
+    padding: 0 8px;
+    font-size: 11.5px;
+    height: 30px;
+  }
+  .ck-header.ck-header-center .ck-tools {
+    grid-area: tools;
+    justify-self: end;
+    max-width: 100%;
+    min-width: 0;
+    gap: 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ck-header.ck-header-center .ck-tools::-webkit-scrollbar {
+    display: none;
+  }
+  .ck-tools > * {
+    flex: none;
+  }
+  .ck-tools .ck-btn,
+  .ck-tools .ck-preset-trigger {
+    height: 30px;
+    padding: 0 8px;
+    font-size: 11.5px;
+  }
+  .ck-tools .ck-btn.sq {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+  }
+  .ck-clock,
+  .ck-btn-fullscreen {
+    display: none;
+  }
+
+  /* 舞台容器：地图态相对定位满铺，数据/事项态流式自然纵向滚动 */
+  .ck-stage {
+    border-radius: 0;
+    margin: 0;
+    padding-bottom: calc(52px + env(safe-area-inset-bottom, 0px));
+  }
+  .ck-stage[data-panel="data"],
+  .ck-stage[data-panel="events"] {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 10px calc(68px + env(safe-area-inset-bottom, 0px));
+    background: var(--frame);
+  }
+  .ck-shell.is-dark .ck-stage[data-panel="data"],
+  .ck-shell.is-dark .ck-stage[data-panel="events"] {
+    background: #0d111a;
+  }
+
+  /* 底部常驻三视图切换栏 */
+  .ck-narrow-panels.ck-nav-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    position: fixed;
+    z-index: 460;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 6px 10px calc(6px + env(safe-area-inset-bottom, 0px));
+    border-radius: 0;
+    border: 0;
+    border-top: var(--hair) solid var(--ck-border);
+    background: var(--ck-panel-solid);
+    box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.1);
+  }
+  .ck-narrow-panels.ck-nav-tabs button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 38px;
+    font-size: 13px;
+    font-weight: 650;
+  }
+  .ck-np-badge {
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--ck-danger);
+    color: #ffffff;
+    font-style: normal;
+    font-size: 10.5px;
+    font-weight: 700;
+    display: inline-grid;
+    place-items: center;
+    line-height: 1;
+  }
+
+  /* 地图态左上角辖区切换按钮 */
+  .ck-stage[data-panel="map"] .ck-mobile-scope-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    position: absolute;
+    z-index: 430;
+    top: 8px;
+    left: 8px;
+    max-width: calc(100% - 168px);
+    height: 32px;
+    padding: 0 10px;
+    border-radius: var(--r-control, 8px);
+    border: var(--hair) solid var(--ck-border);
+    background: var(--ck-panel-solid);
+    color: var(--ck-ink);
+    font-size: 12px;
+    font-weight: 650;
+    box-shadow: var(--e2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ck-msb-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ck-ok);
+    flex-shrink: 0;
+  }
+  .ck-msb-dot.active {
+    background: var(--primary);
+  }
+
+  /* 移动端 14 社区选择底抽屉 */
+  .ck-mobile-comm-scrim {
+    display: flex;
+    align-items: flex-end;
+    position: fixed;
+    inset: 0;
+    z-index: 520;
+    background: rgba(12, 16, 24, 0.52);
+    backdrop-filter: blur(3px);
+  }
+  .ck-mobile-comm-sheet {
+    width: 100%;
+    max-height: 78dvh;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 12px calc(16px + env(safe-area-inset-bottom, 0px));
+    border-radius: 16px 16px 0 0;
+    background: var(--ck-panel-solid);
+    color: var(--ck-ink);
+    border-top: 2px solid var(--primary);
+    box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.22);
+    overflow-y: auto;
+  }
+  .ck-mcs-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .ck-mcs-head strong {
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .ck-mcs-close {
+    width: 30px;
+    height: 30px;
+    border: var(--hair) solid var(--ck-border);
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--ck-muted);
+    display: inline-grid;
+    place-items: center;
+  }
+  .ck-mcs-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 7px;
+  }
+  .ck-mcs-grid .ck-comm-mini {
+    padding: 8px 6px;
+  }
+  .ck-mcs-grid .is-all-anchor {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 12px;
+  }
+
+  /* 面板切换显示规则 */
+  .ck-stage .ck-map-topbar,
+  .ck-stage .ck-rail,
+  .ck-stage .ck-collect-bar {
+    display: none;
+  }
+  .ck-stage:not([data-panel="map"]) .ck-map-fab {
+    display: none;
+  }
+  .ck-stage:not([data-panel="map"]) .ck-map-layer {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  /* 辖区数据态：自然纵向流（KPI 2×3 + 五章结论 + 左侧全部模块 + 14 社区实体卡） */
+  .ck-stage[data-panel="data"] .ck-map-topbar {
+    display: flex;
+    flex-direction: column;
+    position: static;
+    width: 100%;
+    left: auto;
+    right: auto;
+    top: auto;
+    gap: 8px;
+    pointer-events: auto;
+    flex: none;
+  }
+  .ck-stage[data-panel="data"] .ck-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .ck-stage[data-panel="data"] .ck-map-toprow {
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+    justify-content: flex-start;
+    -webkit-overflow-scrolling: touch;
+  }
+  .ck-stage[data-panel="data"] .ck-map-toprow::-webkit-scrollbar {
+    display: none;
+  }
+  .ck-stage[data-panel="data"] .ck-map-toprow .ck-glass-bar {
+    display: inline-flex !important;
+    width: max-content !important;
+    min-width: 100%;
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+  .ck-stage[data-panel="data"] .ck-map-toprow .ck-pill {
+    flex: 0 0 auto;
+    padding: 0 11px;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  .ck-stage[data-panel="data"] .ck-chapter-brief {
+    height: auto;
+    min-height: 32px;
+    padding: 8px 10px;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    row-gap: 6px;
+  }
+  .ck-stage[data-panel="data"] .ck-brief-text {
+    flex: 1 0 100%;
+    order: 3;
+    white-space: normal;
+    line-height: 1.5;
+  }
+  .ck-stage[data-panel="data"] .ck-brief-health {
+    gap: 7px;
+    font-size: 10.5px;
+  }
+  .ck-stage[data-panel="data"] .ck-rail-left,
+  .ck-stage[data-panel="events"] .ck-rail-right {
+    display: flex;
+    position: static;
+    left: auto;
+    right: auto;
+    top: auto;
+    bottom: auto;
+    width: 100%;
+    height: auto;
+    max-height: none;
+    overflow: visible;
+    background: var(--ck-panel-solid);
+    flex: none;
+  }
+  .ck-stage[data-panel="data"] .ck-collect-bar {
+    display: flex;
+    flex-direction: column;
+    position: static;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    width: 100%;
+    height: auto;
+    padding: 10px;
+    gap: 8px;
+    background: var(--ck-panel-solid);
+    flex: none;
+  }
+  .ck-stage[data-panel="data"] .c14-divider {
+    display: none;
+  }
+  .ck-stage[data-panel="data"] .c14-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    width: 100%;
+  }
+
+  /* 解除桌面端整条截断限制，移动端完整展示列表 */
+  .ck-chapter-block,
+  .ck-fill-block {
+    flex: none;
+    min-height: 0;
+  }
+  .ck-rank-fit,
+  .ck-fit-list {
+    overflow: visible !important;
+    max-height: none !important;
+  }
+  .ck-rank-fit .is-clipped,
+  .ck-fit-list .is-clipped {
+    display: grid !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    pointer-events: auto !important;
+  }
+  .ck-dispatch-list {
+    overflow: visible;
+    max-height: none;
+  }
+
+  /* 地图态底部单行紧凑底图切换条（紧贴底部三视图导航上方，留出大面积地图） */
+  .ck-stage[data-panel="map"] .ck-map-fab {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: calc(60px + env(safe-area-inset-bottom, 0px));
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ck-stage[data-panel="map"] .ck-map-fab::-webkit-scrollbar {
+    display: none;
+  }
+  .ck-stage[data-panel="map"] .ck-map-fab > * {
+    flex: none;
+  }
+  .ck-model-preview .ck-preview-controls {
+    left: 8px;
+    right: auto;
+    bottom: calc(100px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+@media (max-width: 520px) {
+  .ck-header.ck-header-center {
+    padding: 4px 8px 6px;
+    gap: 5px 6px;
+  }
+  .ck-crest-body {
+    padding: 3px 8px;
+  }
+  .ck-logo-pedestal {
+    transform: scale(0.72);
+  }
+  .ck-title-main,
+  .ck-title-sub {
+    font-size: 13px !important;
+    letter-spacing: 0.01em !important;
+  }
+  .ck-title-group h1 {
+    font-size: 13px !important;
+  }
+  .ck-head-left .ck-nav-tabs button {
+    padding: 0 7px;
+    font-size: 11px;
+  }
+  .ck-preset-trigger span,
+  .ck-btn-tour {
+    display: none;
+  }
+  .ck-preset-trigger {
+    padding: 0 6px !important;
+    gap: 3px;
+  }
+  .ck-tools .ck-btn.primary {
+    padding: 0 7px;
+    gap: 3px;
+  }
+  .ck-mcs-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ck-stage[data-panel="data"] .c14-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ck-quad-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* ==========================================================================

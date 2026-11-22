@@ -1420,4 +1420,31 @@ function finishWizard() {
   color: var(--brand-2);
   font-weight: 700;
 }
+
+@media (max-width: 768px) {
+  .diag-bar {
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+  .dc-head {
+    flex-wrap: wrap;
+  }
+  .df-name {
+    min-width: 0;
+    width: 100%;
+  }
+  .wiz-steps {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    font-size: 12px;
+  }
+  .excel-preview {
+    -webkit-overflow-scrolling: touch;
+  }
+  .ep-title {
+    font-size: 13.5px;
+  }
+}
 </style>

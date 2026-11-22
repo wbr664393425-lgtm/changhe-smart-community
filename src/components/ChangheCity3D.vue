@@ -4,7 +4,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { COMMUNITIES, store } from '../store/appStore'
 import { CHANGHE_OUTER_BOUNDARY, CHANGHE_LABEL_OFFSETS } from '../utils/changheGeo'
-import { createCockpitWaterfront, WATER_REFLECTION_LAYER } from '../utils/cockpitWaterfront'
+import { createCockpitWaterfrontAsync, WATER_REFLECTION_LAYER } from '../utils/cockpitWaterfront'
 import amapPolyData from '../utils/changheAmapPolygons.json'
 import {
   latLngToWorldXZ,
@@ -13,10 +13,11 @@ import {
   ensureAmapTexture,
   preloadSecondaryAmapAssets,
   buildMergedAmapBuildingGeometries,
-  buildMergedAmapBuildingGeometriesAsync
+  buildMergedAmapBuildingGeometriesAsync,
+  yieldToPaint
 } from '../utils/cityModelCache'
 import {
-  getCockpitBuildingIndex,
+  getCockpitBuildingIndexAsync,
   buildEventBuildingMap,
   buildCockpitEntities
 } from '../utils/cockpitBuildingIndex'
@@ -272,6 +273,7 @@ const _tmpCamVP = new THREE.Matrix4()
 const _lastCamVP = new Float32Array(16)
 let staticRenderNeeded = true
 let cancelSecondaryPreload = null
+let secondaryPreloadTimer = null
 
 // 预解析专题配色，避免 updateZoneStyles 每次悬停重复 new THREE.Color
 const SLICE_COLOR_CACHE = new Map()
@@ -920,7 +922,7 @@ function disposeGroup(grp) {
 }
 
 // ── 构建高德官方风格 1:1 真实多边形三维城市 ──
-function buildAmap3DCity(precomputedGeos = null) {
+async function buildAmap3DCity(precomputedGeos = null, yieldFn = null) {
   if (!scene || !assetsRef) return
   if (cityGroup) {
     waterfront?.disposeInactive()
@@ -990,9 +992,14 @@ function buildAmap3DCity(precomputedGeos = null) {
     imagery.layers.set(IMAGERY_LAYER)
     farGroundMesh.layers.enable(IMAGERY_LAYER)
     cityGroup.add(imagery)
-    waterfront = createCockpitWaterfront(xW, zN, xE, zS, assetsRef.shoreDistanceTex, compactRenderer)
+    if (yieldFn) await yieldFn()
+    if (isDisposed || !scene) return
+    waterfront = await createCockpitWaterfrontAsync(xW, zN, xE, zS, assetsRef.shoreDistanceTex, compactRenderer, yieldFn)
+    if (isDisposed || !scene) return
     for (const light of [sunLight, fillLight, hemiLight]) light.layers.enable(WATER_REFLECTION_LAYER)
     cityGroup.add(waterfront.group)
+    if (yieldFn) await yieldFn()
+    if (isDisposed || !scene) return
   }
 
   // 3. 合批 4,205 栋精确多边形真实轮廓 3D 建筑 + 锐利屋顶轮廓棱边线
@@ -1023,7 +1030,7 @@ function buildAmap3DCity(precomputedGeos = null) {
   cityGroup.add(outerEdges)
 }
 
-function buildCommunityOverlays() {
+async function buildCommunityOverlays(yieldFn = null) {
   if (!scene) return
   if (overlayGroup) {
     disposeGroup(overlayGroup)
@@ -1045,9 +1052,13 @@ function buildCommunityOverlays() {
 
   outerGlowMat = new THREE.MeshBasicMaterial({ color: 0xf4c97a, transparent: true, opacity: 0.20, depthWrite: false })
   overlayGroup.add(new THREE.Mesh(new THREE.TubeGeometry(outerCurve, 260, 2.0, 6, true), outerGlowMat))
+  if (yieldFn) await yieldFn()
+  if (isDisposed || !scene) return
 
-  // 2. 14 真实社区路网贴地分区线 + 选中态干净贴地光晕面与贴地高亮管线（彻底去除穿楼竖墙）
-  COMMUNITIES.forEach((c) => {
+  // 2. 14 真实社区路网贴地分区线 + 选中态干净贴地光晕面与贴地高亮管线（按微切片分批构建，杜绝单帧卡顿）
+  let sliceStart = performance.now()
+  for (let cIdx = 0; cIdx < COMMUNITIES.length; cIdx++) {
+    const c = COMMUNITIES[cIdx]
     const polyXZ = c.polygon.map(([lat, lng]) => latLngToWorldXZ(lat, lng))
     const offset = CHANGHE_LABEL_OFFSETS[c.name] || [0, 0]
     const centerXZ = latLngToWorldXZ(c.center[0] + offset[0], c.center[1] + offset[1])
@@ -1099,7 +1110,13 @@ function buildCommunityOverlays() {
       selTubeMat,
       community: c
     })
-  })
+
+    if (yieldFn && (cIdx % 2 === 1 || performance.now() - sliceStart >= 3.5)) {
+      await yieldFn()
+      if (isDisposed || !scene) return
+      sliceStart = performance.now()
+    }
+  }
 
   // 3. 长河街道综合治理指挥中心 3D 光标（单点事件聚焦/巡查轨迹回放时隐藏，突出当前主角）
   if (props.mode !== 'single' && props.mode !== 'patrol') {
@@ -2382,8 +2399,8 @@ function processPointerHover(clientX, clientY) {
 }
 
 function onPointerMove(e) {
-  // 拖拽旋转镜头或相机动画中跳过拾取，并以 rAF 单帧合并高刷鼠标事件
-  if (e.buttons !== 0 || isCamAnimating || introCamAnim) return
+  // 触屏设备跳过悬停拾取；拖拽旋转镜头或相机动画中跳过拾取，并以 rAF 单帧合并高刷鼠标事件
+  if (e.pointerType === 'touch' || e.buttons !== 0 || isCamAnimating || introCamAnim) return
   pendingPointerClient = { x: e.clientX, y: e.clientY }
   if (pointerMoveRaf === null) {
     pointerMoveRaf = requestAnimationFrame(() => {
@@ -2398,7 +2415,8 @@ function onPointerMove(e) {
 function onPointerUp(e) {
   const dx = e.clientX - pointerDownPos.x
   const dy = e.clientY - pointerDownPos.y
-  if (dx * dx + dy * dy > 25) return
+  const tapThresholdSq = e.pointerType === 'touch' ? 100 : 25
+  if (dx * dx + dy * dy > tapThresholdSq) return
   const hit = pickTarget(e.clientX, e.clientY)
   if (!hit) return
   if (hit.type === 'landmark') {
@@ -2672,7 +2690,13 @@ async function initScene() {
   if (!canvasHost.value) return
   prefersReducedMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
-  compactRenderer = props.mode === 'cockpit' && window.innerWidth <= 1100
+  // 首次加载幕布展示时，先留出 240ms 纯净起步窗让开场描边丝滑起跑，再错峰创建 WebGL 上下文
+  if (props.externalLoader && !prefersReducedMotion) {
+    await new Promise((resolve) => setTimeout(resolve, 240))
+    if (isDisposed || !canvasHost.value) return
+  }
+
+  compactRenderer = window.innerWidth <= 768 || (props.mode === 'cockpit' && window.innerWidth <= 1100)
   try {
     renderer = new THREE.WebGLRenderer({
       antialias: true,
@@ -2699,6 +2723,11 @@ async function initScene() {
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1.06
   canvasHost.value.appendChild(renderer.domElement)
+
+  if (props.externalLoader) {
+    await yieldToPaint(16)
+    if (isDisposed || !canvasHost.value || !renderer) return
+  }
 
   scene = new THREE.Scene()
   scene.background = new THREE.Color('#e6ecf2')
@@ -2765,27 +2794,11 @@ async function initScene() {
     emit('load-progress', { percent: p, stage, stageIndex })
   }
 
-  const nextPaintFrame = () =>
-    new Promise((resolve) => {
-      let done = false
-      let rId = null
-      let tId = null
-      const finish = () => {
-        if (done) return
-        done = true
-        if (rId !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rId)
-        if (tId !== null) clearTimeout(tId)
-        resolve()
-      }
-      if (typeof requestAnimationFrame === 'function' && !document.hidden) {
-        rId = requestAnimationFrame(finish)
-        tId = setTimeout(finish, 60)
-      } else {
-        tId = setTimeout(finish, 0)
-      }
-    })
+  const nextPaintFrame = () => yieldToPaint(props.externalLoader ? 4 : 0)
 
   reportProgress(4, '正在拉取高清地理底图与卫星影像', 0)
+  await nextPaintFrame()
+  if (isDisposed || !scene) return
 
   // 并行启动「首帧必需底图下载」与「4,205 栋三维白模分片构建」，将 CPU 建模重叠隐藏在网络下载窗口内
   let texPct = 0
@@ -2836,17 +2849,22 @@ async function initScene() {
   if (isDisposed || !scene) return
 
   if (props.mode === 'cockpit') {
-    buildingIndexRef = getCockpitBuildingIndex()
+    buildingIndexRef = await getCockpitBuildingIndexAsync(nextPaintFrame)
+    if (isDisposed || !scene) return
   }
 
-  buildAmap3DCity(prebuiltGeos)
+  await buildAmap3DCity(prebuiltGeos, nextPaintFrame)
+  if (isDisposed || !scene) return
   reportProgress(84, '正在渲染岔河水系与社区拓扑图层', 2)
   await nextPaintFrame()
   if (isDisposed || !scene) return
 
-  buildCommunityOverlays()
+  await buildCommunityOverlays(nextPaintFrame)
+  if (isDisposed || !scene) return
   applyVisualTheme()
   reportProgress(88, '正在渲染岔河水系与社区拓扑图层', 2)
+  await nextPaintFrame()
+  if (isDisposed || !scene) return
 
   // 驾驶舱一律强制以全街道「全景鸟瞰」开场（绝不被跨页缓存的 selectedCommunity 拉近）
   const willIntro = props.mode === 'cockpit' && props.deferReveal && !prefersReducedMotion
@@ -2895,7 +2913,7 @@ async function initScene() {
       renderer.compile(scene, camera)
     }
     reportProgress(96, '正在编译三维光影与首帧渲染管线', 3)
-    await nextPaintFrame()
+    await yieldToPaint(16)
     if (isDisposed || !scene || !renderer) return
 
     // 首帧烘焙前即按真实视距同步树木 LOD，避免阴影/倒影/主通道白渲 344 万高模树冠三角
@@ -2908,7 +2926,7 @@ async function initScene() {
     renderer.shadowMap.needsUpdate = true
     renderer.render(scene, camera)
     reportProgress(98, '正在编译三维光影与首帧渲染管线', 3)
-    await nextPaintFrame()
+    await yieldToPaint(16)
     if (isDisposed || !scene || !renderer) return
 
     // 预热第 2 帧：切至入场起始高空弧线机位并刷新管线（保留已烘焙好的最终阴影贴图，不再重算阴影）
@@ -2927,6 +2945,8 @@ async function initScene() {
       if (innerEdgeMat) innerEdgeMat.opacity = 0
       if (outerEdgeMat) outerEdgeMat.opacity = 0
       waterfront?.setReflectionPaused(true)
+    } else {
+      waterfront?.setReflectionPaused(false)
     }
     renderer.shadowMap.needsUpdate = false
     renderer.render(scene, camera)
@@ -2957,16 +2977,20 @@ async function initScene() {
   handleVisibilityChange()
   emit('scene-ready')
 
-  // 首屏就绪后在浏览器空闲窗口后台静默预热其余非首帧底图（暗夜/日景/高清卫星），切图顺滑不卡
-  cancelSecondaryPreload = preloadSecondaryAmapAssets((key, tex) => {
-    if (isDisposed || !renderer || !tex) return
-    tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy())
-    if (typeof renderer.initTexture === 'function') renderer.initTexture(tex)
-    if (key === 'satTex' && imageryMat && imageryMat.map !== tex) {
-      imageryMat.map = tex
-      imageryMat.needsUpdate = true
-    }
-  })
+  // 延后至揭幕三幕动画完全收官后，再在浏览器空闲窗口后台静默预热非首帧底图（避免与开场抢占 GPU/解码线程）
+  secondaryPreloadTimer = setTimeout(() => {
+    secondaryPreloadTimer = null
+    if (isDisposed || !renderer) return
+    cancelSecondaryPreload = preloadSecondaryAmapAssets((key, tex) => {
+      if (isDisposed || !renderer || !tex) return
+      tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy())
+      if (typeof renderer.initTexture === 'function') renderer.initTexture(tex)
+      if (key === 'satTex' && imageryMat && imageryMat.map !== tex) {
+        imageryMat.map = tex
+        imageryMat.needsUpdate = true
+      }
+    })
+  }, props.mode === 'cockpit' ? 4500 : 1200)
 }
 
 // ── 微任务脏标记合并调度器：合并五章切换 / 锁社区 / 切主题并发引发的多次重建 ──
@@ -3168,12 +3192,21 @@ watch(
   }
 )
 
+const mobileHudPanel = ref('') // '' | 'legend' | 'ctrl' (仅窄屏驾驶舱折叠使用)
+function toggleMobileHud(panel) {
+  mobileHudPanel.value = mobileHudPanel.value === panel ? '' : panel
+}
+
 onBeforeUnmount(() => {
   isDisposed = true
   stopLoop()
   if (pointerMoveRaf !== null) {
     cancelAnimationFrame(pointerMoveRaf)
     pointerMoveRaf = null
+  }
+  if (secondaryPreloadTimer !== null) {
+    clearTimeout(secondaryPreloadTimer)
+    secondaryPreloadTimer = null
   }
   cancelSecondaryPreload?.()
   cancelSecondaryPreload = null
@@ -3369,11 +3402,33 @@ onBeforeUnmount(() => {
       <span class="num sa-coord">{{ singleEvent.lat.toFixed(4) }}°N, {{ singleEvent.lng.toFixed(4) }}°E</span>
     </div>
 
+    <!-- 窄屏驾驶舱：图例与视角折叠开关胶囊（桌面端 display: none） -->
+    <div
+      v-if="mode === 'cockpit' && !loading && !comparingImagery"
+      class="city3d-mobile-hud-toggle"
+      :class="{ 'is-stage-hidden': !labelsVisible }"
+    >
+      <button
+        type="button"
+        :class="{ active: mobileHudPanel === 'legend' }"
+        @click="toggleMobileHud('legend')"
+      >
+        图层图例
+      </button>
+      <button
+        type="button"
+        :class="{ active: mobileHudPanel === 'ctrl' }"
+        @click="toggleMobileHud('ctrl')"
+      >
+        视角光影
+      </button>
+    </div>
+
     <!-- 左下角紧凑 3D 专题图例卡 -->
     <aside
       v-if="!compact && !loading && !comparingImagery && mode !== 'single' && mode !== 'patrol' && mode !== 'armed'"
       class="city3d-legend"
-      :class="{ 'is-cockpit': mode === 'cockpit', 'is-stage-hidden': !labelsVisible }"
+      :class="{ 'is-cockpit': mode === 'cockpit', 'is-stage-hidden': !labelsVisible, 'is-mobile-open': mobileHudPanel === 'legend' }"
       aria-label="三维沙盘专题图例"
     >
       <div class="c3d-lg-head">
@@ -3411,7 +3466,7 @@ onBeforeUnmount(() => {
     <div
       v-if="!loading"
       class="city3d-ctrl"
-      :class="{ 'is-cockpit': mode === 'cockpit', 'is-compact': compact, 'is-mini': mode === 'single' || mode === 'patrol', 'is-stage-hidden': !labelsVisible }"
+      :class="{ 'is-cockpit': mode === 'cockpit', 'is-compact': compact, 'is-mini': mode === 'single' || mode === 'patrol', 'is-stage-hidden': !labelsVisible, 'is-mobile-open': mobileHudPanel === 'ctrl' }"
       role="group"
       aria-label="三维视角与光影控制"
     >
@@ -3483,6 +3538,11 @@ onBeforeUnmount(() => {
   inset: 0;
   width: 100%;
   height: 100%;
+  touch-action: none;
+}
+
+.city3d-mobile-hud-toggle {
+  display: none;
 }
 
 .city3d-loading {
@@ -4226,4 +4286,111 @@ onBeforeUnmount(() => {
 .ly-dot.d-st { background: #0ea5e9; }
 .ly-dot.d-aid { background: #10b981; }
 .ly-dot.d-eco { background: #0284c7; }
+
+@media (max-width: 1100px) {
+  .city3d-mobile-hud-toggle {
+    position: absolute;
+    z-index: 38;
+    right: 8px;
+    top: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px;
+    border-radius: var(--r-control, 8px);
+    border: var(--hair, 1px) solid var(--ck-border, rgba(60, 48, 42, 0.16));
+    background: var(--ck-panel-solid, #ffffff);
+    box-shadow: var(--e2);
+  }
+  .city3d-mobile-hud-toggle button {
+    height: 26px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: calc(var(--r-control, 8px) - 2px);
+    background: transparent;
+    color: var(--ck-muted, #5c524c);
+    font-size: 11px;
+    font-weight: 650;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .city3d-mobile-hud-toggle button.active {
+    background: var(--primary, #b81c28);
+    color: var(--on-primary, #ffffff);
+  }
+  .city3d-legend.is-cockpit {
+    display: none;
+    left: 8px;
+    right: 8px;
+    top: 46px;
+    bottom: auto;
+    width: auto;
+    max-width: 280px;
+    margin-left: auto;
+    z-index: 40;
+    background: var(--ck-panel-solid, #ffffff);
+  }
+  .city3d-legend.is-cockpit.is-mobile-open {
+    display: block;
+  }
+  .city3d-ctrl.is-cockpit {
+    display: none;
+    left: 8px;
+    right: 8px;
+    top: 46px;
+    bottom: auto;
+    max-width: calc(100% - 16px);
+    flex-wrap: wrap;
+    z-index: 40;
+    background: var(--ck-panel-solid, #ffffff);
+  }
+  .city3d-ctrl.is-cockpit.is-mobile-open {
+    display: inline-flex;
+  }
+  .city3d-ctrl.is-compact {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    width: auto;
+    max-width: calc(100% - 16px);
+    display: flex;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .city3d-ctrl.is-compact button {
+    flex: 0 0 auto;
+  }
+  .city3d-ctrl.is-compact::-webkit-scrollbar {
+    display: none;
+  }
+  .city3d-root.compact .city3d-comm-tag {
+    font-size: 9.5px;
+    padding: 1px 5px;
+  }
+  .city3d-root.compact .city3d-hq-tag {
+    font-size: 9.5px;
+    padding: 2px 6px;
+  }
+  .city3d-hint {
+    max-width: calc(100% - 20px);
+    font-size: 10.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .city3d-bldg-tip {
+    display: none;
+  }
+  .city3d-comm-tag {
+    font-size: 10.5px;
+    padding: 2px 6px;
+  }
+  .city3d-hq-tag {
+    font-size: 10.5px;
+    padding: 3px 7px;
+  }
+}
 </style>

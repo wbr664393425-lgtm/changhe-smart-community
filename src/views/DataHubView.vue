@@ -697,4 +697,25 @@ function openDrill(kind, extra = '') {
   border-color: var(--brand-2);
   background: var(--brand-soft);
 }
+
+@media (max-width: 768px) {
+  .hub-map-panel {
+    min-height: 320px;
+  }
+  .hub-map-wrap {
+    min-height: 290px;
+    height: 300px;
+  }
+  .special-grid,
+  .gov-kpi-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .aid-grid {
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  }
+  .ai-head {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+}
 </style>

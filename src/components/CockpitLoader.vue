@@ -103,12 +103,67 @@ const geoSvg = (() => {
   }
 })()
 
-// 将 60fps 平滑进度插值隔离在 CockpitLoader 内部，彻底避免父组件 CockpitView 820 行模板 60fps 重渲染
-const smoothProgress = ref(props.visible ? 2 : 100)
+// ── 60fps 零 VDOM Diff 直驱引擎：高频属性由 rAF 直接写入 DOM/合成层，Vue 仅在整数百分比变化时更新 ──
+const displayPct = ref(props.visible ? 0 : 100)
+const waterLayerRef = ref(null)
+const outerGlowRef = ref(null)
+const outerTraceRef = ref(null)
+const innerSilkRef = ref(null)
+const traceTipRef = ref(null)
+const meterFillRef = ref(null)
+const meterTipWrapRef = ref(null)
+
+let smoothVal = props.visible ? 0 : 100
 let startTime = 0
+let lastTime = 0
 let rafId = null
 let holdTimer = null
 let emittedReady = false
+
+function computeTraceHead(pct) {
+  const ratio = pct / 100
+  const target = ratio * geoSvg.totalLen
+  const { closedOuter, cumLens } = geoSvg
+  if (ratio <= 0 || ratio >= 1) return { x: closedOuter[0][0], y: closedOuter[0][1] }
+  let idx = 1
+  while (idx < cumLens.length - 1 && cumLens[idx] < target) idx++
+  const segStart = cumLens[idx - 1]
+  const segLen = Math.max(1e-6, cumLens[idx] - segStart)
+  const t = Math.max(0, Math.min(1, (target - segStart) / segLen))
+  const p0 = closedOuter[idx - 1]
+  const p1 = closedOuter[idx]
+  return {
+    x: p0[0] + (p1[0] - p0[0]) * t,
+    y: p0[1] + (p1[1] - p0[1]) * t
+  }
+}
+
+function paintVisualFrame(pct) {
+  const p = Math.max(0, Math.min(100, pct))
+  const ratio = p / 100
+  const outerOffset = (1000 * (1 - ratio)).toFixed(2)
+  const innerOffset = (1000 * (1 - Math.max(0, (p - 3) / 97))).toFixed(2)
+  const waterOp = Math.max(0, Math.min(1, (p - 16) / 56)).toFixed(3)
+
+  if (outerGlowRef.value) outerGlowRef.value.style.strokeDashoffset = outerOffset
+  if (outerTraceRef.value) outerTraceRef.value.style.strokeDashoffset = outerOffset
+  if (innerSilkRef.value) innerSilkRef.value.style.strokeDashoffset = innerOffset
+  if (waterLayerRef.value) waterLayerRef.value.style.opacity = waterOp
+  if (meterFillRef.value) meterFillRef.value.style.transform = `scaleX(${ratio.toFixed(5)})`
+  if (meterTipWrapRef.value) {
+    meterTipWrapRef.value.style.transform = `translate3d(${p.toFixed(3)}%, 0, 0)`
+    meterTipWrapRef.value.style.opacity = p > 0.5 && p < 99.9 ? '1' : '0'
+  }
+  if (traceTipRef.value) {
+    if (p > 0.8 && p < 99.8) {
+      const head = computeTraceHead(p)
+      traceTipRef.value.style.opacity = '1'
+      traceTipRef.value.setAttribute('transform', `translate(${head.x.toFixed(2)}, ${head.y.toFixed(2)})`)
+    } else {
+      traceTipRef.value.style.opacity = '0'
+    }
+  }
+}
 
 function stopTicker() {
   if (rafId !== null) {
@@ -127,32 +182,54 @@ function tick(now) {
     return
   }
 
+  const dt = lastTime ? Math.min(34, Math.max(4, now - lastTime)) : 16.67
+  lastTime = now
   const elapsed = now - startTime
-  const cur = smoothProgress.value
+  const cur = smoothVal
 
+  // 恒流从容巡航曲线：按真实时间优雅推进，彻底避免因后台阶段停顿造成“走走停停”
+  const minMs = Math.max(1200, props.minCurtainMs)
+  const cruiseRatio = Math.min(1, elapsed / (minMs * 0.94))
+  const cruisePct = 92 * (1 - Math.pow(1 - cruiseRatio, 1.55))
+
+  let desired
   if (!props.sceneReady) {
-    const target = Math.min(98, Math.max(cur, props.targetProgress))
-    smoothProgress.value = Math.min(98, cur + (target - cur) * 0.1)
-    rafId = requestAnimationFrame(tick)
-    return
+    // 后台仍在构建时：随恒流巡航稳步推进，最多温柔减速贴近 93.5%，绝不死停也不突跳
+    const realCap = Math.min(93.5, Math.max(cruisePct, props.targetProgress * 0.92))
+    const creep = cur >= 88 ? Math.min(93.5, cur + dt * 0.0022) : cur
+    desired = Math.min(93.5, Math.max(realCap, creep))
+  } else {
+    const minRatio = Math.min(1, elapsed / minMs)
+    const easedEnd = 1 - Math.pow(1 - minRatio, 1.45)
+    desired = minRatio < 1 ? Math.max(cur, Math.min(99.4, easedEnd * 100)) : 100
   }
 
-  const minRatio = Math.min(1, elapsed / Math.max(1, props.minCurtainMs))
-  const easedMin = 1 - Math.pow(1 - minRatio, 1.38)
-  const smoothTarget = minRatio < 1 ? Math.min(99.2, easedMin * 100) : 100
-  const gap = smoothTarget - cur
-  const step = minRatio < 1 ? Math.max(0.22, gap * 0.14) : Math.max(0.75, gap * 0.22)
-  const next = Math.min(smoothTarget, cur + step)
-  smoothProgress.value = next
+  // 时间归一化指数阻尼 + 单帧最大步长限幅（防后台进度跳变产生视觉闪跳）
+  const k = props.sceneReady && elapsed >= minMs ? 0.0095 : 0.0052
+  const alpha = 1 - Math.exp(-k * dt)
+  const rawDelta = Math.max(0, desired - cur) * alpha
+  const minCruiseStep = props.sceneReady && elapsed >= minMs ? dt * 0.018 : 0
+  const maxStep = dt * (props.sceneReady && elapsed >= minMs ? 0.055 : 0.036)
+  const step = Math.min(maxStep, Math.max(rawDelta, desired > cur ? minCruiseStep : 0))
+  smoothVal = Math.min(desired, cur + step)
 
-  if (next >= 99.7 && elapsed >= props.minCurtainMs) {
-    smoothProgress.value = 100
+  paintVisualFrame(smoothVal)
+
+  const rounded = Math.min(100, Math.floor(smoothVal + 0.15))
+  if (rounded !== displayPct.value) {
+    displayPct.value = rounded
+  }
+
+  if (props.sceneReady && smoothVal >= 99.75 && elapsed >= minMs) {
+    smoothVal = 100
+    displayPct.value = 100
+    paintVisualFrame(100)
     emittedReady = true
     rafId = null
     holdTimer = setTimeout(() => {
       holdTimer = null
       emit('reveal-ready')
-    }, props.fallbackNotice ? 420 : props.holdMs)
+    }, props.fallbackNotice ? 440 : props.holdMs)
     return
   }
 
@@ -162,17 +239,23 @@ function tick(now) {
 function startTicker() {
   if (!props.visible || emittedReady || rafId !== null) return
   startTime = performance.now()
+  lastTime = startTime
+  paintVisualFrame(smoothVal)
   rafId = requestAnimationFrame(tick)
 }
 
 onMounted(() => {
-  if (props.visible) startTicker()
+  if (props.visible) {
+    paintVisualFrame(smoothVal)
+    startTicker()
+  }
 })
 
 watch(() => props.visible, (vis) => {
   if (vis) {
     emittedReady = false
-    smoothProgress.value = 2
+    smoothVal = 0
+    displayPct.value = 0
     startTicker()
   } else {
     stopTicker()
@@ -181,52 +264,27 @@ watch(() => props.visible, (vis) => {
 
 onBeforeUnmount(stopTicker)
 
-const clampedProgress = computed(() => Math.max(0, Math.min(100, smoothProgress.value)))
-const progressRatio = computed(() => clampedProgress.value / 100)
-const displayPct = computed(() => Math.round(clampedProgress.value))
-const outerDashOffset = computed(() => Number((1000 * (1 - progressRatio.value)).toFixed(2)))
-const innerSilkOffset = computed(() => Number((1000 * (1 - Math.max(0, (clampedProgress.value - 3) / 97))).toFixed(2)))
-const waterOpacity = computed(() => Math.max(0, Math.min(1, (clampedProgress.value - 18) / 56)))
 const isComplete = computed(() => displayPct.value >= 100)
 
 const stageMeta = computed(() => {
   if (props.fallbackNotice) {
     return { index: 3, label: props.fallbackNotice }
   }
-  const p = clampedProgress.value
-  if (p >= 99.5) return { index: 3, label: '全景沙盘已就绪，即将进入驾驶舱' }
-  if (p >= 88) return { index: 3, label: '正在编译三维光影与首帧渲染管线' }
-  if (p >= 76) return { index: 2, label: '正在渲染岔河水系与社区拓扑图层' }
-  if (p >= 50) return { index: 1, label: '正在分片构建 4,205 栋三维楼宇白模' }
+  const p = displayPct.value
+  if (p >= 100) return { index: 3, label: '全景沙盘已就绪，即将进入驾驶舱' }
+  if (p >= 82) return { index: 3, label: '正在编译三维光影与首帧渲染管线' }
+  if (p >= 60) return { index: 2, label: '正在渲染岔河水系与社区拓扑图层' }
+  if (p >= 34) return { index: 1, label: '正在分片构建 4,205 栋三维楼宇白模' }
   return { index: 0, label: '正在拉取高清地理底图与卫星影像' }
 })
 
-// 计算外轮廓描边前端光点坐标
-const traceHead = computed(() => {
-  const ratio = clampedProgress.value / 100
-  const target = ratio * geoSvg.totalLen
-  const { closedOuter, cumLens } = geoSvg
-  if (ratio <= 0 || ratio >= 1) return { x: closedOuter[0][0], y: closedOuter[0][1] }
-  let idx = 1
-  while (idx < cumLens.length - 1 && cumLens[idx] < target) idx++
-  const segStart = cumLens[idx - 1]
-  const segLen = Math.max(1e-6, cumLens[idx] - segStart)
-  const t = Math.max(0, Math.min(1, (target - segStart) / segLen))
-  const p0 = closedOuter[idx - 1]
-  const p1 = closedOuter[idx]
-  return {
-    x: Number((p0[0] + (p1[0] - p0[0]) * t).toFixed(2)),
-    y: Number((p0[1] + (p1[1] - p0[1]) * t).toFixed(2))
-  }
-})
-
 const litCommunitiesCount = computed(() =>
-  geoSvg.communities.filter((c) => clampedProgress.value >= c.threshold).length
+  geoSvg.communities.filter((c) => displayPct.value >= c.threshold).length
 )
-const hqLit = computed(() => clampedProgress.value >= 84)
+const hqLit = computed(() => displayPct.value >= 84)
 
 function isCommFresh(comm) {
-  return clampedProgress.value >= comm.threshold && clampedProgress.value < comm.threshold + 12
+  return displayPct.value >= comm.threshold && displayPct.value < comm.threshold + 12
 }
 </script>
 
@@ -282,11 +340,12 @@ function isCommFresh(comm) {
             <!-- 街道疆域底影 -->
             <path v-once :d="geoSvg.outerPath" class="ck-geo-base-fill" fill="url(#ckLoaderFillGrad)" />
 
-            <!-- 真实岔河与长河公园大湖浅水纹（裁剪于街道疆域内，随加载柔缓显影） -->
+            <!-- 真实岔河与长河公园大湖浅水纹（裁剪于街道疆域内，由 rAF 直驱 opacity 柔缓显影） -->
             <g
+              ref="waterLayerRef"
               class="ck-geo-water"
               clip-path="url(#ckLoaderOuterClip)"
-              :style="{ opacity: waterOpacity }"
+              style="opacity: 0"
             >
               <g v-once>
                 <path
@@ -298,7 +357,7 @@ function isCommFresh(comm) {
               </g>
             </g>
 
-            <!-- 14 社区真实界线：随进度逐个点亮 -->
+            <!-- 14 社区真实界线：随整数进度逐个点亮 -->
             <g class="ck-geo-communities">
               <path
                 v-for="comm in geoSvg.communities"
@@ -306,7 +365,7 @@ function isCommFresh(comm) {
                 :d="comm.path"
                 class="ck-geo-comm-poly"
                 :class="{
-                  'is-lit': clampedProgress >= comm.threshold,
+                  'is-lit': displayPct >= comm.threshold,
                   'is-fresh': isCommFresh(comm)
                 }"
               />
@@ -315,43 +374,46 @@ function isCommFresh(comm) {
             <!-- 外轮廓底刻线 -->
             <path v-once :d="geoSvg.outerPath" class="ck-geo-outer-ghost" />
 
-            <!-- 外轮廓半透明宽辉光层（替代 60fps 动态 drop-shadow 滤镜） + 动态描边主线 + 内金丝随行细轨 -->
+            <!-- 外轮廓半透明宽辉光层 + 动态描边主线 + 内金丝随行细轨（rAF 直驱 strokeDashoffset，零 VDOM diff） -->
             <path
+              ref="outerGlowRef"
               :d="geoSvg.outerPath"
               pathLength="1000"
               class="ck-geo-outer-glow"
               stroke="url(#ckLoaderTraceGrad)"
-              :stroke-dashoffset="outerDashOffset"
+              style="stroke-dashoffset: 1000"
             />
             <path
+              ref="outerTraceRef"
               :d="geoSvg.outerPath"
               pathLength="1000"
               class="ck-geo-outer-trace"
               stroke="url(#ckLoaderTraceGrad)"
-              :stroke-dashoffset="outerDashOffset"
+              style="stroke-dashoffset: 1000"
             />
             <path
+              ref="innerSilkRef"
               :d="geoSvg.outerPath"
               pathLength="1000"
               class="ck-geo-inner-silk"
-              :stroke-dashoffset="innerSilkOffset"
+              style="stroke-dashoffset: 1000"
             />
 
-            <!-- 14 社区中心脉络点与简称微水印（点亮瞬间轻浮强调，随后沉淀为淡雅水印） -->
+            <!-- 14 社区中心脉络点与简称微水印（改用 CSS transform scale 替代 SVG 半径重排） -->
             <g class="ck-geo-dots">
               <g
                 v-for="comm in geoSvg.communities"
                 :key="comm.name + '-dot'"
                 class="ck-geo-comm-node"
                 :class="{
-                  'is-lit': clampedProgress >= comm.threshold,
+                  'is-lit': displayPct >= comm.threshold,
                   'is-fresh': isCommFresh(comm)
                 }"
               >
                 <circle
                   :cx="comm.cx"
                   :cy="comm.cy"
-                  :r="clampedProgress >= comm.threshold ? 2.5 : 1.35"
+                  r="2.45"
                   class="ck-geo-comm-dot"
                 />
                 <text
@@ -372,11 +434,11 @@ function isCommFresh(comm) {
               <circle :cx="geoSvg.hqPt[0]" :cy="geoSvg.hqPt[1]" r="4.2" class="ck-geo-hq-core" />
             </g>
 
-            <!-- 描边前端测绘笔尖光点 -->
+            <!-- 描边前端测绘笔尖光点（rAF 直驱 GPU translate3d） -->
             <g
-              v-if="clampedProgress > 1 && clampedProgress < 100"
+              ref="traceTipRef"
               class="ck-geo-tip"
-              :transform="`translate(${traceHead.x}, ${traceHead.y})`"
+              style="opacity: 0"
             >
               <circle r="7" class="ck-geo-tip-halo" />
               <circle r="2.6" class="ck-geo-tip-dot" />
@@ -420,8 +482,10 @@ function isCommFresh(comm) {
             <span class="ck-track-tick" style="left: 25%"></span>
             <span class="ck-track-tick" style="left: 50%"></span>
             <span class="ck-track-tick" style="left: 75%"></span>
-            <div class="ck-meter-fill" :style="{ transform: `scaleX(${progressRatio})` }"></div>
-            <i class="ck-meter-tip" :style="{ left: clampedProgress + '%' }" aria-hidden="true"></i>
+            <div ref="meterFillRef" class="ck-meter-fill" style="transform: scaleX(0)"></div>
+            <div ref="meterTipWrapRef" class="ck-meter-tip-wrap" style="transform: translate3d(0%, 0, 0); opacity: 0" aria-hidden="true">
+              <i class="ck-meter-tip"></i>
+            </div>
           </div>
 
           <!-- 四阶段里程碑 -->
@@ -622,6 +686,7 @@ function isCommFresh(comm) {
   stroke-linejoin: round;
   stroke-dasharray: 1000;
   opacity: 0.2;
+  transition: stroke-dashoffset 140ms linear;
 }
 
 .ck-geo-outer-trace {
@@ -630,6 +695,7 @@ function isCommFresh(comm) {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-dasharray: 1000;
+  transition: stroke-dashoffset 140ms linear;
 }
 
 .ck-geo-inner-silk {
@@ -640,19 +706,25 @@ function isCommFresh(comm) {
   stroke-linejoin: round;
   stroke-dasharray: 1000;
   opacity: 0.65;
+  transition: stroke-dashoffset 140ms linear;
 }
 
 .ck-geo-comm-dot {
   fill: color-mix(in srgb, var(--ck-loader-ink) 20%, transparent);
-  transition: fill 0.42s ease, r 0.42s ease;
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0.56);
+  transition: fill 0.42s ease, transform 0.42s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .ck-geo-comm-node.is-lit .ck-geo-comm-dot {
   fill: var(--ck-loader-stroke-b);
+  transform: scale(1);
 }
 
 .ck-geo-comm-node.is-fresh .ck-geo-comm-dot {
   fill: var(--ck-loader-stroke-a);
+  transform: scale(1.18);
 }
 
 .ck-geo-comm-label {
@@ -721,6 +793,10 @@ function isCommFresh(comm) {
     opacity: 0;
     transform: scale(3.4);
   }
+}
+
+.ck-geo-tip {
+  will-change: transform, opacity;
 }
 
 .ck-geo-tip-halo {
@@ -871,13 +947,40 @@ function isCommFresh(comm) {
   border-radius: 999px;
   transform-origin: left center;
   will-change: transform;
+  overflow: hidden;
+  transition: transform 160ms linear;
   background: linear-gradient(90deg, var(--ck-loader-stroke-a) 0%, var(--ck-loader-stroke-b) 68%, var(--ck-loader-stroke-c) 100%);
   box-shadow: 0 0 10px color-mix(in srgb, var(--ck-loader-stroke-a) 32%, transparent);
   z-index: 2;
 }
 
+.ck-meter-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.55) 50%, transparent 100%);
+  transform: translate3d(-100%, 0, 0);
+  will-change: transform;
+  animation: ckMeterShimmer 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes ckMeterShimmer {
+  0% { transform: translate3d(-100%, 0, 0); }
+  100% { transform: translate3d(100%, 0, 0); }
+}
+
+.ck-meter-tip-wrap {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+  transition: transform 160ms linear, opacity 0.2s ease;
+  z-index: 3;
+}
+
 .ck-meter-tip {
   position: absolute;
+  left: 0;
   top: 50%;
   width: 8px;
   height: 8px;
@@ -885,8 +988,6 @@ function isCommFresh(comm) {
   transform: translate(-50%, -50%);
   background: var(--ck-loader-stroke-c);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--ck-loader-stroke-b) 28%, transparent);
-  z-index: 3;
-  pointer-events: none;
 }
 
 .ck-meter-steps {
@@ -943,7 +1044,13 @@ function isCommFresh(comm) {
 
 @media (prefers-reduced-motion: reduce) {
   .ck-stage-pulse,
-  .ck-geo-hq-ripple { animation: none; }
+  .ck-geo-hq-ripple,
+  .ck-meter-fill::after { animation: none; }
+  .ck-meter-fill,
+  .ck-meter-tip-wrap,
+  .ck-geo-outer-glow,
+  .ck-geo-outer-trace,
+  .ck-geo-inner-silk { transition: none; }
   .ck-loader-reveal-leave-active { transition: opacity 0.24s ease; }
   .ck-loader-reveal-leave-to { transform: none; }
 }

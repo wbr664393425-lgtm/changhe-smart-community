@@ -143,6 +143,117 @@ function getOrBuildGroveStatic(trees, point, pixelScale) {
   return cachedGroveStatic
 }
 
+async function getOrBuildGroveStaticAsync(trees, point, pixelScale, yieldFn) {
+  if (cachedGroveStatic) return cachedGroveStatic
+
+  const forms = [
+    [[0,1.84,0,0.69,0.91,0.66], [-0.42,1.55,0.11,0.62,0.55,0.58], [0.44,1.65,0.16,0.55,0.62,0.58], [0.17,1.88,-0.40,0.52,0.67,0.51], [-0.18,2.21,0.19,0.50,0.56,0.51]],
+    [[0,1.95,0,0.67,1.35,0.68], [-0.27,1.63,0.12,0.48,0.77,0.50], [0.25,2.04,-0.12,0.49,0.90,0.48]],
+    [[0,1.60,0,0.88,0.76,0.77], [-0.39,1.71,-0.18,0.64,0.67,0.66], [0.38,1.74,0.12,0.65,0.64,0.70], [0.00,1.92,0.08,0.68,0.63,0.64]],
+    [[0,1.94,0,0.72,0.63,0.72], [-0.49,1.40,0.12,0.53,0.92,0.61], [0.49,1.42,0.16,0.52,0.89,0.55],
+      [-0.08,1.52,-0.48,0.71,0.89,0.52], [0.08,1.37,0.54,0.62,0.79,0.47]]
+  ]
+  const buckets = forms.map(() => [])
+  for (const [x, y, radius, willow] of trees) {
+    const seed = ((Math.imul(x, 73856093) ^ Math.imul(y, 19349663)) >>> 0)
+    const grove = Math.sin(x * 0.082) + Math.cos(y * 0.12)
+    const type = willow ? 3 : grove > 0.75 && seed % 5 !== 0 ? 1 : seed % 2 === 0 ? 0 : 2
+    buckets[type].push({ p: point([x, y]), r: radius * pixelScale, seed })
+  }
+  if (yieldFn) await yieldFn()
+
+  function branch(a, b, bottom, top) {
+    const axis = b.clone().sub(a)
+    const g = new THREE.CylinderGeometry(top, bottom, axis.length(), 6)
+    g.deleteAttribute('uv')
+    g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis.normalize()))
+    const mid = a.clone().lerp(b, 0.5)
+    return g.translate(mid.x, mid.y, mid.z)
+  }
+  const fork = new THREE.Vector3(0, 0.62, 0)
+  const wood = [
+    branch(new THREE.Vector3(), fork, 0.12, 0.095),
+    branch(fork, new THREE.Vector3(0.10, 1.55, 0.04), 0.095, 0.054),
+    branch(fork, new THREE.Vector3(-0.44, 1.39, 0.11), 0.085, 0.04),
+    branch(new THREE.Vector3(0.03, 0.83, 0), new THREE.Vector3(0.49, 1.55, -0.13), 0.074, 0.037)
+  ]
+  const trunkGeo = mergeGeometries(wood)
+  wood.forEach(g => g.dispose())
+  trunkGeo.computeBoundingSphere()
+
+  const shadowGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2)
+  const size = 32
+  const shadowPixels = new Uint8Array(size * size * 4)
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dist = Math.hypot((x + 0.5) * 2 / size - 1, (y + 0.5) * 2 / size - 1)
+      const i = 4 * (y * size + x)
+      shadowPixels[i] = shadowPixels[i + 1] = shadowPixels[i + 2] = 255
+      shadowPixels[i + 3] = Math.round(255 * (1 - THREE.MathUtils.smoothstep(dist, 0.08, 1)))
+    }
+  }
+  if (yieldFn) await yieldFn()
+
+  const pose = new THREE.Object3D()
+  const tint = new THREE.Color()
+  const totalCount = trees.length
+  const trunkMatrices = new Float32Array(totalCount * 16)
+  const shadowMatrices = new Float32Array(totalCount * 16)
+  const crownSpecs = []
+  let total = 0
+
+  for (let type = 0; type < buckets.length; type++) {
+    const items = buckets[type]
+    if (!items.length) continue
+    const near = crownShape(forms[type], type + 1, false)
+    if (yieldFn) await yieldFn()
+    const far = crownShape(forms[type], type + 1, true)
+    const matrices = new Float32Array(items.length * 16)
+    const colors = new Float32Array(items.length * 3)
+    for (let i = 0; i < items.length; i++) {
+      const { p, r, seed } = items[i]
+      pose.position.set(p.x, 0, p.y)
+      pose.rotation.set(0, (seed % 628) * 0.01, 0)
+      pose.scale.set(r, r * (0.86 + (seed % 31) / 100), r * (0.86 + (seed % 21) / 100))
+      pose.updateMatrix()
+      pose.matrix.toArray(trunkMatrices, total * 16)
+      pose.matrix.toArray(matrices, i * 16)
+
+      const value = 0.72 + (seed % 28) / 100
+      const warmth = (seed % 13) / 75
+      tint.setRGB(value * (type === 1 ? 0.80 : 0.98 + warmth), value, value * (type === 3 ? 1.06 : 0.86 + warmth))
+      colors[i * 3] = tint.r
+      colors[i * 3 + 1] = tint.g
+      colors[i * 3 + 2] = tint.b
+
+      pose.position.set(p.x - 0.23 * r, 0.055, p.y - 0.26 * r)
+      pose.scale.set(2.94 * r, 1, 2.57 * r)
+      pose.updateMatrix()
+      pose.matrix.toArray(shadowMatrices, total * 16)
+      total++
+    }
+    crownSpecs.push({ count: items.length, near, far, matrices, colors })
+    if (yieldFn) await yieldFn()
+  }
+
+  cachedGroveStatic = {
+    totalCount: total,
+    trunkGeo,
+    shadowGeo,
+    shadowSize: size,
+    shadowPixels,
+    trunkMatrices,
+    shadowMatrices,
+    crownSpecs
+  }
+  return cachedGroveStatic
+}
+
+export async function buildCockpitGrovesAsync(trees, point, pixelScale, yieldFn) {
+  await getOrBuildGroveStaticAsync(trees, point, pixelScale, yieldFn)
+  return buildCockpitGroves(trees, point, pixelScale)
+}
+
 export function buildCockpitGroves(trees, point, pixelScale) {
   const cached = getOrBuildGroveStatic(trees, point, pixelScale)
   const group = new THREE.Group()

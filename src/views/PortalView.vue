@@ -837,4 +837,71 @@ function openEvent(ev) {
   font-size: 11.5px;
   color: var(--ink-soft);
 }
+
+@media (max-width: 768px) {
+  .morning-brief {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 14px;
+  }
+  .mb-cta {
+    width: 100%;
+    justify-content: center;
+  }
+  .p3d-canvas-wrap {
+    min-height: 270px;
+    height: 280px;
+  }
+  .p3d-head {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .p3d-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .p3d-controls {
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .p3d-controls::-webkit-scrollbar {
+    display: none;
+  }
+  .staff-banner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 12px 14px;
+  }
+  .sb-kpis {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .sb-kpi {
+    min-width: 0;
+  }
+  .portal-card {
+    padding: 12px;
+  }
+  .pc-head {
+    gap: 6px;
+  }
+  .pc-title {
+    font-size: 13px;
+  }
+  .pc-metric {
+    font-size: 10.5px;
+    padding: 2px 6px;
+  }
+}
+
+@media (max-width: 460px) {
+  .portal-cards {
+    grid-template-columns: 1fr;
+  }
+}
 </style>
