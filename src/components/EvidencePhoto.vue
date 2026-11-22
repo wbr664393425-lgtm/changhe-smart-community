@@ -17,6 +17,11 @@ const props = defineProps({
 })
 
 const lightboxOpen = ref(false)
+const resolvedSrc = computed(() =>
+  typeof props.src === 'string'
+    ? props.src.replace(/(\/photos\/[^?#]+)\.jpg$/i, '$1.webp')
+    : ''
+)
 
 const badgeLabel = computed(() => {
   if (props.badge) return props.badge
@@ -63,7 +68,7 @@ onBeforeUnmount(() => {
     @keydown.space.prevent="openLightbox"
   >
     <img
-      :src="src"
+      :src="resolvedSrc"
       :alt="alt || title"
       class="ev-photo-img"
       :loading="priority === 'lazy' ? 'lazy' : undefined"
@@ -110,7 +115,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="ev-lb-stage">
-            <img :src="src" :alt="title || alt" />
+            <img :src="resolvedSrc" :alt="title || alt" />
           </div>
 
           <div v-if="location || time || person" class="ev-lb-foot">

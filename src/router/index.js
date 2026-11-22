@@ -2,29 +2,18 @@ import { watch } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { store, getCurrentRole, addAuditLog, showToast } from '../store/appStore'
 
-import LoginView from '../views/LoginView.vue'
-import PortalView from '../views/PortalView.vue'
-import CockpitView from '../views/CockpitView.vue'
-import DataHubView from '../views/DataHubView.vue'
-import ThinkTankView from '../views/ThinkTankView.vue'
-import ArmedForcesView from '../views/ArmedForcesView.vue'
-import GridBusinessView from '../views/GridBusinessView.vue'
-import DataDirectView from '../views/DataDirectView.vue'
-import MobileGridView from '../views/MobileGridView.vue'
-import XinchuangView from '../views/XinchuangView.vue'
-
 const routes = [
   { path: '/', redirect: '/cockpit' },
-  { path: '/login', component: LoginView, meta: { public: true } },
-  { path: '/portal', component: PortalView },
-  { path: '/cockpit', component: CockpitView },
-  { path: '/data-hub', component: DataHubView },
-  { path: '/think-tank', component: ThinkTankView },
-  { path: '/armed-forces', component: ArmedForcesView },
-  { path: '/grid', component: GridBusinessView },
-  { path: '/data-direct', component: DataDirectView },
-  { path: '/mobile', component: MobileGridView },
-  { path: '/xinchuang', component: XinchuangView },
+  { path: '/login', component: () => import('../views/LoginView.vue'), meta: { public: true } },
+  { path: '/portal', component: () => import('../views/PortalView.vue') },
+  { path: '/cockpit', component: () => import('../views/CockpitView.vue') },
+  { path: '/data-hub', component: () => import('../views/DataHubView.vue') },
+  { path: '/think-tank', component: () => import('../views/ThinkTankView.vue') },
+  { path: '/armed-forces', component: () => import('../views/ArmedForcesView.vue') },
+  { path: '/grid', component: () => import('../views/GridBusinessView.vue') },
+  { path: '/data-direct', component: () => import('../views/DataDirectView.vue') },
+  { path: '/mobile', component: () => import('../views/MobileGridView.vue') },
+  { path: '/xinchuang', component: () => import('../views/XinchuangView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/portal' }
 ]
 

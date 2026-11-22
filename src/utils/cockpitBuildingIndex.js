@@ -488,10 +488,13 @@ export function getCockpitBuildingIndex() {
     return best
   }
 
+  const careBuildingsList = buildings.filter((b) => b && b.isInner && b.elderAloneCount > 0)
+
   cachedIndex = {
     buildings,
     landmarks,
     estateLandmarks,
+    careBuildingsList,
     totalCount: buildings.length,
     pickBuildingAtXZ,
     findNearestBuildingXZ
@@ -499,15 +502,28 @@ export function getCockpitBuildingIndex() {
   return cachedIndex
 }
 
+let cachedEventMapSig = ''
+let cachedEventMapResult = null
+
 /**
- * 将全站治理事件映射到对应真实 3D 建筑索引
+ * 将全站治理事件映射到对应真实 3D 建筑索引（按关键字段签名缓存，避免多处重复计算）
  */
 export function buildEventBuildingMap(events) {
+  const listIn = events || []
+  let sig = ''
+  for (let i = 0; i < listIn.length; i++) {
+    const ev = listIn[i]
+    sig += `${ev.id}:${ev.stage}:${ev.buildingIndex ?? ''}:${ev.lat ?? ''}:${ev.lng ?? ''}:${ev.community ?? ''}|`
+  }
+  if (cachedEventMapResult && sig === cachedEventMapSig) {
+    return cachedEventMapResult
+  }
+
   const index = getCockpitBuildingIndex()
   const map = new Map() // buildingIndex -> event[]
   const eventToBldg = new Map() // eventId -> buildingMeta
 
-  ;(events || []).forEach((ev) => {
+  listIn.forEach((ev) => {
     let b = null
     if (typeof ev.buildingIndex === 'number' && index.buildings[ev.buildingIndex]) {
       b = index.buildings[ev.buildingIndex]
@@ -532,7 +548,9 @@ export function buildEventBuildingMap(events) {
     list.push(ev)
   })
 
-  return { bldgToEvents: map, eventToBldg }
+  cachedEventMapSig = sig
+  cachedEventMapResult = { bldgToEvents: map, eventToBldg }
+  return cachedEventMapResult
 }
 
 /**
@@ -838,23 +856,29 @@ export function queryEmergencyRadius(cx, cz, radiusUnits = 30, store) {
 
   // 1. 周边网格员（优先 300 米内，同时保证返回最近的 3 名供一键派单）
   const staffSorted = entities.gridStaff
-    .map((s) => ({ ...s, distUnits: Math.hypot(s.x - cx, s.z - cz), distMeters: Math.round(Math.hypot(s.x - cx, s.z - cz) * 10) }))
+    .map((s) => {
+      const d = Math.hypot(s.x - cx, s.z - cz)
+      return { ...s, distUnits: d, distMeters: Math.round(d * 10) }
+    })
     .sort((a, b) => a.distUnits - b.distUnits)
   const staffInRadius = staffSorted.filter((s) => s.distUnits <= radiusUnits)
   const nearbyStaff = staffInRadius.length ? staffInRadius.slice(0, 3) : staffSorted.slice(0, 2)
 
   // 2. 周边共享辅助站（300 米内优先，兜底返回最近 1 处）
   const aidSorted = entities.aidStations
-    .map((a) => ({ ...a, distUnits: Math.hypot(a.x - cx, a.z - cz), distMeters: Math.round(Math.hypot(a.x - cx, a.z - cz) * 10) }))
+    .map((a) => {
+      const d = Math.hypot(a.x - cx, a.z - cz)
+      return { ...a, distUnits: d, distMeters: Math.round(d * 10) }
+    })
     .sort((a, b) => a.distUnits - b.distUnits)
   const aidInRadius = aidSorted.filter((a) => a.distUnits <= radiusUnits)
   const nearbyAids = aidInRadius.length ? aidInRadius.slice(0, 2) : aidSorted.slice(0, 1)
 
-  // 3. 300 米内独居高龄重点关怀楼栋
+  // 3. 300 米内独居高龄重点关怀楼栋（仅遍历预过滤的关怀楼栋列表）
   const careBuildings = []
-  for (let i = 0; i < index.buildings.length; i++) {
-    const b = index.buildings[i]
-    if (!b || !b.isInner || b.elderAloneCount <= 0) continue
+  const careList = index.careBuildingsList || index.buildings
+  for (let i = 0; i < careList.length; i++) {
+    const b = careList[i]
     const d = Math.hypot(b.cx - cx, b.cz - cz)
     if (d <= radiusUnits && d > 0.2) {
       careBuildings.push({
@@ -872,7 +896,10 @@ export function queryEmergencyRadius(cx, cz, radiusUnits = 30, store) {
 
   // 4. 300 米内防汛防火盯防点
   const nearbyEco = entities.ecoRisks
-    .map((p) => ({ ...p, distUnits: Math.hypot(p.x - cx, p.z - cz), distMeters: Math.round(Math.hypot(p.x - cx, p.z - cz) * 10) }))
+    .map((p) => {
+      const d = Math.hypot(p.x - cx, p.z - cz)
+      return { ...p, distUnits: d, distMeters: Math.round(d * 10) }
+    })
     .filter((p) => p.distUnits <= radiusUnits * 1.4)
     .sort((a, b) => a.distUnits - b.distUnits)
     .slice(0, 2)

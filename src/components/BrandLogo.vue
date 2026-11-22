@@ -1,7 +1,7 @@
 <script setup>
-import { computed, watchEffect } from 'vue'
+import { computed } from 'vue'
 import { store } from '../store/appStore'
-import smartCityLogo from '../assets/smart-city-map-logo.png'
+import smartCityLogo from '../assets/smart-city-map-logo.webp'
 
 const props = defineProps({
   size: {
@@ -33,14 +33,6 @@ const logoSrc = computed(() => smartCityLogo)
 const dropShadow = computed(
   () => `drop-shadow(0 2px 6px ${SHADOW_MAP[activePreset.value] || SHADOW_MAP['vermilion-seal']})`
 )
-
-watchEffect(() => {
-  if (typeof document === 'undefined' || props.preset) return
-  const link = document.querySelector('link[rel="icon"]')
-  if (link && link.getAttribute('href') !== logoSrc.value) {
-    link.setAttribute('href', logoSrc.value)
-  }
-})
 </script>
 
 <template>

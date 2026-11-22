@@ -7,7 +7,7 @@ import BrandLogo from '../components/BrandLogo.vue'
 import {
   store, ROLES, PRESETS, COMMUNITIES, switchRole, applyPreset, addAuditLog, showToast
 } from '../store/appStore'
-import loginBg from '../assets/login-bg.jpg'
+import loginBg from '../assets/login-bg.webp'
 
 const router = useRouter()
 const loginTab = ref('account') // account | wechat

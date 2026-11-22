@@ -1,4 +1,4 @@
-import { reactive, watch } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { buildScenePhoto, isLegacySvgPhoto } from '../utils/sampleImages'
 import { evaluateFormula } from '../utils/validators'
 import { CHANGHE_COMMUNITY_GEO } from '../utils/changheGeo'
@@ -1532,11 +1532,13 @@ export function applyPreset(id, event) {
   }, 340)
 }
 
+export const toastMessage = ref('')
+
 export function showToast(msg) {
-  store.toastMessage = msg
+  toastMessage.value = msg
   clearTimeout(toastTimer)
   toastTimer = setTimeout(() => {
-    store.toastMessage = ''
+    toastMessage.value = ''
   }, 3200)
 }
 
@@ -1595,15 +1597,54 @@ export function recalculateLedgerRecord(ledger, values) {
   return next
 }
 
+let persistTimer = null
+let persistIdleId = null
+let persistDirty = false
+
+function flushStorePersist() {
+  if (!persistDirty) return
+  persistDirty = false
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+  }
+  if (persistIdleId !== null) {
+    if (typeof cancelIdleCallback === 'function') cancelIdleCallback(persistIdleId)
+    else clearTimeout(persistIdleId)
+    persistIdleId = null
+  }
+  try {
+    const copy = { ...store, toastMessage: '' }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(copy))
+  } catch {
+    // ignore storage quota error
+  }
+}
+
+function scheduleStorePersist() {
+  persistDirty = true
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    if (typeof requestIdleCallback === 'function') {
+      persistIdleId = requestIdleCallback(() => {
+        persistIdleId = null
+        flushStorePersist()
+      }, { timeout: 1200 })
+    } else {
+      flushStorePersist()
+    }
+  }, 400)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushStorePersist)
+}
+
 watch(
   () => store,
-  (val) => {
-    try {
-      const copy = { ...val, toastMessage: '' }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(copy))
-    } catch {
-      // ignore storage quota error
-    }
+  () => {
+    scheduleStorePersist()
   },
   { deep: true }
 )

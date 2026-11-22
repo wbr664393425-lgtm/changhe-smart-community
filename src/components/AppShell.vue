@@ -7,6 +7,7 @@ import {
 } from 'lucide-vue-next'
 import AppSelect from './AppSelect.vue'
 import BrandLogo from './BrandLogo.vue'
+import GovWatermark from './GovWatermark.vue'
 import {
   store, PRESETS, ROLES, COMMUNITIES, getCurrentRole, getEffectiveCommunity,
   applyPreset, switchRole, resetDemoData, showToast
@@ -25,8 +26,6 @@ const collapsedGroups = ref({})
 const dropdownOpen = ref(false)
 const accountBtnRef = ref(null)
 const dropdownStyle = ref({})
-const nowTick = ref(new Date().toLocaleTimeString('zh-CN', { hour12: false }))
-let timer = null
 
 const currentRole = computed(() => getCurrentRole())
 const effectiveScope = computed(() => getEffectiveCommunity())
@@ -255,16 +254,12 @@ onMounted(() => {
   document.addEventListener('click', onDocClick)
   document.addEventListener('keydown', onGlobalKey)
   window.addEventListener('rui:close-popovers', onGlobalClosePopovers)
-  timer = setInterval(() => {
-    nowTick.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
-  }, 1000)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', onDocClick)
   document.removeEventListener('keydown', onGlobalKey)
   window.removeEventListener('rui:close-popovers', onGlobalClosePopovers)
-  clearInterval(timer)
 })
 </script>
 
@@ -478,10 +473,12 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 全屏低干扰实名防拍水印 -->
-    <div v-if="store.xinchuang.watermarkEnabled" class="gov-watermark" aria-hidden="true">
-      <span v-for="i in 9" :key="i">{{ currentRole.userName }} · {{ currentRole.dept }} · {{ nowTick }}</span>
-    </div>
+    <!-- 全屏低干扰实名防拍水印（独立隔离 1Hz 时钟组件，关闭即停表） -->
+    <GovWatermark
+      v-if="store.xinchuang.watermarkEnabled"
+      :user-name="currentRole.userName"
+      :dept="currentRole.dept"
+    />
 
     <!-- 顶层挂载 100% 不透明实色账号切换下拉框 -->
     <Teleport to="body">

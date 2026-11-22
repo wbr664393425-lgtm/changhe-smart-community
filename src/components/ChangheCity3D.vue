@@ -1,7 +1,7 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, shallowRef, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import * as THREE from 'three'
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { COMMUNITIES, store } from '../store/appStore'
 import { CHANGHE_OUTER_BOUNDARY, CHANGHE_LABEL_OFFSETS } from '../utils/changheGeo'
 import { createCockpitWaterfront, WATER_REFLECTION_LAYER } from '../utils/cockpitWaterfront'
@@ -10,7 +10,10 @@ import {
   latLngToWorldXZ,
   CHANGHE_HQ_LATLNG,
   loadChangheAmapAssets,
-  buildMergedAmapBuildingGeometries
+  ensureAmapTexture,
+  preloadSecondaryAmapAssets,
+  buildMergedAmapBuildingGeometries,
+  buildMergedAmapBuildingGeometriesAsync
 } from '../utils/cityModelCache'
 import {
   getCockpitBuildingIndex,
@@ -40,7 +43,12 @@ const props = defineProps({
   selectedBuildingIndex: { type: Number, default: -1 },
   selectedEntityId: { type: String, default: '' },
   selectedEventId: { type: String, default: '' },
-  emergencyInfo: { type: Object, default: null }
+  emergencyInfo: { type: Object, default: null },
+  // 大屏外部全屏加载序幕与三幕入场协调
+  externalLoader: { type: Boolean, default: false },
+  deferReveal: { type: Boolean, default: false },
+  labelsVisible: { type: Boolean, default: true },
+  paused: { type: Boolean, default: false }
 })
 
 const emit = defineEmits([
@@ -51,7 +59,10 @@ const emit = defineEmits([
   'select-building',
   'select-entity',
   'reset-panorama',
-  'webgl-fallback'
+  'webgl-fallback',
+  'load-progress',
+  'scene-ready',
+  'hover-community'
 ])
 
 const rootEl = ref(null)
@@ -66,14 +77,14 @@ const groundStyle = ref('amap') // amap（高德官方矢量底图·默认） | 
 const comparingImagery = ref(false)
 const IMAGERY_LAYER = 2
 const hoveredLocal = ref('')
-const hoveredBuilding = ref(null) // { bldg, x, y, openCount, chip }
+const hoveredBuilding = shallowRef(null) // { bldg, x, y, openCount, chip }
 const hoveredPatrolIdx = ref(-1)
-const projectedLabels = ref([])
-const projectedEntityLabels = ref([])
-const projectedSingleLabel = ref(null)
-const projectedPatrolLabels = ref([])
-const projectedArmedLabels = ref([])
-const hqScreenPos = ref({ x: 0, y: 0, visible: false })
+const projectedLabels = shallowRef([])
+const projectedEntityLabels = shallowRef([])
+const projectedSingleLabel = shallowRef(null)
+const projectedPatrolLabels = shallowRef([])
+const projectedArmedLabels = shallowRef([])
+const hqScreenPos = shallowRef({ x: 0, y: 0, visible: false })
 
 // 驾驶舱左下角业务图层开关（克制默认：标杆楼宇常显，其余随专题或勾选浮现）
 const cockpitLayers = ref({
@@ -89,14 +100,15 @@ const isNightScene = computed(() => {
   if (lightingOverride.value === 'night') return true
   return props.dark || store.preset === 'command-dark'
 })
-const activeHover = computed(() => hoveredLocal.value || props.hoveredCommunity)
+const activeHover = computed(() => props.hoveredCommunity || hoveredLocal.value)
+watch(hoveredLocal, (name) => emit('hover-community', name || ''))
 
 const SLICE_PALETTES = {
   safety: {
     title: '治理体检 · 隐患态势',
     unit: '社区等级',
-    ticks: ['标杆', '稳健', '关注', '督办'],
-    colors: ['#10b981', '#3b82f6', '#f59e0b', '#ef4444']
+    ticks: ['标杆', '平稳', '关注', '督办'],
+    colors: ['#2a8a5e', '#3d7ea6', '#d08417', '#c8402a']
   },
   party: {
     title: '党建引领 · 在册党员',
@@ -172,7 +184,8 @@ function getCommunityMetricChip(c, slice) {
     return `${sum}关怀`
   }
   const openHz = c.safety.hazards - c.safety.fixed
-  return openHz > 0 ? `${openHz}隐患` : '平稳'
+  if (openHz > 0) return `待销 ${openHz}`
+  return getCommunityLevel(c, 'safety') === 0 ? '标杆' : '平稳'
 }
 
 function pointInPolyXZ(x, z, polyXZ) {
@@ -209,7 +222,9 @@ let overlayGroup = null
 let dynamicGroup = null
 let entityGroup = null
 let emergencyGroup = null
-let selectionOutlineGroup = null
+let selectedOutlineGroup = null
+let hoverOutlineGroup = null
+let imageryMat = null
 let outerTubeMat = null
 let outerGlowMat = null
 let hqBeamMat = null
@@ -217,11 +232,19 @@ let hqBeacon = null
 let hqRings = []
 let arcParticles = []
 let alertRings = []
+let pickableDynamicTargets = []
 const zoneEntries = new Map() // name -> { polyXZ, centerXZ, borderMat, fillMesh, fillMat, selTubeMesh, selTubeMat, community }
+
+// 常驻复用的单栋选中/悬停描边材质，避免悬停切楼反复分配/释放材质
+const selOutlineTopMat = new THREE.MeshBasicMaterial({ color: 0xe63946, transparent: true, opacity: 0.96 })
+const selOutlineBaseMat = new THREE.MeshBasicMaterial({ color: 0xe63946, transparent: true, opacity: 0.72 })
+const hovOutlineTopMat = new THREE.MeshBasicMaterial({ color: 0xd99b38, transparent: true, opacity: 0.96 })
+const hovOutlineBaseMat = new THREE.MeshBasicMaterial({ color: 0xd99b38, transparent: true, opacity: 0.72 })
 
 // 驾驶舱建筑语义索引与 128×64 RGBA DataTexture（兼容所有集显，零新增 DrawCall 动态着色）
 const SEM_TEX_W = 128
 const SEM_TEX_H = 64
+const baseBldgColorData = new Uint8Array(SEM_TEX_W * SEM_TEX_H * 4)
 const bldgColorData = new Uint8Array(SEM_TEX_W * SEM_TEX_H * 4)
 const bldgColorTex = new THREE.DataTexture(bldgColorData, SEM_TEX_W, SEM_TEX_H, THREE.RGBAFormat)
 bldgColorTex.minFilter = THREE.NearestFilter
@@ -233,8 +256,36 @@ let buildingIndexRef = null
 let cockpitEntitiesRef = { gridStaff: [], aidStations: [], ecoRisks: [], landmarks: [] }
 let lastEventBldgMap = new Map()
 let hoveredBldgIndex = -1
+let appliedHoverBldgIndex = -1
+let hoveredBldgMetaCache = null // 缓存同楼移动文案，避免每像素重算 events.filter
+
+// 渲染/投影脏检查与缓存状态
+let hostWidth = 0
+let hostHeight = 0
+let cachedCanvasRect = null
+let lastCursor = ''
+let pointerMoveRaf = null
+let pendingPointerClient = null
+let labelsDirty = true
+let hasLastCamVP = false
+const _tmpCamVP = new THREE.Matrix4()
+const _lastCamVP = new Float32Array(16)
+let staticRenderNeeded = true
+let cancelSecondaryPreload = null
+
+// 预解析专题配色，避免 updateZoneStyles 每次悬停重复 new THREE.Color
+const SLICE_COLOR_CACHE = new Map()
+function getCachedThreeColor(hex) {
+  let c = SLICE_COLOR_CACHE.get(hex)
+  if (!c) {
+    c = new THREE.Color(hex)
+    SLICE_COLOR_CACHE.set(hex, c)
+  }
+  return c
+}
 
 // 着色器统一驱动（切换日/夜与主题时瞬间平滑更新，无需重建几何体）
+const [hqIntroX, hqIntroZ] = latLngToWorldXZ(CHANGHE_HQ_LATLNG[0], CHANGHE_HQ_LATLNG[1])
 const bldgUniforms = {
   uBottomCol: { value: new THREE.Color('#cfd8e3') },
   uTopCol: { value: new THREE.Color('#f6f8fb') },
@@ -245,17 +296,31 @@ const bldgUniforms = {
   uOuterTopCol: { value: new THREE.Color('#f2f5f9') },
   uOuterRoofCol: { value: new THREE.Color('#f7f9fc') },
   uBldgColorTex: { value: bldgColorTex },
-  uUseSemantic: { value: 0 }
+  uUseSemantic: { value: 0 },
+  // 入场指挥中心柔光扫楼 + 楼宇优雅苏醒（零额外 DrawCall）
+  uWaveOrigin: { value: new THREE.Vector2(hqIntroX, hqIntroZ) },
+  uWaveRadius: { value: 1400.0 },
+  uWaveActive: { value: 0.0 },
+  uWaveColor: { value: new THREE.Color('#e8c484') }
 }
+
+let targetFogDensity = 0.00046
+let targetEdgeInOp = 0.56
+let targetEdgeOutOp = 0.28
 
 let rafId = null
 let resizeObserver = null
 let intersectionObserver = null
 let isRenderPaused = false
+let introHoldPaused = false
 let contentSkipped = false
 let narrowScreen = null
 let prefersReducedMotion = false
 let isDisposed = false
+
+const _tmpIntroLook = new THREE.Vector3()
+const _tmpIntroOffset = new THREE.Vector3()
+const _tmpIntroSph = new THREE.Spherical()
 
 const raycaster = new THREE.Raycaster()
 const pointer = new THREE.Vector2()
@@ -264,6 +329,85 @@ let pointerDownPos = { x: 0, y: 0 }
 const camTargetPos = new THREE.Vector3()
 const camTargetLook = new THREE.Vector3()
 let isCamAnimating = false
+let introCamAnim = null
+let introWaveAnim = null
+
+function getIntroStartPose() {
+  const hero = getCameraPose('hero')
+  const offset = hero.pos.clone().sub(hero.look)
+  const sph = new THREE.Spherical().setFromVector3(offset)
+  sph.radius *= 1.44
+  sph.phi = Math.max(0.24, sph.phi * 0.88)
+  sph.theta += 0.245 // 约 +14° 航拍优雅偏航角，落位时走电影级轻弧线
+  const startLook = new THREE.Vector3(hero.look.x - 6, hero.look.y + 10, hero.look.z - 20)
+  const startPos = startLook.clone().add(new THREE.Vector3().setFromSpherical(sph))
+  return { pos: startPos, look: startLook }
+}
+
+function finishIntroVisualsImmediately() {
+  introCamAnim = null
+  introWaveAnim = null
+  introHoldPaused = false
+  bldgUniforms.uWaveActive.value = 0.0
+  bldgUniforms.uWaveRadius.value = 1400.0
+  if (scene?.fog) scene.fog.density = targetFogDensity
+  if (innerEdgeMat) innerEdgeMat.opacity = targetEdgeInOp
+  if (outerEdgeMat) outerEdgeMat.opacity = targetEdgeOutOp
+  waterfront?.setReflectionPaused(false)
+}
+
+function playIntroCamera(durationMs = 2050) {
+  if (!camera || !controls || isDisposed) return
+  introHoldPaused = false
+  const hero = getCameraPose('hero')
+  if (prefersReducedMotion || durationMs <= 0) {
+    finishIntroVisualsImmediately()
+    isCamAnimating = false
+    camera.position.copy(hero.pos)
+    controls.target.copy(hero.look)
+    controls.update()
+    handleVisibilityChange()
+    return
+  }
+
+  const start = getIntroStartPose()
+  const fromSph = new THREE.Spherical().setFromVector3(start.pos.clone().sub(start.look))
+  const toSph = new THREE.Spherical().setFromVector3(hero.pos.clone().sub(hero.look))
+
+  isCamAnimating = false
+  camera.position.copy(start.pos)
+  controls.target.copy(start.look)
+  controls.update()
+
+  const now = performance.now()
+  introCamAnim = {
+    startTime: now,
+    duration: durationMs,
+    fromSph,
+    toSph,
+    fromLook: start.look.clone(),
+    toLook: hero.look.clone()
+  }
+
+  // 同步启动指挥中心柔光扫楼 + 晨雾渐散 + 屋顶棱线凝现（2 秒弧线期间复用预热好的水面倒影，杜绝帧率抖动）
+  bldgUniforms.uWaveActive.value = 1.0
+  bldgUniforms.uWaveRadius.value = -36.0
+  if (scene?.fog) scene.fog.density = targetFogDensity * 1.95
+  if (innerEdgeMat) innerEdgeMat.opacity = 0
+  if (outerEdgeMat) outerEdgeMat.opacity = 0
+  waterfront?.setReflectionPaused(true)
+  introWaveAnim = {
+    startTime: now + 80,
+    waveDuration: 1920,
+    fogDuration: 1680
+  }
+
+  handleVisibilityChange()
+}
+
+defineExpose({
+  playIntroCamera
+})
 
 function getCameraPose(preset = 'hero') {
   if (props.mode === 'single' && props.singleEvent) {
@@ -342,6 +486,7 @@ function getCameraPose(preset = 'hero') {
 }
 
 function animateCameraTo(pos, look) {
+  if (introCamAnim || introWaveAnim) finishIntroVisualsImmediately()
   camTargetPos.copy(pos)
   camTargetLook.copy(look)
   if (prefersReducedMotion && camera && controls) {
@@ -371,15 +516,32 @@ function toggleGroundStyle() {
   groundStyle.value = groundStyle.value === 'amap' ? 'sat' : 'amap'
 }
 
-function toggleImageryComparison() {
+async function toggleImageryComparison() {
   if (!camera) return
+  if (!comparingImagery.value && assetsRef && !assetsRef.satTex) {
+    try {
+      const tex = await ensureAmapTexture('satTex')
+      if (isDisposed || !camera) return
+      if (tex) {
+        tex.anisotropy = renderer ? Math.min(8, renderer.capabilities.getMaxAnisotropy()) : 4
+        if (typeof renderer?.initTexture === 'function') renderer.initTexture(tex)
+        if (imageryMat) {
+          imageryMat.map = tex
+          imageryMat.needsUpdate = true
+        }
+      }
+    } catch {
+      return
+    }
+  }
   comparingImagery.value = !comparingImagery.value
   camera.layers.set(comparingImagery.value ? IMAGERY_LAYER : 0)
+  staticRenderNeeded = true
   if (comparingImagery.value) {
     clearHoveredBuilding()
     hoveredLocal.value = ''
     updateZoneStyles()
-    renderer.domElement.style.cursor = 'grab'
+    setCanvasCursor('grab')
   }
 }
 
@@ -435,25 +597,48 @@ function createAmapBuildingMaterial(isInner) {
     shader.uniforms.uRoofCol = isInner ? bldgUniforms.uRoofCol : bldgUniforms.uOuterRoofCol
     shader.uniforms.uLineCol = bldgUniforms.uLineCol
     shader.uniforms.uNight = bldgUniforms.uNight
-    shader.uniforms.uBldgColorTex = bldgUniforms.uBldgColorTex
-    shader.uniforms.uUseSemantic = bldgUniforms.uUseSemantic
+    if (isInner) {
+      shader.uniforms.uBldgColorTex = bldgUniforms.uBldgColorTex
+      shader.uniforms.uUseSemantic = bldgUniforms.uUseSemantic
+    }
+    shader.uniforms.uWaveOrigin = bldgUniforms.uWaveOrigin
+    shader.uniforms.uWaveRadius = bldgUniforms.uWaveRadius
+    shader.uniforms.uWaveActive = bldgUniforms.uWaveActive
+    shader.uniforms.uWaveColor = bldgUniforms.uWaveColor
 
     shader.vertexShader = `
       attribute float aHeightRatio;
-      attribute float aBldgId;
+      ${isInner ? 'attribute float aBldgId;' : ''}
+      uniform vec2 uWaveOrigin;
+      uniform float uWaveRadius;
+      uniform float uWaveActive;
       varying float vHR;
-      varying float vBldgId;
-      varying vec3 vWPos;
-      varying vec3 vWNorm;
+      ${isInner ? 'varying vec2 vSemUv;' : ''}
+      varying float vWorldY;
+      varying float vIsRoof;
+      varying float vSunBias;
+      varying float vWaveDist;
     ` + shader.vertexShader
 
     shader.vertexShader = shader.vertexShader.replace(
       '#include <begin_vertex>',
       `#include <begin_vertex>
        vHR = aHeightRatio;
-       vBldgId = aBldgId;
-       vWPos = (modelMatrix * vec4(position, 1.0)).xyz;
-       vWNorm = normalize(mat3(modelMatrix) * objectNormal);`
+       ${isInner ? 'vSemUv = vec2((mod(aBldgId, 128.0) + 0.5) / 128.0, (floor(aBldgId / 128.0) + 0.5) / 64.0);' : ''}
+       vWaveDist = 0.0;
+       if (uWaveActive > 0.5) {
+         float wDist = length(position.xz - uWaveOrigin);
+         vWaveDist = wDist;
+         float passed = 1.0 - smoothstep(uWaveRadius - 125.0, uWaveRadius + 28.0, wDist);
+         float growth = mix(0.24, 1.0, passed);
+         transformed.y *= growth;
+       }
+       vec3 wPosB = (modelMatrix * vec4(transformed, 1.0)).xyz;
+       vWorldY = wPosB.y;
+       vec3 wNormB = normalize(mat3(modelMatrix) * objectNormal);
+       vIsRoof = step(0.65, wNormB.y);
+       // 东西/南北立面细微明暗立体区分（normalize(vec3(0.55, 0.55, 0.62)) 预计算常量）
+       vSunBias = 0.93 + 0.09 * clamp(dot(wNormB, vec3(0.5534, 0.5534, 0.6238)), -1.0, 1.0);`
     )
 
     shader.fragmentShader = `
@@ -462,61 +647,68 @@ function createAmapBuildingMaterial(isInner) {
       uniform vec3 uRoofCol;
       uniform vec3 uLineCol;
       uniform float uNight;
-      uniform sampler2D uBldgColorTex;
-      uniform float uUseSemantic;
+      ${isInner ? 'uniform sampler2D uBldgColorTex;\n      uniform float uUseSemantic;' : ''}
+      uniform float uWaveRadius;
+      uniform float uWaveActive;
+      uniform vec3 uWaveColor;
       varying float vHR;
-      varying float vBldgId;
-      varying vec3 vWPos;
-      varying vec3 vWNorm;
+      ${isInner ? 'varying vec2 vSemUv;' : ''}
+      varying float vWorldY;
+      varying float vIsRoof;
+      varying float vSunBias;
+      varying float vWaveDist;
     ` + shader.fragmentShader
 
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <color_fragment>',
       `#include <color_fragment>
-       float isRoof = step(0.65, vWNorm.y);
+       float hrClamped = clamp(vHR, 0.0, 1.0);
        // 垂直柔和渐变（底部接地沉稳，上部明亮通透）
-       vec3 wallGrad = mix(uBottomCol, uTopCol, pow(clamp(vHR, 0.0, 1.0), 0.78));
+       vec3 wallGrad = mix(uBottomCol, uTopCol, pow(hrClamped, 0.78));
        // 极其克制细腻的楼层水平玻璃线（每 0.42 单位 = 一层楼，远看干净不杂乱，近看极精致）
-       float floorBand = smoothstep(0.84, 0.96, abs(sin(vWPos.y * 7.4)));
+       float floorSine = abs(sin(vWorldY * 7.4));
+       float floorBand = smoothstep(0.84, 0.96, floorSine);
        wallGrad = mix(wallGrad, uLineCol, floorBand * ${isInner ? '0.26' : '0.12'});
-       // 东西/南北立面细微明暗立体区分，强化高德 3D 建筑体块雕塑感
-       float sunBias = 0.93 + 0.09 * clamp(dot(vWNorm, normalize(vec3(0.55, 0.55, 0.62))), -1.0, 1.0);
-       vec3 baseCol = mix(wallGrad * sunBias, uRoofCol, isRoof);
+       vec3 baseCol = mix(wallGrad * vSunBias, uRoofCol, vIsRoof);
        ${isInner ? `
+       vec4 semSample = vec4(0.0);
        if (uUseSemantic > 0.5) {
-         float bx = mod(vBldgId, 128.0) + 0.5;
-         float by = floor(vBldgId / 128.0) + 0.5;
-         vec4 sem = texture2D(uBldgColorTex, vec2(bx / 128.0, by / 64.0));
-         if (sem.a > 0.01) {
+         semSample = texture2D(uBldgColorTex, vSemUv);
+         if (semSample.a > 0.01) {
            // 保留立面垂直渐变、楼层玻璃线和日光体块明暗，绝不糊成平涂色块
-           vec3 semWall = mix(sem.rgb * 0.78, sem.rgb * 1.10, pow(clamp(vHR, 0.0, 1.0), 0.75));
-           semWall = mix(semWall, uLineCol, floorBand * 0.20) * sunBias;
-           vec3 semRoof = mix(sem.rgb, vec3(1.0), 0.24);
-           baseCol = mix(baseCol, mix(semWall, semRoof, isRoof), sem.a);
+           vec3 semWall = mix(semSample.rgb * 0.78, semSample.rgb * 1.10, pow(hrClamped, 0.75));
+           semWall = mix(semWall, uLineCol, floorBand * 0.20) * vSunBias;
+           vec3 semRoof = mix(semSample.rgb, vec3(1.0), 0.24);
+           baseCol = mix(baseCol, mix(semWall, semRoof, vIsRoof), semSample.a);
          }
        }` : ''}
+       if (uWaveActive > 0.5) {
+         float wDelta = (vWaveDist - uWaveRadius) / 30.0;
+         float wRing = exp(-(wDelta * wDelta));
+         baseCol = mix(baseCol, uWaveColor, wRing * ${isInner ? '0.28' : '0.14'});
+       }
        diffuseColor.rgb = baseCol;`
     )
 
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <emissivemap_fragment>',
       `#include <emissivemap_fragment>
+       if (uWaveActive > 0.5) {
+         float wDeltaE = (vWaveDist - uWaveRadius) / 28.0;
+         float wRingE = exp(-(wDeltaE * wDeltaE));
+         float wBoost = ${isInner ? '0.46' : '0.20'} * (0.35 + 0.65 * pow(hrClamped, 1.3));
+         totalEmissiveRadiance += uWaveColor * wRingE * wBoost;
+       }
        if (uNight > 0.5) {
-         float isRoofE = step(0.65, vWNorm.y);
-         float topGlow = pow(clamp(vHR, 0.0, 1.0), 1.65);
-         float floorGlow = smoothstep(0.86, 0.98, abs(sin(vWPos.y * 7.4)));
+         float topGlow = pow(hrClamped, 1.65);
+         float floorGlow = smoothstep(0.86, 0.98, floorSine);
          // 夜间 DataV 晶格微发光：顶部柔和辉光 + 细腻楼层横丝，彻底告别死黑方块
          vec3 sideEmit = uTopCol * (0.14 + topGlow * ${isInner ? '0.36' : '0.14'}) + uLineCol * floorGlow * ${isInner ? '0.22' : '0.06'};
          vec3 roofEmit = uRoofCol * ${isInner ? '0.28' : '0.10'};
-         totalEmissiveRadiance += mix(sideEmit, roofEmit, isRoofE);
+         totalEmissiveRadiance += mix(sideEmit, roofEmit, vIsRoof);
          ${isInner ? `
-         if (uUseSemantic > 0.5) {
-           float bxE = mod(vBldgId, 128.0) + 0.5;
-           float byE = floor(vBldgId / 128.0) + 0.5;
-           vec4 semE = texture2D(uBldgColorTex, vec2(bxE / 128.0, byE / 64.0));
-           if (semE.a > 0.35) {
-             totalEmissiveRadiance += semE.rgb * (semE.a * (0.16 + topGlow * 0.16));
-           }
+         if (uUseSemantic > 0.5 && semSample.a > 0.35) {
+           totalEmissiveRadiance += semSample.rgb * (semSample.a * (0.16 + topGlow * 0.16));
          }` : ''}
        }`
     )
@@ -650,7 +842,10 @@ function applyVisualTheme() {
   bldgUniforms.uNight.value = night ? 1 : 0
   scene.background = new THREE.Color(t.bg)
   scene.fog.color.set(t.bg)
-  scene.fog.density = night ? 0.00056 : 0.00046
+  targetFogDensity = night ? 0.00056 : 0.00046
+  if (!introWaveAnim) {
+    scene.fog.density = targetFogDensity
+  }
   if (farGroundMesh) farGroundMesh.material.color.set(t.far)
 
   sunLight.intensity = t.sunInt
@@ -668,9 +863,12 @@ function applyVisualTheme() {
   bldgUniforms.uOuterBottomCol.value.set(t.outerBottom)
   bldgUniforms.uOuterTopCol.value.set(t.outerTop)
   bldgUniforms.uOuterRoofCol.value.set(t.outerRoof)
+  bldgUniforms.uWaveColor.value.set(t.hqRing || t.outerGlow || '#e8c484')
 
-  if (innerEdgeMat) { innerEdgeMat.color.set(t.edgeIn); innerEdgeMat.opacity = t.edgeInOp }
-  if (outerEdgeMat) { outerEdgeMat.color.set(t.edgeOut); outerEdgeMat.opacity = t.edgeOutOp }
+  targetEdgeInOp = t.edgeInOp
+  targetEdgeOutOp = t.edgeOutOp
+  if (innerEdgeMat) { innerEdgeMat.color.set(t.edgeIn); if (!introWaveAnim) innerEdgeMat.opacity = t.edgeInOp }
+  if (outerEdgeMat) { outerEdgeMat.color.set(t.edgeOut); if (!introWaveAnim) outerEdgeMat.opacity = t.edgeOutOp }
   if (outerTubeMat) outerTubeMat.color.set(t.outerLine)
   if (outerGlowMat) outerGlowMat.color.set(t.outerGlow)
   if (hqBeamMat) hqBeamMat.color.set(t.hqBeam)
@@ -681,17 +879,32 @@ function applyVisualTheme() {
   hqRings.forEach((r) => r.mat.color.set(t.hqRing))
 
   if (groundMat) {
-    if (isSat) {
-      groundMat.map = assetsRef.satTex
-      groundMat.color.set(night ? '#5a6a82' : '#ffffff')
+    const desiredKey = isSat ? 'satTex' : (night ? 'darkVecTex' : 'lightVecTex')
+    const desiredTex = assetsRef[desiredKey]
+    if (desiredTex) {
+      const prevHasMap = Boolean(groundMat.map)
+      groundMat.map = desiredTex
+      if (!prevHasMap) groundMat.needsUpdate = true
     } else {
-      groundMat.map = night ? assetsRef.darkVecTex : assetsRef.lightVecTex
-      groundMat.color.set('#ffffff')
+      // 若用户抢先切换时尚未完成后台静默预热，立即按需加载并自动无缝上屏
+      ensureAmapTexture(desiredKey)
+        .then((tex) => {
+          if (isDisposed || !renderer || !tex) return
+          tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy())
+          if (typeof renderer.initTexture === 'function') renderer.initTexture(tex)
+          if (desiredKey === 'satTex' && imageryMat && imageryMat.map !== tex) {
+            imageryMat.map = tex
+            imageryMat.needsUpdate = true
+          }
+          applyVisualTheme()
+        })
+        .catch(() => {})
     }
-    groundMat.needsUpdate = true
+    groundMat.color.set(isSat && night ? '#5a6a82' : '#ffffff')
   }
 
-  if (renderer.shadowMap) renderer.shadowMap.needsUpdate = true
+  // 光源方向与楼宇几何未变动，无需重烘 2048×2048 阴影贴图
+  staticRenderNeeded = true
 }
 
 function disposeGroup(grp) {
@@ -699,7 +912,7 @@ function disposeGroup(grp) {
   grp.traverse((obj) => {
     if (obj.isInstancedMesh) obj.dispose()
     if (obj.geometry && !obj.userData.sharedGeo) obj.geometry.dispose()
-    if (obj.material) {
+    if (obj.material && !obj.userData.sharedMat) {
       if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose())
       else obj.material.dispose()
     }
@@ -707,7 +920,7 @@ function disposeGroup(grp) {
 }
 
 // ── 构建高德官方风格 1:1 真实多边形三维城市 ──
-function buildAmap3DCity() {
+function buildAmap3DCity(precomputedGeos = null) {
   if (!scene || !assetsRef) return
   if (cityGroup) {
     waterfront?.disposeInactive()
@@ -741,7 +954,7 @@ function buildAmap3DCity() {
   const groundCZ = (zN + zS) / 2
 
   groundMat = new THREE.MeshStandardMaterial({
-    map: assetsRef.lightVecTex,
+    map: (isNightScene.value ? assetsRef.darkVecTex : assetsRef.lightVecTex) || assetsRef.lightVecTex || assetsRef.darkVecTex,
     roughness: 0.94,
     metalness: 0.02
   })
@@ -767,9 +980,10 @@ function buildAmap3DCity() {
 
   if (props.mode === 'cockpit') {
     // 共用原地面的投影和卫星纹理，切换时保留当前相机、光照方案和业务选择。
-    const imagery = new THREE.Mesh(groundMesh.geometry, new THREE.MeshBasicMaterial({
-      map: assetsRef.satTex, toneMapped: false, fog: false
-    }))
+    imageryMat = new THREE.MeshBasicMaterial({
+      map: assetsRef.satTex || null, toneMapped: false, fog: false
+    })
+    const imagery = new THREE.Mesh(groundMesh.geometry, imageryMat)
     imagery.userData.sharedGeo = true
     imagery.position.copy(groundMesh.position)
     imagery.rotation.copy(groundMesh.rotation)
@@ -782,7 +996,7 @@ function buildAmap3DCity() {
   }
 
   // 3. 合批 4,205 栋精确多边形真实轮廓 3D 建筑 + 锐利屋顶轮廓棱边线
-  const geos = buildMergedAmapBuildingGeometries(amapPolyData.buildings)
+  const geos = precomputedGeos || buildMergedAmapBuildingGeometries(amapPolyData.buildings)
 
   innerBldgMat = createAmapBuildingMaterial(true)
   const innerMesh = new THREE.Mesh(geos.inner.meshGeo, innerBldgMat)
@@ -943,6 +1157,7 @@ function rebuildDynamicEvents() {
   }
   arcParticles = []
   alertRings = []
+  pickableDynamicTargets = []
   dynamicGroup = new THREE.Group()
   scene.add(dynamicGroup)
 
@@ -1234,14 +1449,13 @@ function rebuildDynamicEvents() {
     }
   })
 
-  if (props.mode === 'cockpit') {
-    updateBuildingSemanticTexture()
-    rebuildCockpitEntities()
-    rebuildEmergencyRing()
-  }
+  pickableDynamicTargets = dynamicGroup.children.filter(
+    (obj) => obj.userData?.armedPoint || obj.userData?.eventObj
+  )
+  staticRenderNeeded = true
 }
 
-/** 写入 128×64 建筑语义着色纹理（克制低饱和高质感点睛，保留 85%+ 原有白模/暗夜晶格美学） */
+/** 写入 128×64 建筑语义着色纹理（底色镜像 + 悬停 O(1) 增量叠加，保留 85%+ 原有白模/暗夜晶格美学） */
 function updateBuildingSemanticTexture() {
   if (props.mode !== 'cockpit') {
     bldgUniforms.uUseSemantic.value = 0
@@ -1253,22 +1467,21 @@ function updateBuildingSemanticTexture() {
   lastEventBldgMap = bldgToEvents
 
   const selIdx = props.selectedBuildingIndex
-  const hovIdx = hoveredBldgIndex
   const slice = props.slice
   const selComm = props.selectedCommunity
   const night = isNightScene.value
   const emgCareSet = new Set((props.emergencyInfo?.careBuildings || []).map((c) => c.index))
 
-  // 清空所有像素（alpha=0 表示完全保留原有精调渐变白模）
-  bldgColorData.fill(0)
+  // 先写入不含 hover 的底色镜像（alpha=0 表示完全保留原有精调渐变白模）
+  baseBldgColorData.fill(0)
 
-  const setPx = (idx, r, g, b, aFloat) => {
+  const setBasePx = (idx, r, g, b, aFloat) => {
     if (idx < 0 || idx >= SEM_TEX_W * SEM_TEX_H) return
     const off = idx * 4
-    bldgColorData[off] = r
-    bldgColorData[off + 1] = g
-    bldgColorData[off + 2] = b
-    bldgColorData[off + 3] = Math.max(0, Math.min(255, Math.round(aFloat * 255)))
+    baseBldgColorData[off] = r
+    baseBldgColorData[off + 1] = g
+    baseBldgColorData[off + 2] = b
+    baseBldgColorData[off + 3] = Math.max(0, Math.min(255, Math.round(aFloat * 255)))
   }
 
   const list = buildingIndexRef.buildings
@@ -1280,111 +1493,158 @@ function updateBuildingSemanticTexture() {
     const hasOpenEv = evs.some((e) => e.stage !== '已办结')
     const inSelComm = selComm === '全街道' || b.community === selComm
 
-    // 1. 当前选中或悬停单栋楼：温润高亮点睛
+    // 1. 当前选中单栋楼：温润高亮点睛
     if (i === selIdx) {
-      setPx(i, 214, 72, 62, 0.86)
-      continue
-    }
-    if (i === hovIdx) {
-      setPx(i, 212, 152, 64, 0.72)
+      setBasePx(i, 214, 72, 62, 0.86)
       continue
     }
 
     // 2. 300m 联动圈内受波及独居高龄重点楼：柔和紫金高亮
     if (emgCareSet.has(i)) {
-      setPx(i, 139, 92, 246, 0.78)
+      setBasePx(i, 139, 92, 246, 0.78)
       continue
     }
 
     // 非锁定社区轻微压柔，突出焦点社区
     if (!inSelComm) {
-      if (night) setPx(i, 18, 26, 40, 0.42)
-      else setPx(i, 218, 215, 210, 0.36)
+      if (night) setBasePx(i, 18, 26, 40, 0.42)
+      else setBasePx(i, 218, 215, 210, 0.36)
       continue
     }
 
     // 3. 按当前驾驶舱五章专题克制点睛（仅对真正有该业务特征的少数重点楼着色）
     if (slice === 'safety') {
       if (hasOpenEv) {
-        setPx(i, 210, 56, 56, 0.84) // 红牌/在办隐患事件楼
+        setBasePx(i, 210, 56, 56, 0.84)
       } else if (b.baseHazard) {
-        setPx(i, 218, 134, 48, 0.62) // 待复核关注楼
+        setBasePx(i, 218, 134, 48, 0.62)
       } else if (b.isLandmark) {
-        setPx(i, 186, 146, 78, 0.56) // 标杆重点楼
+        setBasePx(i, 186, 146, 78, 0.56)
       }
     } else if (slice === 'party') {
       if (b.isLandmark || b.category === 'public') {
-        setPx(i, 188, 44, 54, 0.74) // 党群阵地与公服楼
+        setBasePx(i, 188, 44, 54, 0.74)
       } else if (b.partyMembers >= 5) {
-        setPx(i, 206, 98, 92, 0.48) // 党员密集红领楼栋
+        setBasePx(i, 206, 98, 92, 0.48)
       }
     } else if (slice === 'economy') {
       if (b.profileKey === 'commercial' || b.revenueYi >= 3.8) {
-        setPx(i, 208, 148, 46, 0.78) // 重点税源与规上楼宇
+        setBasePx(i, 208, 148, 46, 0.78)
       } else if (b.category === 'commercial' || b.profileKey === 'district') {
-        setPx(i, 218, 178, 98, 0.54) // 常规商务与示范商圈
+        setBasePx(i, 218, 178, 98, 0.54)
       } else if (hasOpenEv) {
-        setPx(i, 210, 56, 56, 0.72)
+        setBasePx(i, 210, 56, 56, 0.72)
       }
     } else if (slice === 'eco') {
       if (b.floodNear) {
-        setPx(i, 42, 146, 198, 0.64) // 易涝临河关注楼
+        setBasePx(i, 42, 146, 198, 0.64)
       } else if (b.community === '芦李府社区' || b.community === '赵辛社区' || b.community === '岳庄社区') {
-        if (b.baseHazard) setPx(i, 218, 114, 46, 0.60) // 林缘防火关注点周边
+        if (b.baseHazard) setBasePx(i, 218, 114, 46, 0.60)
       }
     } else if (slice === 'aid') {
       if (b.elderAloneCount >= 4) {
-        setPx(i, 134, 92, 214, 0.76) // 独居高龄密集关怀楼
+        setBasePx(i, 134, 92, 214, 0.76)
       } else if (b.elderAloneCount >= 1) {
-        setPx(i, 162, 132, 220, 0.46) // 常规关怀楼
+        setBasePx(i, 162, 132, 220, 0.46)
       }
     }
   }
 
+  bldgColorData.set(baseBldgColorData)
+  appliedHoverBldgIndex = -1
+  if (hoveredBldgIndex >= 0 && hoveredBldgIndex !== selIdx && hoveredBldgIndex < SEM_TEX_W * SEM_TEX_H) {
+    const off = hoveredBldgIndex * 4
+    bldgColorData[off] = 212
+    bldgColorData[off + 1] = 152
+    bldgColorData[off + 2] = 64
+    bldgColorData[off + 3] = Math.round(0.72 * 255)
+    appliedHoverBldgIndex = hoveredBldgIndex
+  }
   bldgColorTex.needsUpdate = true
-  rebuildSelectionOutline()
+  rebuildSelectedOutline()
+  rebuildHoverOutline()
+  staticRenderNeeded = true
 }
 
-/** 单栋选中/悬停楼栋精确屋顶轮廓线（复用单组轻量化 LineLoop，零穿模） */
-function rebuildSelectionOutline() {
+/** 鼠标跨楼悬停 O(1) 增量更新语义纹理（仅改旧/新 2 像素，免全量遍历 4,205 栋楼与重建选中描边） */
+function applyHoverSemanticDelta(nextIdx) {
+  if (props.mode !== 'cockpit') return
+  const prevIdx = appliedHoverBldgIndex
+  if (prevIdx >= 0 && prevIdx < SEM_TEX_W * SEM_TEX_H) {
+    const off = prevIdx * 4
+    bldgColorData[off] = baseBldgColorData[off]
+    bldgColorData[off + 1] = baseBldgColorData[off + 1]
+    bldgColorData[off + 2] = baseBldgColorData[off + 2]
+    bldgColorData[off + 3] = baseBldgColorData[off + 3]
+  }
+  if (nextIdx >= 0 && nextIdx !== props.selectedBuildingIndex && nextIdx < SEM_TEX_W * SEM_TEX_H) {
+    const off = nextIdx * 4
+    bldgColorData[off] = 212
+    bldgColorData[off + 1] = 152
+    bldgColorData[off + 2] = 64
+    bldgColorData[off + 3] = Math.round(0.72 * 255)
+    appliedHoverBldgIndex = nextIdx
+  } else {
+    appliedHoverBldgIndex = -1
+  }
+  bldgColorTex.needsUpdate = true
+  rebuildHoverOutline()
+  staticRenderNeeded = true
+}
+
+function buildSingleOutlineGroup(b, r, topMat, baseMat) {
+  const grp = new THREE.Group()
+  const roofPts = b.pts.map(([x, z]) => new THREE.Vector3(x, b.height + 0.35, z))
+  if (roofPts.length >= 3) {
+    const curve = new THREE.CatmullRomCurve3(roofPts, true, 'catmullrom', 0.02)
+    const topMesh = new THREE.Mesh(
+      new THREE.TubeGeometry(curve, Math.min(96, roofPts.length * 4), r, 5, true),
+      topMat
+    )
+    topMesh.userData.sharedMat = true
+    grp.add(topMesh)
+
+    const basePts = b.pts.map(([x, z]) => new THREE.Vector3(x, 0.48, z))
+    const baseCurve = new THREE.CatmullRomCurve3(basePts, true, 'catmullrom', 0.02)
+    const baseMesh = new THREE.Mesh(
+      new THREE.TubeGeometry(baseCurve, Math.min(96, basePts.length * 4), r * 0.8, 5, true),
+      baseMat
+    )
+    baseMesh.userData.sharedMat = true
+    grp.add(baseMesh)
+  }
+  return grp
+}
+
+/** 选中单栋楼精确轮廓线（与悬停解耦，鼠标划过其他楼栋绝不销毁重建） */
+function rebuildSelectedOutline() {
   if (!scene || props.mode !== 'cockpit') return
-  if (selectionOutlineGroup) {
-    disposeGroup(selectionOutlineGroup)
-    scene.remove(selectionOutlineGroup)
-    selectionOutlineGroup = null
+  if (selectedOutlineGroup) {
+    disposeGroup(selectedOutlineGroup)
+    scene.remove(selectedOutlineGroup)
+    selectedOutlineGroup = null
   }
   if (!buildingIndexRef) return
-  const targets = []
-  if (props.selectedBuildingIndex >= 0 && buildingIndexRef.buildings[props.selectedBuildingIndex]) {
-    targets.push({ b: buildingIndexRef.buildings[props.selectedBuildingIndex], col: 0xe63946, r: 0.46 })
-  }
-  if (hoveredBldgIndex >= 0 && hoveredBldgIndex !== props.selectedBuildingIndex && buildingIndexRef.buildings[hoveredBldgIndex]) {
-    targets.push({ b: buildingIndexRef.buildings[hoveredBldgIndex], col: 0xd99b38, r: 0.30 })
-  }
-  if (!targets.length) return
+  const b = props.selectedBuildingIndex >= 0 ? buildingIndexRef.buildings[props.selectedBuildingIndex] : null
+  if (!b) return
+  selectedOutlineGroup = buildSingleOutlineGroup(b, 0.46, selOutlineTopMat, selOutlineBaseMat)
+  scene.add(selectedOutlineGroup)
+}
 
-  selectionOutlineGroup = new THREE.Group()
-  targets.forEach(({ b, col, r }) => {
-    const roofPts = b.pts.map(([x, z]) => new THREE.Vector3(x, b.height + 0.35, z))
-    if (roofPts.length >= 3) {
-      const curve = new THREE.CatmullRomCurve3(roofPts, true, 'catmullrom', 0.02)
-      selectionOutlineGroup.add(
-        new THREE.Mesh(
-          new THREE.TubeGeometry(curve, Math.min(96, roofPts.length * 4), r, 5, true),
-          new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.96 })
-        )
-      )
-      const basePts = b.pts.map(([x, z]) => new THREE.Vector3(x, 0.48, z))
-      const baseCurve = new THREE.CatmullRomCurve3(basePts, true, 'catmullrom', 0.02)
-      selectionOutlineGroup.add(
-        new THREE.Mesh(
-          new THREE.TubeGeometry(baseCurve, Math.min(96, basePts.length * 4), r * 0.8, 5, true),
-          new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.72 })
-        )
-      )
-    }
-  })
-  scene.add(selectionOutlineGroup)
+/** 悬停单栋楼轻量轮廓线（复用常驻材质） */
+function rebuildHoverOutline() {
+  if (!scene || props.mode !== 'cockpit') return
+  if (hoverOutlineGroup) {
+    disposeGroup(hoverOutlineGroup)
+    scene.remove(hoverOutlineGroup)
+    hoverOutlineGroup = null
+  }
+  if (!buildingIndexRef) return
+  if (hoveredBldgIndex < 0 || hoveredBldgIndex === props.selectedBuildingIndex) return
+  const b = buildingIndexRef.buildings[hoveredBldgIndex]
+  if (!b) return
+  hoverOutlineGroup = buildSingleOutlineGroup(b, 0.30, hovOutlineTopMat, hovOutlineBaseMat)
+  scene.add(hoverOutlineGroup)
 }
 
 /** 渲染 4 类克制精致的 3D 治理实体小模型（在岗网格员 / 共享辅助站 / 易涝防火点 / 标杆楼宇顶标） */
@@ -1576,10 +1836,11 @@ function updateZoneStyles() {
         ? props.patrolRecord.community
         : props.selectedCommunity
   const hov = activeHover.value
+  const night = isNightScene.value
 
   zoneEntries.forEach((entry, name) => {
     const lvl = getCommunityLevel(entry.community, props.slice)
-    const col = new THREE.Color(pal.colors[lvl])
+    const col = getCachedThreeColor(pal.colors[lvl])
     const isSel = sel === name
     const isHov = hov === name
 
@@ -1591,35 +1852,37 @@ function updateZoneStyles() {
     entry.selTubeMesh.visible = isSel || isHov
     if (isSel) {
       entry.fillMat.color.copy(col)
-      entry.fillMat.opacity = isNightScene.value ? 0.16 : 0.11
+      entry.fillMat.opacity = night ? 0.16 : 0.11
       entry.selTubeMat.color.copy(col)
       entry.selTubeMat.opacity = 0.96
     } else if (isHov) {
       entry.fillMat.color.copy(col)
-      entry.fillMat.opacity = isNightScene.value ? 0.10 : 0.07
+      entry.fillMat.opacity = night ? 0.10 : 0.07
       entry.selTubeMat.color.copy(col)
       entry.selTubeMat.opacity = 0.75
     }
   })
+  staticRenderNeeded = true
 }
 
 const tmpProj = new THREE.Vector3()
+const _projResult = { inFront: false, x: 0, y: 0, z: 0 }
 function projectXZ(x, y, z, w, h) {
   tmpProj.set(x, y, z)
   tmpProj.project(camera)
-  return {
-    inFront: tmpProj.z > -1 && tmpProj.z < 1,
-    x: (tmpProj.x * 0.5 + 0.5) * w,
-    y: (-tmpProj.y * 0.5 + 0.5) * h,
-    z: tmpProj.z
-  }
+  _projResult.inFront = tmpProj.z > -1 && tmpProj.z < 1
+  _projResult.x = (tmpProj.x * 0.5 + 0.5) * w
+  _projResult.y = (-tmpProj.y * 0.5 + 0.5) * h
+  _projResult.z = tmpProj.z
+  return _projResult
 }
 
 function updateProjectedLabels() {
   if (!camera || !canvasHost.value) return
-  const w = canvasHost.value.clientWidth
-  const h = canvasHost.value.clientHeight
+  const w = hostWidth || canvasHost.value.clientWidth
+  const h = hostHeight || canvasHost.value.clientHeight
   if (!w || !h) return
+  labelsDirty = false
 
   const isCockpit = props.mode === 'cockpit'
   const compactDesk = typeof window !== 'undefined' && window.innerWidth <= 1520
@@ -1814,6 +2077,7 @@ function updateProjectedLabels() {
       shortName: name.replace('社区', ''),
       chip: getCommunityMetricChip(c, props.slice),
       health: c.health,
+      level: ['lead', 'ok', 'warn', 'bad'][getCommunityLevel(c, 'safety')],
       hasAlert: props.slice === 'safety' && openHz > 0,
       isSel,
       isHov,
@@ -1933,10 +2197,19 @@ function updateProjectedLabels() {
       })
     }
 
+    // 先投影指挥中心红牌，保证碰撞避让使用当前帧真实坐标（修复一帧滞后）
+    const hprNow = projectXZ(hqIntroX, 18.5, hqIntroZ, w, h)
+    const nextHqPos = {
+      x: Math.round(hprNow.x),
+      y: Math.round(hprNow.y),
+      visible: hprNow.inFront && hprNow.x >= safeLeft && hprNow.x <= safeRight && hprNow.y >= safeTop && hprNow.y <= safeBottom
+    }
+    hqScreenPos.value = nextHqPos
+
     // 简单屏幕网格防打架消隐（先登记已显示的 14 社区标牌与指挥中心红牌，再排布小区/实体标签，杜绝重叠）
     const placed = []
-    if (hqScreenPos.value.visible) {
-      placed.push({ x: hqScreenPos.value.x, y: hqScreenPos.value.y })
+    if (nextHqPos.visible) {
+      placed.push({ x: nextHqPos.x, y: nextHqPos.y })
     }
     next.forEach((lb) => {
       if (lb.visible) placed.push({ x: lb.x, y: lb.y })
@@ -1952,12 +2225,12 @@ function updateProjectedLabels() {
         }
       })
     projectedEntityLabels.value = kept
+    return
   } else {
     projectedEntityLabels.value = []
   }
 
-  const [hx, hz] = latLngToWorldXZ(CHANGHE_HQ_LATLNG[0], CHANGHE_HQ_LATLNG[1])
-  const hpr = projectXZ(hx, 18.5, hz, w, h)
+  const hpr = projectXZ(hqIntroX, 18.5, hqIntroZ, w, h)
   hqScreenPos.value = {
     x: Math.round(hpr.x),
     y: Math.round(hpr.y),
@@ -1965,9 +2238,23 @@ function updateProjectedLabels() {
   }
 }
 
+function setCanvasCursor(cur) {
+  if (!renderer || lastCursor === cur) return
+  lastCursor = cur
+  renderer.domElement.style.cursor = cur
+}
+
+function getCanvasRect() {
+  if (!cachedCanvasRect && renderer?.domElement) {
+    cachedCanvasRect = renderer.domElement.getBoundingClientRect()
+  }
+  return cachedCanvasRect
+}
+
 function pickTarget(clientX, clientY) {
   if (!renderer || !camera || comparingImagery.value) return null
-  const rect = renderer.domElement.getBoundingClientRect()
+  const rect = getCanvasRect()
+  if (!rect || !rect.width || !rect.height) return null
   pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1
   pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1
   raycaster.setFromCamera(pointer, camera)
@@ -1980,8 +2267,8 @@ function pickTarget(clientX, clientY) {
     if (entHit) return { type: 'entity', entity: entHit.object.userData.entityObj }
   }
 
-  if (dynamicGroup) {
-    const dynHits = raycaster.intersectObjects(dynamicGroup.children, false)
+  if (pickableDynamicTargets.length) {
+    const dynHits = raycaster.intersectObjects(pickableDynamicTargets, false)
     const armedHit = dynHits.find((h) => h.object.userData.armedPoint)
     if (armedHit) return { type: 'armed', point: armedHit.object.userData.armedPoint }
     const evHit = dynHits.find((h) => h.object.userData.eventObj)
@@ -2012,56 +2299,66 @@ function pickTarget(clientX, clientY) {
 function onPointerDown(e) {
   pointerDownPos = { x: e.clientX, y: e.clientY }
   isCamAnimating = false
+  if (introCamAnim || introWaveAnim) finishIntroVisualsImmediately()
 }
 
 function clearHoveredBuilding() {
+  hoveredBldgMetaCache = null
   if (hoveredBldgIndex !== -1) {
     hoveredBldgIndex = -1
     hoveredBuilding.value = null
     if (props.mode === 'cockpit' && !loading.value) {
-      updateBuildingSemanticTexture()
+      applyHoverSemanticDelta(-1)
     }
   }
 }
 
-function onPointerMove(e) {
-  const hit = pickTarget(e.clientX, e.clientY)
+function processPointerHover(clientX, clientY) {
+  if (isDisposed || !renderer || isCamAnimating || introCamAnim) return
+  const hit = pickTarget(clientX, clientY)
   if (hit && hit.type === 'building') {
     const b = hit.building
-    const rect = canvasHost.value?.getBoundingClientRect()
-    const rx = rect ? Math.min(rect.width - 220, Math.max(16, e.clientX - rect.left + 14)) : 0
-    const ry = rect ? Math.min(rect.height - 96, Math.max(76, e.clientY - rect.top - 12)) : 0
-    const evs = lastEventBldgMap.get(b.index) || []
-    const openCnt = evs.filter((ev) => ev.stage !== '已办结').length
-    const chip = openCnt > 0
-      ? `在办 ${openCnt} 件`
-      : b.baseHazard
-        ? '关注复核'
-        : b.category === 'commercial' && b.revenueYi
-          ? `产值 ${b.revenueYi} 亿`
-          : b.elderAloneCount > 0
-            ? `独居关怀 ${b.elderAloneCount} 户`
-            : `${b.floors} 层 · ${b.households} 户`
+    const rect = getCanvasRect()
+    const rx = rect ? Math.min(rect.width - 220, Math.max(16, clientX - rect.left + 14)) : 0
+    const ry = rect ? Math.min(rect.height - 96, Math.max(76, clientY - rect.top - 12)) : 0
+    const nextX = Math.round(rx)
+    const nextY = Math.round(ry)
 
-    hoveredBuilding.value = {
-      name: b.name,
-      estate: b.estate || '',
-      community: b.community,
-      gridName: b.gridName,
-      chip,
-      isAlert: openCnt > 0 || b.baseHazard,
-      x: Math.round(rx),
-      y: Math.round(ry)
+    if (hoveredBldgIndex !== b.index || !hoveredBldgMetaCache) {
+      const evs = lastEventBldgMap.get(b.index) || []
+      const openCnt = evs.filter((ev) => ev.stage !== '已办结').length
+      const chip = openCnt > 0
+        ? `在办 ${openCnt} 件`
+        : b.baseHazard
+          ? '关注复核'
+          : b.category === 'commercial' && b.revenueYi
+            ? `产值 ${b.revenueYi} 亿`
+            : b.elderAloneCount > 0
+              ? `独居关怀 ${b.elderAloneCount} 户`
+              : `${b.floors} 层 · ${b.households} 户`
+      hoveredBldgMetaCache = {
+        name: b.name,
+        estate: b.estate || '',
+        community: b.community,
+        gridName: b.gridName,
+        chip,
+        isAlert: openCnt > 0 || b.baseHazard
+      }
+      if (hoveredBldgIndex !== b.index) {
+        hoveredBldgIndex = b.index
+        applyHoverSemanticDelta(b.index)
+      }
     }
-    if (hoveredBldgIndex !== b.index) {
-      hoveredBldgIndex = b.index
-      updateBuildingSemanticTexture()
+
+    const prevTip = hoveredBuilding.value
+    if (!prevTip || prevTip.name !== hoveredBldgMetaCache.name || prevTip.x !== nextX || prevTip.y !== nextY) {
+      hoveredBuilding.value = { ...hoveredBldgMetaCache, x: nextX, y: nextY }
     }
     if (hoveredLocal.value !== b.community) {
       hoveredLocal.value = b.community
       updateZoneStyles()
     }
-    if (renderer) renderer.domElement.style.cursor = 'pointer'
+    setCanvasCursor('pointer')
     return
   }
 
@@ -2072,15 +2369,29 @@ function onPointerMove(e) {
       hoveredLocal.value = hit.name
       updateZoneStyles()
     }
-    if (renderer) renderer.domElement.style.cursor = 'pointer'
+    setCanvasCursor('pointer')
   } else if (hit && (hit.type === 'event' || hit.type === 'armed' || hit.type === 'entity' || hit.type === 'landmark')) {
-    if (renderer) renderer.domElement.style.cursor = 'pointer'
+    setCanvasCursor('pointer')
   } else {
     if (hoveredLocal.value) {
       hoveredLocal.value = ''
       updateZoneStyles()
     }
-    if (renderer) renderer.domElement.style.cursor = 'grab'
+    setCanvasCursor('grab')
+  }
+}
+
+function onPointerMove(e) {
+  // 拖拽旋转镜头或相机动画中跳过拾取，并以 rAF 单帧合并高刷鼠标事件
+  if (e.buttons !== 0 || isCamAnimating || introCamAnim) return
+  pendingPointerClient = { x: e.clientX, y: e.clientY }
+  if (pointerMoveRaf === null) {
+    pointerMoveRaf = requestAnimationFrame(() => {
+      pointerMoveRaf = null
+      const pt = pendingPointerClient
+      pendingPointerClient = null
+      if (pt) processPointerHover(pt.x, pt.y)
+    })
   }
 }
 
@@ -2134,9 +2445,35 @@ function handleArmedLabelClick(item) {
   emit('select-point', item.payload)
 }
 
+// 指针离开画布（含移入浮层面板）时清除社区悬停，避免残留高亮
+function onCanvasLeave() {
+  clearHoveredBuilding()
+  if (hoveredLocal.value) {
+    hoveredLocal.value = ''
+    updateZoneStyles()
+  }
+}
+
 function onLabelHover(name) {
   hoveredLocal.value = name
   updateZoneStyles()
+}
+
+function hasCameraMoved() {
+  _tmpCamVP.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+  const els = _tmpCamVP.elements
+  if (!hasLastCamVP) {
+    _lastCamVP.set(els)
+    hasLastCamVP = true
+    return true
+  }
+  for (let i = 0; i < 16; i++) {
+    if (Math.abs(els[i] - _lastCamVP[i]) > 1e-5) {
+      _lastCamVP.set(els)
+      return true
+    }
+  }
+  return false
 }
 
 let lastTime = 0
@@ -2149,11 +2486,35 @@ function animate(now) {
   }
   rafId = requestAnimationFrame(animate)
 
-  if (compactRenderer && lastTime && now - lastTime < 1000 / 30 - 1) return
+  // 紧凑屏限 30fps，高刷屏（120Hz/144Hz）常规模式封顶 60fps，避免 2× GPU 负载
+  const minFrameMs = compactRenderer ? (1000 / 30 - 1) : 15.2
+  if (lastTime && now - lastTime < minFrameMs) return
   const dt = Math.min(0.05, (now - (lastTime || now)) / 1000)
   lastTime = now
 
-  if (isCamAnimating && controls) {
+  let camDriven = false
+  if (introCamAnim && controls) {
+    camDriven = true
+    const rawT = Math.min(1, Math.max(0, (now - introCamAnim.startTime) / introCamAnim.duration))
+    const eased = 1 - Math.pow(1 - rawT, 3.6)
+    _tmpIntroLook.lerpVectors(introCamAnim.fromLook, introCamAnim.toLook, eased)
+    _tmpIntroSph.set(
+      THREE.MathUtils.lerp(introCamAnim.fromSph.radius, introCamAnim.toSph.radius, eased),
+      THREE.MathUtils.lerp(introCamAnim.fromSph.phi, introCamAnim.toSph.phi, eased),
+      THREE.MathUtils.lerp(introCamAnim.fromSph.theta, introCamAnim.toSph.theta, eased)
+    )
+    _tmpIntroOffset.setFromSpherical(_tmpIntroSph)
+    camera.position.copy(_tmpIntroLook).add(_tmpIntroOffset)
+    controls.target.copy(_tmpIntroLook)
+    if (rawT >= 1) {
+      controls.target.copy(introCamAnim.toLook)
+      _tmpIntroOffset.setFromSpherical(introCamAnim.toSph)
+      camera.position.copy(introCamAnim.toLook).add(_tmpIntroOffset)
+      introCamAnim = null
+      waterfront?.setReflectionPaused(false)
+    }
+  } else if (isCamAnimating && controls) {
+    camDriven = true
     const lerpF = 1 - Math.exp(-4.8 * dt)
     camera.position.lerp(camTargetPos, lerpF)
     controls.target.lerp(camTargetLook, lerpF)
@@ -2162,13 +2523,50 @@ function animate(now) {
     }
   }
 
-  if (controls) {
-    controls.autoRotate = autoOrbit.value && !prefersReducedMotion && !comparingImagery.value
-    controls.update()
+  if (introWaveAnim) {
+    const wt = Math.min(1, Math.max(0, (now - introWaveAnim.startTime) / introWaveAnim.waveDuration))
+    const ft = Math.min(1, Math.max(0, (now - (introWaveAnim.startTime - 80)) / introWaveAnim.fogDuration))
+    const waveEased = 1 - Math.pow(1 - wt, 1.85)
+    bldgUniforms.uWaveRadius.value = -36.0 + waveEased * 960.0
+
+    if (scene?.fog) {
+      const fogEased = 1 - Math.pow(1 - ft, 2.4)
+      scene.fog.density = THREE.MathUtils.lerp(targetFogDensity * 1.95, targetFogDensity, fogEased)
+    }
+
+    const edgeFactor = Math.min(1, Math.max(0, (wt - 0.52) / 0.48))
+    const edgeSmooth = edgeFactor * edgeFactor * (3 - 2 * edgeFactor)
+    if (innerEdgeMat) innerEdgeMat.opacity = targetEdgeInOp * edgeSmooth
+    if (outerEdgeMat) outerEdgeMat.opacity = targetEdgeOutOp * edgeSmooth
+
+    if (wt >= 1 && ft >= 1) {
+      // 100% 高度阴影已在加载序幕后台烘焙完成，此处收口零重算、零掉帧
+      introWaveAnim = null
+      bldgUniforms.uWaveActive.value = 0.0
+      bldgUniforms.uWaveRadius.value = 1400.0
+      if (scene?.fog) scene.fog.density = targetFogDensity
+      if (innerEdgeMat) innerEdgeMat.opacity = targetEdgeInOp
+      if (outerEdgeMat) outerEdgeMat.opacity = targetEdgeOutOp
+      waterfront?.setReflectionPaused(false)
+    }
   }
 
+  let controlsChanged = false
+  if (controls) {
+    controls.autoRotate = autoOrbit.value && !prefersReducedMotion && !comparingImagery.value
+    controlsChanged = controls.update()
+  }
+
+  // 影像对照与减弱动效模式在画面完全静止时按需渲染，零 GPU 空转
   if (comparingImagery.value) {
-    renderer.render(scene, camera)
+    if (staticRenderNeeded || camDriven || controlsChanged) {
+      renderer.render(scene, camera)
+      staticRenderNeeded = false
+    }
+    return
+  }
+
+  if (prefersReducedMotion && !camDriven && !controlsChanged && !staticRenderNeeded) {
     return
   }
 
@@ -2202,11 +2600,18 @@ function animate(now) {
   }
 
   renderer.render(scene, camera)
-  updateProjectedLabels()
+  staticRenderNeeded = false
+
+  if (props.labelsVisible) {
+    const moved = hasCameraMoved()
+    if (moved || labelsDirty) {
+      updateProjectedLabels()
+    }
+  }
 }
 
 function startLoop() {
-  if (isRenderPaused || loading.value || rafId !== null || webglFailed.value || isDisposed) return
+  if (isRenderPaused || introHoldPaused || loading.value || rafId !== null || webglFailed.value || isDisposed) return
   lastTime = performance.now()
   rafId = requestAnimationFrame(animate)
 }
@@ -2219,9 +2624,20 @@ function stopLoop() {
 }
 
 function handleVisibilityChange() {
-  isRenderPaused = document.hidden || contentSkipped || (narrowScreen?.matches && props.narrowPanelOpen)
-  if (isRenderPaused) stopLoop()
-  else startLoop()
+  isRenderPaused =
+    document.hidden ||
+    contentSkipped ||
+    introHoldPaused ||
+    props.paused ||
+    (narrowScreen?.matches && props.narrowPanelOpen)
+  if (isRenderPaused) {
+    stopLoop()
+  } else {
+    staticRenderNeeded = true
+    labelsDirty = true
+    cachedCanvasRect = null
+    startLoop()
+  }
 }
 
 function handleContentVisibility(e) {
@@ -2234,7 +2650,12 @@ function handleResize() {
   const w = canvasHost.value.clientWidth
   const h = canvasHost.value.clientHeight
   if (!w || !h) return
+  hostWidth = w
+  hostHeight = h
   halfViewportHeight = h / 2
+  cachedCanvasRect = null
+  labelsDirty = true
+  staticRenderNeeded = true
   camera.aspect = w / h
   camera.updateProjectionMatrix()
   renderer.setSize(w, h)
@@ -2258,7 +2679,8 @@ async function initScene() {
       alpha: false,
       powerPreference: 'high-performance'
     })
-  } catch {
+  } catch (err) {
+    console.error('[ChangheCity3D] WebGLRenderer create failed:', err)
     webglFailed.value = true
     loading.value = false
     emit('webgl-fallback')
@@ -2294,13 +2716,14 @@ async function initScene() {
   sunLight.castShadow = true
   const shadowSize = compactRenderer ? 1024 : 2048
   sunLight.shadow.mapSize.set(shadowSize, shadowSize)
+  // 紧贴 4,205 栋建筑与滨水实际 AABB（X:[-285,250], Z:[-282,276]），提升 ~35% 有效阴影纹素密度
   Object.assign(sunLight.shadow.camera, {
-    left: -460,
-    right: 460,
-    top: 460,
-    bottom: -460,
-    near: 80,
-    far: 1450
+    left: -380,
+    right: 380,
+    top: 380,
+    bottom: -380,
+    near: 120,
+    far: 1200
   })
   sunLight.shadow.camera.updateProjectionMatrix()
   sunLight.shadow.bias = -0.00025
@@ -2321,18 +2744,83 @@ async function initScene() {
   controls.autoRotateSpeed = 0.42
   controls.target.copy(pose.look)
   controls.update()
+  controls.addEventListener('change', () => {
+    staticRenderNeeded = true
+  })
+  controls.addEventListener('start', () => {
+    isCamAnimating = false
+    staticRenderNeeded = true
+    if (introCamAnim || introWaveAnim) finishIntroVisualsImmediately()
+  })
 
-  renderer.domElement.style.cursor = 'grab'
+  setCanvasCursor('grab')
   renderer.domElement.addEventListener('pointerdown', onPointerDown)
   renderer.domElement.addEventListener('pointermove', onPointerMove)
   renderer.domElement.addEventListener('pointerup', onPointerUp)
-  renderer.domElement.addEventListener('pointerleave', clearHoveredBuilding)
+  renderer.domElement.addEventListener('pointerleave', onCanvasLeave)
 
-  try {
-    assetsRef = await loadChangheAmapAssets((pct) => {
-      loadProgress.value = pct
+  const reportProgress = (percent, stage, stageIndex) => {
+    const p = Math.max(0, Math.min(100, Math.round(percent)))
+    loadProgress.value = p
+    emit('load-progress', { percent: p, stage, stageIndex })
+  }
+
+  const nextPaintFrame = () =>
+    new Promise((resolve) => {
+      let done = false
+      let rId = null
+      let tId = null
+      const finish = () => {
+        if (done) return
+        done = true
+        if (rId !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rId)
+        if (tId !== null) clearTimeout(tId)
+        resolve()
+      }
+      if (typeof requestAnimationFrame === 'function' && !document.hidden) {
+        rId = requestAnimationFrame(finish)
+        tId = setTimeout(finish, 60)
+      } else {
+        tId = setTimeout(finish, 0)
+      }
     })
-  } catch {
+
+  reportProgress(4, '正在拉取高清地理底图与卫星影像', 0)
+
+  // 并行启动「首帧必需底图下载」与「4,205 栋三维白模分片构建」，将 CPU 建模重叠隐藏在网络下载窗口内
+  let texPct = 0
+  let geoPct = 0
+  const emitParallelProgress = () => {
+    const combined = 4 + texPct * 0.44 + geoPct * 0.30
+    if (texPct < 100) {
+      reportProgress(combined, '正在拉取高清地理底图与卫星影像', 0)
+    } else {
+      reportProgress(combined, '正在分片构建 4,205 栋三维楼宇白模', 1)
+    }
+  }
+
+  let prebuiltGeos = null
+  try {
+    const [loadedAssets, builtGeos] = await Promise.all([
+      loadChangheAmapAssets(
+        (pct) => {
+          texPct = pct
+          emitParallelProgress()
+        },
+        {
+          initialDark: isNightScene.value,
+          needShoreDistance: props.mode === 'cockpit'
+        }
+      ),
+      buildMergedAmapBuildingGeometriesAsync(amapPolyData.buildings, (pct) => {
+        geoPct = pct
+        emitParallelProgress()
+      })
+    ])
+    assetsRef = loadedAssets
+    prebuiltGeos = builtGeos
+  } catch (err) {
+    console.error('[ChangheCity3D] assets/geo init failed:', err)
     if (!isDisposed) {
       webglFailed.value = true
       loading.value = false
@@ -2343,19 +2831,34 @@ async function initScene() {
 
   if (isDisposed || !scene) return
 
+  reportProgress(80, '正在渲染岔河水系与社区拓扑图层', 2)
+  await nextPaintFrame()
+  if (isDisposed || !scene) return
+
   if (props.mode === 'cockpit') {
     buildingIndexRef = getCockpitBuildingIndex()
   }
 
-  buildAmap3DCity()
+  buildAmap3DCity(prebuiltGeos)
+  reportProgress(84, '正在渲染岔河水系与社区拓扑图层', 2)
+  await nextPaintFrame()
+  if (isDisposed || !scene) return
+
   buildCommunityOverlays()
   applyVisualTheme()
+  reportProgress(88, '正在渲染岔河水系与社区拓扑图层', 2)
 
   // 驾驶舱一律强制以全街道「全景鸟瞰」开场（绝不被跨页缓存的 selectedCommunity 拉近）
+  const willIntro = props.mode === 'cockpit' && props.deferReveal && !prefersReducedMotion
   if (props.mode === 'cockpit') {
     cameraPreset.value = 'hero'
     const heroPose = getCameraPose('hero')
     isCamAnimating = false
+    introCamAnim = null
+    introWaveAnim = null
+    // 先以 100% 满高度状态预热，一次性把 4,205 栋白模显存缓冲与最终 2048×2048 阴影在加载页后台烘焙完毕
+    bldgUniforms.uWaveActive.value = 0.0
+    bldgUniforms.uWaveRadius.value = 1400.0
     camera.position.copy(heroPose.pos)
     controls.target.copy(heroPose.look)
     controls.update()
@@ -2366,13 +2869,160 @@ async function initScene() {
     focusOnCommunity(props.selectedCommunity)
   }
 
-  loading.value = false
-  renderer.shadowMap.needsUpdate = true
+  reportProgress(90, '正在编译三维光影与首帧渲染管线', 3)
+  await nextPaintFrame()
+  if (isDisposed || !scene || !renderer) return
+
+  // 在加载遮罩后台逐帧将首帧必需底图/岸线与语义纹理预上传至 GPU 显存
   handleResize()
+  try {
+    if (typeof renderer.initTexture === 'function') {
+      const primaryKey = isNightScene.value ? 'darkVecTex' : 'lightVecTex'
+      const preloadTexList = [
+        assetsRef[primaryKey],
+        props.mode === 'cockpit' ? assetsRef.shoreDistanceTex : null,
+        bldgColorTex
+      ].filter(Boolean)
+      for (let i = 0; i < preloadTexList.length; i++) {
+        renderer.initTexture(preloadTexList[i])
+        reportProgress(90 + Math.round(((i + 1) / preloadTexList.length) * 4), '正在编译三维光影与首帧渲染管线', 3)
+        await nextPaintFrame()
+        if (isDisposed || !scene || !renderer) return
+      }
+    }
+
+    if (typeof renderer.compile === 'function') {
+      renderer.compile(scene, camera)
+    }
+    reportProgress(96, '正在编译三维光影与首帧渲染管线', 3)
+    await nextPaintFrame()
+    if (isDisposed || !scene || !renderer) return
+
+    // 首帧烘焙前即按真实视距同步树木 LOD，避免阴影/倒影/主通道白渲 344 万高模树冠三角
+    if (waterfront) {
+      const unitsPerPixel = camera.position.y / (camera.projectionMatrix.elements[5] * halfViewportHeight)
+      waterfront.updateTreeDetail(unitsPerPixel)
+    }
+
+    // 预热第 1 帧：100% 完整楼宇高度烘焙最终阴影贴图、水面倒影与白模 VBO 上传显存
+    renderer.shadowMap.needsUpdate = true
+    renderer.render(scene, camera)
+    reportProgress(98, '正在编译三维光影与首帧渲染管线', 3)
+    await nextPaintFrame()
+    if (isDisposed || !scene || !renderer) return
+
+    // 预热第 2 帧：切至入场起始高空弧线机位并刷新管线（保留已烘焙好的最终阴影贴图，不再重算阴影）
+    if (willIntro) {
+      const startPose = getIntroStartPose()
+      camera.position.copy(startPose.pos)
+      controls.target.copy(startPose.look)
+      controls.update()
+      if (waterfront) {
+        const unitsPerPixel = camera.position.y / (camera.projectionMatrix.elements[5] * halfViewportHeight)
+        waterfront.updateTreeDetail(unitsPerPixel)
+      }
+      bldgUniforms.uWaveActive.value = 1.0
+      bldgUniforms.uWaveRadius.value = -36.0
+      if (scene?.fog) scene.fog.density = targetFogDensity * 1.95
+      if (innerEdgeMat) innerEdgeMat.opacity = 0
+      if (outerEdgeMat) outerEdgeMat.opacity = 0
+      waterfront?.setReflectionPaused(true)
+    }
+    renderer.shadowMap.needsUpdate = false
+    renderer.render(scene, camera)
+    const gl = renderer.getContext?.()
+    if (gl && typeof gl.flush === 'function') {
+      gl.flush()
+    }
+    await nextPaintFrame()
+    if (isDisposed || !scene || !renderer) return
+    labelsDirty = true
+    if (props.labelsVisible) {
+      updateProjectedLabels()
+    }
+  } catch (err) {
+    console.error('[ChangheCity3D] warmup render failed:', err)
+    if (!isDisposed) {
+      webglFailed.value = true
+      loading.value = false
+      emit('webgl-fallback')
+    }
+    return
+  }
+
+  // 若由外部全屏加载序幕控制揭幕，先暂停后台 3D 渲染循环，避免与遮罩 SVG 争抢 GPU；待揭幕瞬间立刻恢复
+  introHoldPaused = Boolean(props.mode === 'cockpit' && props.deferReveal)
+  reportProgress(100, '全景沙盘已就绪，即将进入驾驶舱', 3)
+  loading.value = false
   handleVisibilityChange()
+  emit('scene-ready')
+
+  // 首屏就绪后在浏览器空闲窗口后台静默预热其余非首帧底图（暗夜/日景/高清卫星），切图顺滑不卡
+  cancelSecondaryPreload = preloadSecondaryAmapAssets((key, tex) => {
+    if (isDisposed || !renderer || !tex) return
+    tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy())
+    if (typeof renderer.initTexture === 'function') renderer.initTexture(tex)
+    if (key === 'satTex' && imageryMat && imageryMat.map !== tex) {
+      imageryMat.map = tex
+      imageryMat.needsUpdate = true
+    }
+  })
 }
 
-watch(() => props.narrowPanelOpen, handleVisibilityChange)
+// ── 微任务脏标记合并调度器：合并五章切换 / 锁社区 / 切主题并发引发的多次重建 ──
+let syncScheduled = false
+const syncFlags = {
+  theme: false,
+  zones: false,
+  dynamic: false,
+  semantic: false,
+  entities: false,
+  emergency: false,
+  labels: false
+}
+
+function scheduleSync(flags) {
+  if (loading.value || isDisposed) return
+  Object.assign(syncFlags, flags)
+  if (syncScheduled) return
+  syncScheduled = true
+  queueMicrotask(() => {
+    syncScheduled = false
+    if (loading.value || isDisposed || !scene) return
+    const f = { ...syncFlags }
+    syncFlags.theme = syncFlags.zones = syncFlags.dynamic = syncFlags.semantic = syncFlags.entities = syncFlags.emergency = syncFlags.labels = false
+    if (f.theme) applyVisualTheme()
+    if (f.zones) updateZoneStyles()
+    if (f.dynamic) rebuildDynamicEvents()
+    if (f.semantic && props.mode === 'cockpit') updateBuildingSemanticTexture()
+    if (f.entities && props.mode === 'cockpit') rebuildCockpitEntities()
+    if (f.emergency && props.mode === 'cockpit') rebuildEmergencyRing()
+    if (f.labels) {
+      labelsDirty = true
+      if (props.labelsVisible) updateProjectedLabels()
+    }
+    staticRenderNeeded = true
+  })
+}
+
+const eventsVisualSig = computed(() => {
+  const list = props.events || []
+  let s = ''
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i]
+    s += `${e.id}:${e.stage}:${e.lat}:${e.lng}:${e.community}|`
+  }
+  return s
+})
+
+watch(() => props.labelsVisible, (vis) => {
+  if (vis && !loading.value) {
+    labelsDirty = true
+    updateProjectedLabels()
+  }
+})
+
+watch(() => [props.narrowPanelOpen, props.paused], handleVisibilityChange)
 
 onMounted(() => {
   narrowScreen = window.matchMedia('(max-width: 1100px)')
@@ -2407,61 +3057,48 @@ watch(
   () => store.preset,
   () => {
     lightingOverride.value = null
-    if (!loading.value) {
-      applyVisualTheme()
-      updateZoneStyles()
-      if (props.mode === 'cockpit') updateBuildingSemanticTexture()
-    }
+    scheduleSync({ theme: true, zones: true, semantic: true })
   }
 )
 
 watch(
   () => [isNightScene.value, groundStyle.value],
   () => {
-    if (!loading.value) {
-      applyVisualTheme()
-      updateZoneStyles()
-      if (props.mode === 'cockpit') {
-        updateBuildingSemanticTexture()
-        rebuildEmergencyRing()
-      }
-    }
+    scheduleSync({ theme: true, zones: true, semantic: true, emergency: true })
   }
 )
 
 watch(
-  () => [props.slice, props.events, props.cockpitViewMode, props.selectedEventId],
-  () => {
-    if (!loading.value) {
-      updateZoneStyles()
-      rebuildDynamicEvents()
-    }
-  },
-  { deep: true }
+  () => [props.slice, eventsVisualSig.value, props.cockpitViewMode, props.selectedEventId],
+  ([newSlice, newEvSig, newViewMode, newSelEv], [oldSlice, oldEvSig, oldViewMode, oldSelEv] = []) => {
+    const needDyn = props.mode !== 'cockpit' || newEvSig !== oldEvSig || newViewMode !== oldViewMode || newSelEv !== oldSelEv
+    scheduleSync({
+      zones: true,
+      dynamic: needDyn,
+      semantic: true,
+      entities: newSlice !== oldSlice || newViewMode !== oldViewMode,
+      labels: true
+    })
+  }
 )
 
 watch(
   () => [props.selectedBuildingIndex, props.selectedEntityId, props.emergencyInfo],
   ([bIdx]) => {
     if (loading.value || props.mode !== 'cockpit') return
-    updateBuildingSemanticTexture()
-    rebuildCockpitEntities()
-    rebuildEmergencyRing()
+    scheduleSync({ semantic: true, entities: true, emergency: true, labels: true })
     if (typeof bIdx === 'number' && bIdx >= 0 && buildingIndexRef?.buildings?.[bIdx]) {
       const b = buildingIndexRef.buildings[bIdx]
       focusOnPointXZ(b.cx, b.cz, 98, 102)
     }
-    updateProjectedLabels()
-  },
-  { deep: true }
+  }
 )
 
 watch(
   () => props.singleEvent?.id,
   () => {
     if (loading.value || props.mode !== 'single') return
-    updateZoneStyles()
-    rebuildDynamicEvents()
+    scheduleSync({ zones: true, dynamic: true, labels: true })
     const pose = getCameraPose(cameraPreset.value)
     animateCameraTo(pose.pos, pose.look)
   }
@@ -2471,8 +3108,7 @@ watch(
   () => props.patrolRecord?.id,
   () => {
     if (loading.value || props.mode !== 'patrol') return
-    updateZoneStyles()
-    rebuildDynamicEvents()
+    scheduleSync({ zones: true, dynamic: true, labels: true })
     const pose = getCameraPose(cameraPreset.value)
     animateCameraTo(pose.pos, pose.look)
   }
@@ -2482,25 +3118,22 @@ watch(
   () => [props.patrolStepIdx, props.patrolThreshold],
   () => {
     if (loading.value || props.mode !== 'patrol') return
-    rebuildDynamicEvents()
-    updateProjectedLabels()
+    scheduleSync({ dynamic: true, labels: true })
   }
 )
 
 watch(
-  () => [props.armedTopic, props.mobilizeLayer, props.armedPlaces],
+  () => [props.armedTopic, props.mobilizeLayer, props.armedPlaces?.length],
   () => {
     if (loading.value || props.mode !== 'armed') return
-    rebuildDynamicEvents()
-    updateProjectedLabels()
-  },
-  { deep: true }
+    scheduleSync({ dynamic: true, labels: true })
+  }
 )
 
 watch(
   () => props.hoveredCommunity,
   () => {
-    if (!loading.value) updateZoneStyles()
+    scheduleSync({ zones: true })
   }
 )
 
@@ -2509,12 +3142,13 @@ watch(
   (val) => {
     if (loading.value) return
     if (props.mode === 'single' || props.mode === 'patrol') return
-    updateZoneStyles()
-    if (props.mode === 'armed') rebuildDynamicEvents()
-    if (props.mode === 'cockpit') {
-      updateBuildingSemanticTexture()
-      rebuildCockpitEntities()
-    }
+    scheduleSync({
+      zones: true,
+      dynamic: props.mode === 'armed',
+      semantic: true,
+      entities: true,
+      labels: true
+    })
     if (val && val !== '全街道') {
       focusOnCommunity(val)
     } else {
@@ -2530,14 +3164,19 @@ watch(
   () => props.chapterIndex,
   () => {
     if (loading.value || props.mode !== 'cockpit') return
-    updateBuildingSemanticTexture()
-    rebuildCockpitEntities()
+    scheduleSync({ semantic: true, entities: true, labels: true })
   }
 )
 
 onBeforeUnmount(() => {
   isDisposed = true
   stopLoop()
+  if (pointerMoveRaf !== null) {
+    cancelAnimationFrame(pointerMoveRaf)
+    pointerMoveRaf = null
+  }
+  cancelSecondaryPreload?.()
+  cancelSecondaryPreload = null
   narrowScreen?.removeEventListener('change', handleVisibilityChange)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   rootEl.value?.removeEventListener('contentvisibilityautostatechange', handleContentVisibility)
@@ -2548,21 +3187,36 @@ onBeforeUnmount(() => {
     renderer.domElement.removeEventListener('pointerdown', onPointerDown)
     renderer.domElement.removeEventListener('pointermove', onPointerMove)
     renderer.domElement.removeEventListener('pointerup', onPointerUp)
-    renderer.domElement.removeEventListener('pointerleave', clearHoveredBuilding)
+    renderer.domElement.removeEventListener('pointerleave', onCanvasLeave)
   }
   waterfront?.disposeInactive()
-  ;[cityGroup, overlayGroup, dynamicGroup, entityGroup, emergencyGroup, selectionOutlineGroup].forEach((g) => {
+  ;[cityGroup, overlayGroup, dynamicGroup, entityGroup, emergencyGroup, selectedOutlineGroup, hoverOutlineGroup].forEach((g) => {
     if (g && scene) {
       disposeGroup(g)
       scene.remove(g)
     }
   })
+  selOutlineTopMat.dispose()
+  selOutlineBaseMat.dispose()
+  hovOutlineTopMat.dispose()
+  hovOutlineBaseMat.dispose()
+  bldgColorTex.dispose()
+  sunLight?.shadow?.map?.dispose()
+  zoneEntries.clear()
+  pickableDynamicTargets = []
   controls?.dispose()
   renderer?.dispose()
   renderer?.forceContextLoss()
   if (renderer?.domElement?.parentNode) {
     renderer.domElement.parentNode.removeChild(renderer.domElement)
   }
+  renderer = null
+  scene = null
+  camera = null
+  controls = null
+  waterfront = null
+  cityGroup = overlayGroup = dynamicGroup = entityGroup = emergencyGroup = selectedOutlineGroup = hoverOutlineGroup = null
+  imageryMat = null
 })
 </script>
 
@@ -2574,8 +3228,8 @@ onBeforeUnmount(() => {
   >
     <div ref="canvasHost" class="city3d-canvas"></div>
 
-    <!-- 首次载入进度提示 -->
-    <div v-if="loading" class="city3d-loading">
+    <!-- 首次载入进度提示（大屏模式由全屏 CockpitLoader 接管，子页面保留轻提示） -->
+    <div v-if="loading && !externalLoader" class="city3d-loading">
       <div class="c3d-load-card">
         <strong>正在加载长河街道高德实景三维白模</strong>
         <div class="c3d-load-bar"><i :style="{ width: loadProgress + '%' }"></i></div>
@@ -2584,7 +3238,12 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 3D 实时投影悬浮铭牌层 -->
-    <div v-show="!loading && !comparingImagery" class="city3d-labels" aria-label="长河街道三维实景地标">
+    <div
+      v-show="!loading && !comparingImagery"
+      class="city3d-labels"
+      :class="{ 'is-stage-hidden': !labelsVisible, 'has-hover': mode === 'cockpit' && !!hoveredCommunity }"
+      aria-label="长河街道三维实景地标"
+    >
       <!-- 常规模式：指挥中心与 14 社区铭牌 -->
       <div
         v-if="hqScreenPos.visible"
@@ -2602,7 +3261,7 @@ onBeforeUnmount(() => {
         :key="lb.name"
         type="button"
         class="city3d-comm-tag"
-        :class="['h-' + lb.health, { active: lb.isSel, hover: lb.isHov, alert: lb.hasAlert }]"
+        :class="['h-' + lb.health, 'lv-' + lb.level, { active: lb.isSel, hover: lb.isHov, alert: lb.hasAlert }]"
         :style="{
           transform: `translate3d(${lb.x}px, ${lb.y}px, 0) translate(-50%, -100%)`,
           zIndex: lb.zIndex
@@ -2714,7 +3373,7 @@ onBeforeUnmount(() => {
     <aside
       v-if="!compact && !loading && !comparingImagery && mode !== 'single' && mode !== 'patrol' && mode !== 'armed'"
       class="city3d-legend"
-      :class="{ 'is-cockpit': mode === 'cockpit' }"
+      :class="{ 'is-cockpit': mode === 'cockpit', 'is-stage-hidden': !labelsVisible }"
       aria-label="三维沙盘专题图例"
     >
       <div class="c3d-lg-head">
@@ -2752,7 +3411,7 @@ onBeforeUnmount(() => {
     <div
       v-if="!loading"
       class="city3d-ctrl"
-      :class="{ 'is-cockpit': mode === 'cockpit', 'is-compact': compact, 'is-mini': mode === 'single' || mode === 'patrol' }"
+      :class="{ 'is-cockpit': mode === 'cockpit', 'is-compact': compact, 'is-mini': mode === 'single' || mode === 'patrol', 'is-stage-hidden': !labelsVisible }"
       role="group"
       aria-label="三维视角与光影控制"
     >
@@ -2769,10 +3428,12 @@ onBeforeUnmount(() => {
         <button v-if="mode === 'cockpit'" type="button" :class="{ active: cameraPreset === 'bridge' }" @click="applyCameraPreset('bridge')">岔河桥景</button>
         <button type="button" :class="{ active: cameraPreset === 'xingkai' }" @click="applyCameraPreset('xingkai')">星凯商圈</button>
         <button type="button" :class="{ active: cameraPreset === 'top' }" @click="applyCameraPreset('top')">正射俯瞰</button>
+        <i v-if="mode === 'cockpit'" class="c3d-ctrl-sep" aria-hidden="true"></i>
         <button v-if="!comparingImagery" type="button" @click="toggleDayNight">{{ isNightScene ? '日景白模' : '暗夜晶格' }}</button>
         <button v-if="!comparingImagery" type="button" @click="toggleGroundStyle">{{ groundStyle === 'amap' ? '叠加卫星' : '纯净矢量' }}</button>
         <button v-if="mode === 'cockpit'" type="button" aria-label="影像对照" :aria-pressed="comparingImagery"
           :class="{ active: comparingImagery }" @click="toggleImageryComparison">{{ comparingImagery ? '返回模型' : '影像对照' }}</button>
+        <i v-if="mode === 'cockpit'" class="c3d-ctrl-sep" aria-hidden="true"></i>
         <button v-if="!comparingImagery" type="button" :class="{ active: autoOrbit }" @click="autoOrbit = !autoOrbit">
           {{ autoOrbit ? '暂停' : '环绕' }}
         </button>
@@ -2798,6 +3459,19 @@ onBeforeUnmount(() => {
   background: #e6ecf2;
   content-visibility: auto;
   contain-intrinsic-size: auto 560px;
+}
+
+.city3d-root.mode-cockpit {
+  content-visibility: visible;
+}
+
+/* 浅色 94%-95% 不透明小铭牌与宣瓷 3D 控件免除冗余 WebGL 模糊回读，大幅削减并发 Backdrop Pass */
+.city3d-root:not(.dark) .city3d-comm-tag,
+.city3d-root:not(.dark) .city3d-ent-tag,
+.city3d-root.preset-vermilion-seal .city3d-legend.is-cockpit,
+.city3d-root.preset-vermilion-seal .city3d-ctrl.is-cockpit {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .city3d-root.dark {
@@ -2866,6 +3540,24 @@ onBeforeUnmount(() => {
   pointer-events: none;
   overflow: hidden;
   z-index: 20;
+  transition: opacity 0.68s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.city3d-labels.is-stage-hidden,
+.city3d-legend.is-stage-hidden,
+.city3d-ctrl.is-stage-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.city3d-legend,
+.city3d-ctrl {
+  transition: opacity 0.66s cubic-bezier(0.22, 1, 0.36, 1), transform 0.66s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.city3d-legend.is-stage-hidden,
+.city3d-ctrl.is-stage-hidden {
+  transform: translateY(10px);
 }
 
 .city3d-hq-tag {
@@ -2962,6 +3654,25 @@ onBeforeUnmount(() => {
 .city3d-comm-tag.hover {
   border-color: var(--primary, #c81e2b);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+  scale: 1.12;
+}
+.city3d-comm-tag {
+  transform-origin: 50% 100%;
+}
+.city3d-comm-tag.lv-lead .tag-dot { background: #2a8a5e; }
+.city3d-comm-tag.lv-ok .tag-dot { background: #3d7ea6; }
+.city3d-labels.has-hover .city3d-comm-tag:not(.hover):not(.active) {
+  opacity: 0.42;
+}
+.city3d-comm-tag {
+  transition: background-color 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, opacity 0.18s ease, scale 0.18s ease;
+}
+.c3d-ctrl-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 3px;
+  background: var(--ck-line, rgba(60, 48, 42, 0.18));
+  flex-shrink: 0;
 }
 
 .city3d-comm-tag.active {
@@ -3167,8 +3878,11 @@ onBeforeUnmount(() => {
     padding: 6px 9px;
   }
   .city3d-ctrl.is-cockpit {
-    bottom: 152px;
+    bottom: 178px;
     right: 328px;
+  }
+  .city3d-ctrl.is-cockpit button {
+    padding: 0 6px;
   }
 }
 

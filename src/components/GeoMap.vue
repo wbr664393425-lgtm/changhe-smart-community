@@ -44,6 +44,7 @@ let tileLayer = null
 let labelTileLayer = null
 let vectorGroup = null
 let polyGroup = null
+let roadBlockGroup = null
 let dataGroup = null
 let boxRectLayer = null
 let dragStartLatLng = null
@@ -339,7 +340,7 @@ function drawGovernanceBase() {
 }
 
 function drawCityMicroBlocks() {
-  if (!dataGroup || effectiveBase.value !== 'gov') return
+  if (!roadBlockGroup || effectiveBase.value !== 'gov') return
   const isDark = effectiveDark.value
   const isVermilion = store.preset === 'vermilion-seal'
   const isJade = store.preset === 'jade-emerald'
@@ -395,7 +396,7 @@ function drawCityMicroBlocks() {
           [la + hLat - tall, ln + tall * 0.65]
         ],
         { color: 'transparent', fillColor: shadowFill, fillOpacity: 1, interactive: false }
-      ).addTo(dataGroup)
+      ).addTo(roadBlockGroup)
 
       // 建筑屋顶高光块
       L.polygon(
@@ -406,14 +407,16 @@ function drawCityMicroBlocks() {
           [la + hLat, ln]
         ],
         { color: roofEdge, weight: 0.7, fillColor: roofFill, fillOpacity: 1, interactive: false }
-      ).addTo(dataGroup)
+      ).addTo(roadBlockGroup)
       drawn++
     }
   })
 }
 
 function drawRoadsAndInnerParks() {
-  if (!dataGroup || effectiveBase.value !== 'gov') return
+  if (!roadBlockGroup) return
+  roadBlockGroup.clearLayers()
+  if (effectiveBase.value !== 'gov') return
   const isDark = effectiveDark.value
   const isVermilion = store.preset === 'vermilion-seal'
 
@@ -432,7 +435,7 @@ function drawRoadsAndInnerParks() {
       fillColor: parkFill,
       fillOpacity: 1,
       interactive: false
-    }).addTo(dataGroup)
+    }).addTo(roadBlockGroup)
     if (pk.showLabel) {
       L.marker(pk.labelPos, {
         interactive: false,
@@ -443,7 +446,7 @@ function drawRoadsAndInnerParks() {
           iconSize: [64, 14],
           iconAnchor: [32, 7]
         })
-      }).addTo(dataGroup)
+      }).addTo(roadBlockGroup)
     }
   })
 
@@ -458,9 +461,9 @@ function drawRoadsAndInnerParks() {
 
   ROADS.forEach((rd) => {
     if (rd.primary) {
-      L.polyline(rd.coords, { color: primaryOuter, weight: 4.8, opacity: 0.92, interactive: false }).addTo(dataGroup)
-      L.polyline(rd.coords, { color: primaryCore, weight: 2.4, opacity: 0.96, interactive: false }).addTo(dataGroup)
-      L.polyline(rd.coords, { color: primaryFlow, weight: 1.4, dashArray: '8 16', className: 'road-flow', interactive: false }).addTo(dataGroup)
+      L.polyline(rd.coords, { color: primaryOuter, weight: 4.8, opacity: 0.92, interactive: false }).addTo(roadBlockGroup)
+      L.polyline(rd.coords, { color: primaryCore, weight: 2.4, opacity: 0.96, interactive: false }).addTo(roadBlockGroup)
+      L.polyline(rd.coords, { color: primaryFlow, weight: 1.4, dashArray: '8 16', className: 'road-flow', interactive: false }).addTo(roadBlockGroup)
       const tipPt = rd.coords[rd.labelIdx]
       L.marker(tipPt, {
         interactive: false,
@@ -471,9 +474,9 @@ function drawRoadsAndInnerParks() {
           iconSize: [56, 16],
           iconAnchor: [28, 8]
         })
-      }).addTo(dataGroup)
+      }).addTo(roadBlockGroup)
     } else {
-      L.polyline(rd.coords, { color: secondaryCol, weight: 1.5, interactive: false }).addTo(dataGroup)
+      L.polyline(rd.coords, { color: secondaryCol, weight: 1.5, interactive: false }).addTo(roadBlockGroup)
     }
   })
 }
@@ -579,7 +582,6 @@ function renderDataLayers(shouldFitView = true) {
       const style = computeCommunityStyle(c, isTarget, false)
       L.polygon(c.polygon, style).addTo(polyGroup)
     })
-    drawRoadsAndInnerParks()
     const col = ev.stage === '已办结' ? '#16a34a' : (ev.stage === '待受理' || ev.stage === '待补充') ? '#dc2626' : '#d97706'
     L.circle([ev.lat, ev.lng], { radius: 130, color: col, fillColor: col, fillOpacity: 0.14, weight: 1.5, dashArray: '4 4', interactive: false }).addTo(dataGroup)
     L.marker([ev.lat, ev.lng], {
@@ -626,9 +628,6 @@ function renderDataLayers(shouldFitView = true) {
     polyLayerMap.set(c.name, { poly, community: c })
     boundsList.push(poly)
   })
-
-  // 2. 辖区内公园 + 主次分级路网（叠于板块之上、标牌之下）
-  drawRoadsAndInnerParks()
 
   // 3. 全街道 104 顶点双线发光外廓界线（内高光倒角 + 主疆域红/青/蓝外框）
   const outerLineCol = isVermilion
@@ -942,8 +941,10 @@ onMounted(() => {
   })
   vectorGroup = L.layerGroup().addTo(map)
   polyGroup = L.layerGroup().addTo(map)
+  roadBlockGroup = L.layerGroup().addTo(map)
   dataGroup = L.layerGroup().addTo(map)
   applyBaseLayer()
+  drawRoadsAndInnerParks()
   renderDataLayers(true)
   setupBoxSelection()
   updateScaleBar()
@@ -974,6 +975,7 @@ watch(
   () => [effectiveBase.value, effectiveDark.value, store.preset],
   () => {
     applyBaseLayer()
+    drawRoadsAndInnerParks()
     renderDataLayers(false)
   }
 )
@@ -986,20 +988,33 @@ watch(
   }
 )
 
+const geoEventsSig = computed(() => {
+  const list = props.events || []
+  let s = ''
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i]
+    s += `${e.id}:${e.stage}:${e.lat}:${e.lng}:${e.community}|`
+  }
+  return s
+})
+
 watch(
   () => [
     props.selectedCommunity,
     props.slice,
-    props.events,
+    geoEventsSig.value,
     props.armedTopic,
     props.mobilizeLayer,
-    props.patrolRecord,
+    props.patrolRecord?.id,
     props.patrolStepIdx,
     props.patrolThreshold,
-    props.singleEvent
+    props.singleEvent?.id
   ],
-  () => renderDataLayers(true),
-  { deep: true }
+  ([newSel, , , , , newPatrolId, , , newSingleId], [oldSel, , , , , oldPatrolId, , , oldSingleId] = []) => {
+    // 仅当社区/单点/巡查记录切换时才重新 fitSafeBounds，切专题或步进不引发视野重算
+    const needFit = newSel !== oldSel || newPatrolId !== oldPatrolId || newSingleId !== oldSingleId
+    renderDataLayers(needFit)
+  }
 )
 
 watch(

@@ -1,35 +1,59 @@
+<script>
+// 会话级标记：浏览器当前会话首次进入大屏时展示完整疆域进度序幕；从工作台等子页二次切回跳过进度页直进三幕动画
+let cockpitSessionCurtainShown = false
+</script>
+
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, shallowRef, computed, defineAsyncComponent, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Sun, Moon, Play, Pause, Maximize2, ArrowRight, Bell, Send,
+  Sun, Moon, Play, Pause, Maximize2, ArrowRight, Bell, Send, ChevronDown,
   Users, Flag, Building2, Briefcase, AlertTriangle, CheckCircle2, ChevronRight, X
 } from 'lucide-vue-next'
 import BrandLogo from '../components/BrandLogo.vue'
-import GeoMap from '../components/GeoMap.vue'
-import ChangheCity3D from '../components/ChangheCity3D.vue'
+import CockpitLoader from '../components/CockpitLoader.vue'
+import CockpitClock from '../components/CockpitClock.vue'
 import EvidencePhoto from '../components/EvidencePhoto.vue'
-import DrilldownDrawer from '../components/DrilldownDrawer.vue'
-import BuildingProfilePanel from '../components/BuildingProfilePanel.vue'
 import {
   store, PRESETS, COMMUNITIES, EVENT_CATEGORIES, getCurrentRole, getEffectiveCommunity, getVisibleCommunities,
   applyPreset, showToast, addAuditLog, nowStr
 } from '../store/appStore'
 import { buildScenePhoto } from '../utils/sampleImages'
-import { latLngToWorldXZ } from '../utils/cityModelCache'
-import {
-  getCockpitBuildingIndex,
-  buildEventBuildingMap,
-  buildBuildingDetail,
-  queryEmergencyRadius
-} from '../utils/cockpitBuildingIndex'
-import {
-  buildPartyBranchDrill,
-  buildSpecialGroupDrill,
-  buildHousingDrill,
-  buildUnitResourceDrill,
-  buildSafetyHazardsDrill
-} from '../utils/drilldownData'
+
+// 重型 3D / 2D / 抽屉 / 档案面板按需异步分包，让全屏加载序幕首绘零阻塞
+const ChangheCity3D = defineAsyncComponent(() => import('../components/ChangheCity3D.vue'))
+const GeoMap = defineAsyncComponent(() => import('../components/GeoMap.vue'))
+const DrilldownDrawer = defineAsyncComponent(() => import('../components/DrilldownDrawer.vue'))
+const BuildingProfilePanel = defineAsyncComponent(() => import('../components/BuildingProfilePanel.vue'))
+
+// 纯算术经纬度投影，避免在 CockpitView 首屏引入含 Three.js 的 cityModelCache
+const _ORIGIN_LAT = 37.4408
+const _ORIGIN_LNG = 116.3472
+const _M_PER_LAT = 111320
+const _M_PER_LNG = 111320 * Math.cos((_ORIGIN_LAT * Math.PI) / 180)
+function latLngToWorldXZ(lat, lng) {
+  return [((lng - _ORIGIN_LNG) * _M_PER_LNG) / 10, -((lat - _ORIGIN_LAT) * _M_PER_LAT) / 10]
+}
+
+// 异步按需载入楼栋空间索引模块，避免 519KB+ 地理 JSON 阻塞首屏解析
+const bldgIdxMod = shallowRef(null)
+let bldgIdxModPromise = null
+function loadBldgIdxMod() {
+  if (bldgIdxMod.value) return Promise.resolve(bldgIdxMod.value)
+  if (!bldgIdxModPromise) {
+    bldgIdxModPromise = import('../utils/cockpitBuildingIndex').then((mod) => {
+      bldgIdxMod.value = mod
+      return mod
+    })
+  }
+  return bldgIdxModPromise
+}
+
+const NARROW_PANEL_TABS = [
+  { key: 'map', label: '地图' },
+  { key: 'data', label: '辖区数据' },
+  { key: 'events', label: '治理事项' }
+]
 
 const router = useRouter()
 
@@ -42,21 +66,274 @@ const previewPose = ref('hero')
 const previewRoot = import.meta.env.BASE_URL + 'model-previews/'
 const previewViews = { hero: '全景鸟瞰', park: '长河公园', bridge: '岔河桥景' }
 const mapBase = ref('city3d') // city3d（三维社区沙盘·默认） | gov（政务平面图） | aerial（卫星影像） | street（电子路网）
+const city3dMounted = ref(true) // 首次懒挂载后切平面图用 v-show 保活，避免销毁重建 WebGL 上下文
 const hoveredComm = ref('')
 const selectedEvent = ref(null)
 const selectedBuildingIndex = ref(-1)
-const selectedEntity = ref(null)
+const selectedEntity = shallowRef(null)
 const radiusActive = ref(false)
 const aidTick = ref(0)
 const activeCategoryFilter = ref('')
 const rightFootTab = ref('police') // police | armed
 const tourRunning = ref(false)
-const clockTime = ref('')
-const clockDate = ref('')
 let tourTimer = null
-let clockTimer = null
+let isViewUnmounted = false
 
-const drill = ref({ open: false, title: '', subtitle: '', summary: '', filters: [], columns: [], rows: [], exportName: '' })
+// ── 大屏全屏资源加载序幕 & 电影级三幕渐进入场编排 ──
+const city3dRef = ref(null)
+const isFirstSessionEntry = !cockpitSessionCurtainShown
+const loaderVisible = ref(isFirstSessionEntry)
+const loaderTargetProgress = ref(isFirstSessionEntry ? 4 : 100)
+const loaderSceneReady = ref(false)
+const loaderFallbackNotice = ref('')
+const entrancePhase = ref('pre') // pre | revealing | ready
+const city3dLabelsVisible = ref(false)
+const countUpFactor = ref(0)
+const chartSweepFactor = ref(0)
+
+let revealTriggered = false
+let countUpRafId = null
+let watchdogTimer = null
+let revisitSafetyTimer = null
+let revealTimers = []
+let prefersReducedMotion = false
+
+const MIN_CURTAIN_MS = 2500
+const CURTAIN_HOLD_MS = 400
+const LOAD_TIMEOUT_MS = 15000
+const TOUR_MS = 6000
+
+// 配色方案下拉（顶层挂载实色浮层）
+const presetMenuOpen = ref(false)
+const presetBtnEl = ref(null)
+const presetMenuPos = ref({ top: 0, right: 0 })
+const currentPreset = computed(() => PRESETS.find((p) => p.id === store.preset) || PRESETS[0])
+function togglePresetMenu() {
+  if (!presetMenuOpen.value && presetBtnEl.value) {
+    const r = presetBtnEl.value.getBoundingClientRect()
+    presetMenuPos.value = { top: Math.round(r.bottom + 6), right: Math.round(window.innerWidth - r.right) }
+  }
+  presetMenuOpen.value = !presetMenuOpen.value
+}
+function pickPreset(id, ev) {
+  applyPreset(id, ev)
+  presetMenuOpen.value = false
+}
+function onDocPointerDown(e) {
+  if (!presetMenuOpen.value) return
+  if (presetBtnEl.value?.contains(e.target) || e.target.closest?.('.ck-preset-menu')) return
+  presetMenuOpen.value = false
+}
+function onDocKeydown(e) {
+  if (e.key === 'Escape') presetMenuOpen.value = false
+}
+
+function clearEntranceTimers() {
+  if (countUpRafId !== null) {
+    cancelAnimationFrame(countUpRafId)
+    countUpRafId = null
+  }
+  if (watchdogTimer) {
+    clearTimeout(watchdogTimer)
+    watchdogTimer = null
+  }
+  if (revisitSafetyTimer) {
+    clearTimeout(revisitSafetyTimer)
+    revisitSafetyTimer = null
+  }
+  revealTimers.forEach((id) => clearTimeout(id))
+  revealTimers = []
+}
+
+function scheduleRevealTimer(fn, delay) {
+  const id = setTimeout(fn, delay)
+  revealTimers.push(id)
+  return id
+}
+
+function startNumericEntrance() {
+  if (prefersReducedMotion) {
+    countUpFactor.value = 1
+    chartSweepFactor.value = 1
+    return
+  }
+  const countDelay = 1460
+  const countDur = 1220
+  const chartOffset = 80
+  const chartDur = 1080
+
+  // 延后至 1460ms 再启动跳数 rAF，彻底消除前 88 帧空转与父模板重渲染
+  scheduleRevealTimer(() => {
+    if (isViewUnmounted) return
+    const start = performance.now()
+    const step = (now) => {
+      if (isViewUnmounted) {
+        countUpRafId = null
+        return
+      }
+      const elapsed = now - start
+      const ct = Math.min(1, Math.max(0, elapsed / countDur))
+      const ch = Math.min(1, Math.max(0, (elapsed - chartOffset) / chartDur))
+      countUpFactor.value = 1 - Math.pow(1 - ct, 3)
+      chartSweepFactor.value = 1 - Math.pow(1 - ch, 3)
+      if (ct < 1 || ch < 1) {
+        countUpRafId = requestAnimationFrame(step)
+      } else {
+        countUpFactor.value = 1
+        chartSweepFactor.value = 1
+        countUpRafId = null
+      }
+    }
+    countUpRafId = requestAnimationFrame(step)
+  }, countDelay)
+}
+
+function beginReveal() {
+  if (revealTriggered || isViewUnmounted) return
+  revealTriggered = true
+  if (watchdogTimer) {
+    clearTimeout(watchdogTimer)
+    watchdogTimer = null
+  }
+  if (revisitSafetyTimer) {
+    clearTimeout(revisitSafetyTimer)
+    revisitSafetyTimer = null
+  }
+
+  cockpitSessionCurtainShown = true
+  loaderVisible.value = false
+
+  if (prefersReducedMotion) {
+    countUpFactor.value = 1
+    chartSweepFactor.value = 1
+    city3dLabelsVisible.value = true
+    entrancePhase.value = 'ready'
+    city3dRef.value?.playIntroCamera(0)
+    return
+  }
+
+  entrancePhase.value = 'revealing'
+
+  // 第一幕（0.00s – 2.05s）：与幕布薄纱淡出同帧启动，3D 镜头 14° 航拍弧线压镜 + 晨雾渐散 + 指挥中心柔光扫楼
+  city3dRef.value?.playIntroCamera(2050)
+
+  // 第三幕：核心数字沉稳滚动跳数 + 人口结构环舒展
+  startNumericEntrance()
+
+  // 第三幕压轴（2.04s）：3D 弧线压镜即将落定时，3D 社区与地标铭牌轻柔浮现
+  scheduleRevealTimer(() => {
+    city3dLabelsVisible.value = true
+  }, 2040)
+
+  // 入场收口（3.25s）：清除临时过渡态，释放所有常规交互
+  scheduleRevealTimer(() => {
+    entrancePhase.value = 'ready'
+  }, 3250)
+}
+
+function handleCityLoadProgress({ percent }) {
+  if (revealTriggered) return
+  if (percent > loaderTargetProgress.value) {
+    loaderTargetProgress.value = percent
+  }
+}
+
+function handleCitySceneReady() {
+  if (revealTriggered) return
+  loaderSceneReady.value = true
+  loaderTargetProgress.value = 100
+  loadBldgIdxMod()
+  if (watchdogTimer) {
+    clearTimeout(watchdogTimer)
+    watchdogTimer = null
+  }
+  // 二次切回大屏跳过进度页，首帧稳住后立即进入三幕渐进动画
+  if (!loaderVisible.value) {
+    beginReveal()
+  }
+}
+
+function preloadImageWithCap(url, timeoutMs = 2400) {
+  return new Promise((resolve) => {
+    const img = new Image()
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    const timer = scheduleRevealTimer(done, timeoutMs)
+    img.onload = () => { clearTimeout(timer); done() }
+    img.onerror = () => { clearTimeout(timer); done() }
+    img.src = url
+  })
+}
+
+async function triggerPreviewFallback(noticeText) {
+  if (revealTriggered || loaderSceneReady.value) return
+  city3dMounted.value = false
+  mapBase.value = 'preview'
+  if (loaderVisible.value) {
+    loaderFallbackNotice.value = noticeText
+    loaderTargetProgress.value = Math.max(loaderTargetProgress.value, 92)
+    const previewUrl = previewRoot + previewPose.value + (isDark.value ? '-night.webp' : '-day.webp')
+    await preloadImageWithCap(previewUrl, 2200)
+    if (revealTriggered || isViewUnmounted) return
+    loaderSceneReady.value = true
+    loaderTargetProgress.value = 100
+  } else {
+    beginReveal()
+  }
+}
+
+function handleCityWebglFallback() {
+  if (!revealTriggered && !loaderSceneReady.value) {
+    triggerPreviewFallback('正在载入三维沙盘静态视图')
+  } else {
+    city3dMounted.value = false
+    mapBase.value = 'preview'
+  }
+}
+
+// 数值补间：入场阶段由 countUpFactor 统一跳数；入场完成后数据变化（锁定社区、复位、派单）从旧值平滑滚到新值
+const tweenRafs = new Set()
+function useTween(getter, duration = 560) {
+  const out = ref(Number(getter()) || 0)
+  let raf = null
+  watch(getter, (next) => {
+    const to = Number(next) || 0
+    if (raf !== null) { cancelAnimationFrame(raf); tweenRafs.delete(raf); raf = null }
+    if (prefersReducedMotion || entrancePhase.value !== 'ready' || isViewUnmounted) {
+      out.value = to
+      return
+    }
+    const from = out.value
+    const t0 = performance.now()
+    const step = (now) => {
+      tweenRafs.delete(raf)
+      const p = Math.min(1, (now - t0) / duration)
+      out.value = from + (to - from) * (1 - Math.pow(1 - p, 3))
+      if (p < 1 && !isViewUnmounted) {
+        raf = requestAnimationFrame(step)
+        tweenRafs.add(raf)
+      } else {
+        out.value = to
+        raf = null
+      }
+    }
+    raf = requestAnimationFrame(step)
+    tweenRafs.add(raf)
+  })
+  return out
+}
+
+// 显示值 = 补间值 × 入场跳数系数
+function shownNum(twRef, decimals = 0) {
+  const v = twRef.value * countUpFactor.value
+  return decimals ? v.toFixed(decimals) : Math.round(v).toLocaleString()
+}
+
+const drill = shallowRef({ open: false, title: '', subtitle: '', summary: '', filters: [], columns: [], rows: [], exportName: '' })
 
 const role = computed(() => getCurrentRole())
 const scope = computed(() => getEffectiveCommunity())
@@ -74,6 +351,17 @@ const CHAPTERS = [
 
 const PENDING_STAGES = ['待受理', '待补充', '待派单']
 const isOverdue = (ev) => ev.stage !== '已办结' && Number(ev.elapsedHours) > Number(ev.deadlineHours)
+
+// 社区治理分级（与三维沙盘图例同一口径）：标杆 / 平稳 / 关注 / 督办
+const LEVEL_LABEL = { lead: '标杆', ok: '平稳', warn: '关注', bad: '督办' }
+const openHzOf = (c) => c.safety.hazards - c.safety.fixed
+function commLevel(c) {
+  if (c.health === 'bad') return 'bad'
+  if (c.health === 'warn') return 'warn'
+  if (c.safety.coverage >= 98 && openHzOf(c) === 0) return 'lead'
+  return 'ok'
+}
+const commChipText = (c) => (openHzOf(c) ? `待销 ${openHzOf(c)}` : LEVEL_LABEL[commLevel(c)])
 function stageTagClass(ev) {
   if (!ev) return 'st-wait'
   if (ev.stage === '已办结') return 'st-ok'
@@ -87,6 +375,29 @@ function stageDotColor(ev) {
 }
 const barPct = (v, max) => (max > 0 ? Math.max(4, Math.min(100, Math.round((v / max) * 100))) : 0)
 const shortName = (name) => name.replace('社区', '')
+
+// 独立拆分共享辅助站与事件范围 computed，避免调拨物资（aidTick）引发地图 :events 引用重建
+const scopedEvents = computed(() =>
+  store.events.filter((e) => scope.value === '全街道' || e.community === scope.value)
+)
+
+const aidStats = computed(() => {
+  void aidTick.value
+  const list = visibleComms.value
+  const aidDetail = list.reduce(
+    (acc, c) => {
+      acc.wheelchair += c.gov.aidStation.wheelchair
+      acc.crutch += c.gov.aidStation.crutch
+      acc.medkit += c.gov.aidStation.medkit
+      acc.toolbox += c.gov.aidStation.toolbox
+      acc.umbrella += c.gov.aidStation.umbrella
+      return acc
+    },
+    { wheelchair: 0, crutch: 0, medkit: 0, toolbox: 0, umbrella: 0 }
+  )
+  const aidItems = Object.values(aidDetail).reduce((a, b) => a + b, 0)
+  return { aidDetail, aidItems }
+})
 
 const stats = computed(() => {
   const list = visibleComms.value
@@ -153,20 +464,8 @@ const stats = computed(() => {
   const riversKm = list.reduce((a, c) => a + c.env.rivers, 0)
   const bareSoil = list.reduce((a, c) => a + c.env.bareSoil, 0)
 
-  // 共享辅助站物资
-  void aidTick.value
-  const aidDetail = list.reduce(
-    (acc, c) => {
-      acc.wheelchair += c.gov.aidStation.wheelchair
-      acc.crutch += c.gov.aidStation.crutch
-      acc.medkit += c.gov.aidStation.medkit
-      acc.toolbox += c.gov.aidStation.toolbox
-      acc.umbrella += c.gov.aidStation.umbrella
-      return acc
-    },
-    { wheelchair: 0, crutch: 0, medkit: 0, toolbox: 0, umbrella: 0 }
-  )
-  const aidItems = Object.values(aidDetail).reduce((a, b) => a + b, 0)
+  // 共享辅助站物资（引用独立 computed）
+  const { aidDetail, aidItems } = aidStats.value
 
   // 数字武装实时底数
   const armed = list.reduce(
@@ -182,7 +481,7 @@ const stats = computed(() => {
   )
 
   // 治理事件全周期闭环
-  const events = store.events.filter((e) => scope.value === '全街道' || e.community === scope.value)
+  const events = scopedEvents.value
   const doneEvents = events.filter((e) => e.stage === '已办结')
   const openEvents = events.filter((e) => e.stage !== '已办结')
   const doneCnt = doneEvents.length
@@ -220,8 +519,8 @@ const stats = computed(() => {
 
   // 数据直达宽表采集任务实时进度（读取真实 doneCount / totalTarget 字段）
   const directTasks = store.dataDirect.tasks
-    .filter((t) => !t.expiredLocked)
-    .slice(0, 2)
+    .filter((t) => !t.expiredLocked && (scope.value === '全街道' || (t.assignees || []).includes(scope.value)))
+    .slice(0, 3)
     .map((t) => {
       const done = Number(t.doneCount || 0)
       const total = Number(t.totalTarget || 1)
@@ -242,7 +541,8 @@ const stats = computed(() => {
     fixRate: hazards ? ((fixed / hazards) * 100).toFixed(1) : '100.0',
     avgCoverage, avgGovPass,
     healthCounts: {
-      ok: list.filter((c) => c.health === 'ok').length,
+      lead: list.filter((c) => commLevel(c) === 'lead').length,
+      ok: list.filter((c) => commLevel(c) === 'ok').length,
       warn: list.filter((c) => c.health === 'warn').length,
       bad: list.filter((c) => c.health === 'bad').length
     },
@@ -268,8 +568,166 @@ const filteredStreamEvents = computed(() => {
     if (aOpen !== bOpen) return aOpen - bOpen
     return String(b.createdAt).localeCompare(String(a.createdAt))
   })
-  return list.slice(0, 6)
+  return list.slice(0, 14)
 })
+
+// ── 数值补间源 ──
+const tw = {
+  pop: useTween(() => stats.value.pop),
+  party: useTween(() => stats.value.party),
+  homes: useTween(() => stats.value.homes),
+  ent: useTween(() => stats.value.ent),
+  openHazards: useTween(() => stats.value.openHazards),
+  open: useTween(() => stats.value.openEvents.length),
+  youth: useTween(() => stats.value.youthPct),
+  elder: useTween(() => stats.value.elderPct),
+  teen: useTween(() => stats.value.teenPct),
+  rate: useTween(() => (stats.value.rateExact === '—' ? 0 : Number(stats.value.rateExact))),
+  elderAlone: useTween(() => stats.value.special.elderAlone),
+  lowIncome: useTween(() => stats.value.special.lowIncome),
+  disabled: useTween(() => stats.value.special.disabled),
+  veteran: useTween(() => stats.value.special.veteran),
+  largeEnt: useTween(() => stats.value.largeEnt),
+  revenue: useTween(() => Number(stats.value.revenue)),
+  employeesWan: useTween(() => Number(stats.value.employeesWan))
+}
+const RING_C = 219.9
+// 环图三段弧长随补间与入场扫描同步
+const ringArcs = computed(() => {
+  const f = chartSweepFactor.value
+  const y = (tw.youth.value / 100) * RING_C * f
+  const e = (tw.elder.value / 100) * RING_C * f
+  const t = (tw.teen.value / 100) * RING_C * f
+  return { y, e, t }
+})
+
+// ── 当前章专题排行：全街道口径排序，锁定社区时高亮并保证其可见 ──
+const RANK_DEFS = [
+  { note: '在册党员排行', val: (c) => c.party, text: (c) => `${c.party} 名`, color: () => 'var(--chart-1)' },
+  {
+    note: '待销号隐患排行',
+    val: (c) => openHzOf(c),
+    tie: (a, b) => a.gov.passRate - b.gov.passRate,
+    text: (c) => (openHzOf(c) ? `待销 ${openHzOf(c)} 处` : '已清零'),
+    color: (c) => (c.health === 'bad' ? 'var(--ck-danger)' : c.health === 'warn' ? 'var(--ck-warn)' : 'var(--ck-ok)')
+  },
+  { note: '规上产值排行', val: (c) => c.biz.revenue, text: (c) => `${c.biz.revenue} 亿`, color: () => 'var(--ck-accent)' },
+  {
+    note: '汛火点位排行',
+    val: (c) => c.env.floodPts + c.env.firePts,
+    text: (c) => `易涝 ${c.env.floodPts} · 防火 ${c.env.firePts}`,
+    color: () => 'var(--ck-run)'
+  },
+  {
+    note: '重点关怀排行',
+    val: (c) => c.special.elderAlone + c.special.lowIncome + c.special.disabled + c.special.veteran,
+    text: (c) => `${c.special.elderAlone + c.special.lowIncome + c.special.disabled + c.special.veteran} 人`,
+    color: () => 'var(--chart-2)'
+  }
+]
+const rankBoard = computed(() => {
+  void aidTick.value
+  const def = RANK_DEFS[activeChapter.value] || RANK_DEFS[0]
+  const pool = role.value.scope === '全街道' ? COMMUNITIES : visibleComms.value
+  const sorted = [...pool].sort((a, b) => def.val(b) - def.val(a) || (def.tie ? def.tie(a, b) : 0))
+  const max = Math.max(0, ...sorted.map(def.val))
+  const rows = sorted.map((c, i) => {
+    const v = def.val(c)
+    return {
+      c,
+      rank: i + 1,
+      pct: v > 0 ? barPct(v, max) : 0,
+      text: def.text(c),
+      color: def.color(c),
+      isScope: c.name === scope.value
+    }
+  })
+  return { note: def.note, rows, total: sorted.length }
+})
+
+// ── 列表按剩余高度整条适配：只显示能完整放下的条目，杜绝半截行 ──
+const unwrapEl = (r) => r?.$el ?? r
+function useFitCount(elRef, deps) {
+  const count = ref(99)
+  let ro = null
+  const measure = () => {
+    const el = unwrapEl(elRef.value)
+    if (!el || !el.children) return
+    const limit = el.clientHeight + 1
+    let n = 0
+    for (const child of el.children) {
+      if (child.offsetTop + child.offsetHeight <= limit) n += 1
+      else break
+    }
+    count.value = Math.max(1, n)
+  }
+  onMounted(() => {
+    ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null
+    watch(
+      () => unwrapEl(elRef.value),
+      (el, old) => {
+        if (old) ro?.unobserve(old)
+        if (el) ro?.observe(el)
+        nextTick(measure)
+      },
+      { immediate: true }
+    )
+  })
+  watch(deps, () => nextTick(measure))
+  onBeforeUnmount(() => ro?.disconnect())
+  return count
+}
+const rankListEl = ref(null)
+const liveListEl = ref(null)
+const doneListEl = ref(null)
+const timelineEl = ref(null)
+const rankFit = useFitCount(rankListEl, () => [activeChapter.value, scope.value, viewMode.value])
+const liveFit = useFitCount(liveListEl, () => [filteredStreamEvents.value.length, scope.value, activeCategoryFilter.value, viewMode.value])
+
+// 锁定社区排名靠后时，以其替换可视区最后一行，保证始终能看到本社区位次
+const rankRowsShown = computed(() => {
+  const rows = rankBoard.value.rows
+  const n = rankFit.value
+  const idx = rows.findIndex((r) => r.isScope)
+  if (idx < 0 || idx < n || n < 2) return rows
+  return [...rows.slice(0, n - 1), rows[idx], ...rows.slice(n - 1, idx), ...rows.slice(idx + 1)]
+})
+
+// 调度态：在办待办之下补充近期办结流，填充左轨剩余高度
+const recentDoneEvents = computed(() =>
+  stats.value.events
+    .filter((e) => e.stage === '已办结')
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    .slice(0, 12)
+)
+const doneFit = useFitCount(doneListEl, () => [recentDoneEvents.value.length, scope.value, viewMode.value])
+const timelineFit = useFitCount(timelineEl, () => [selectedEvent.value?.id, selectedEvent.value?.history?.length])
+const selectedTimeline = computed(() => {
+  const h = selectedEvent.value?.history || []
+  return [...h].reverse()
+})
+
+// 新增事项短暂高亮（派单、排查工单写回事件流时）
+const freshIds = ref(new Set())
+watch(
+  () => store.events.length,
+  (len, oldLen) => {
+    if (!(len > oldLen) || entrancePhase.value !== 'ready') return
+    const added = store.events.slice(0, len - oldLen).map((e) => e.id)
+    const next = new Set(freshIds.value)
+    added.forEach((id) => next.add(id))
+    freshIds.value = next
+    setTimeout(() => {
+      if (isViewUnmounted) return
+      const s = new Set(freshIds.value)
+      added.forEach((id) => s.delete(id))
+      freshIds.value = s
+    }, 2000)
+  }
+)
+
+// 地图悬停社区 → 底部社区格联动高亮
+const mapHoverComm = ref('')
 
 const currentChapterObj = computed(() => CHAPTERS[activeChapter.value])
 
@@ -293,7 +751,7 @@ const chapterConclusion = computed(() => {
     case 1: {
       if (!all) return `${who}待销号隐患 ${s.openHazards} 处，安全检查覆盖率 ${s.avgCoverage}%，政务抽查合格率 ${s.avgGovPass}%。`
       const bad = visibleComms.value.filter((c) => c.health === 'bad')
-      return `${s.healthCounts.ok} 个社区运行平稳、${s.healthCounts.warn} 个重点关注${bad.length ? `，${names(bad, 3)}已纳入街道督办` : ''}。`
+      return `${s.healthCounts.lead} 个标杆社区、${s.healthCounts.ok} 个运行平稳、${s.healthCounts.warn} 个重点关注${bad.length ? `，${names(bad, 3)}已纳入街道督办` : ''}。`
     }
     case 2:
       return `${who}规上企业 ${s.largeEnt} 家、规上产值 ${s.revenue} 亿元${all ? `，${names(s.revenueTop, 3)}居前` : ''}；隐患整改销号率 ${s.fixRate}%。`
@@ -311,7 +769,7 @@ const kpiCards = computed(() => {
       key: 'pop',
       label: '常住人口',
       icon: Users,
-      value: s.pop.toLocaleString(),
+      value: shownNum(tw.pop),
       unit: '人',
       sub: `户籍占比 ${s.hukouPct}%`,
       tone: 'var(--chart-2)',
@@ -323,7 +781,7 @@ const kpiCards = computed(() => {
       key: 'party',
       label: '在册党员',
       icon: Flag,
-      value: s.party.toLocaleString(),
+      value: shownNum(tw.party),
       unit: '名',
       sub: `${s.branches} 个基层支部`,
       tone: 'var(--primary)',
@@ -335,7 +793,7 @@ const kpiCards = computed(() => {
       key: 'homes',
       label: '实有房屋',
       icon: Building2,
-      value: s.homes.toLocaleString(),
+      value: shownNum(tw.homes),
       unit: '户',
       sub: `物业覆盖 ${s.avgPropertyRate}%`,
       tone: 'var(--chart-5)',
@@ -347,7 +805,7 @@ const kpiCards = computed(() => {
       key: 'ent',
       label: '市场主体',
       icon: Briefcase,
-      value: s.ent.toLocaleString(),
+      value: shownNum(tw.ent),
       unit: '家',
       sub: `规上企业 ${s.largeEnt} 家`,
       tone: 'var(--chart-4)',
@@ -359,7 +817,7 @@ const kpiCards = computed(() => {
       key: 'hazards',
       label: '待销号隐患',
       icon: AlertTriangle,
-      value: String(s.openHazards),
+      value: shownNum(tw.openHazards),
       unit: '处',
       sub: `整改销号 ${s.fixRate}%`,
       tone: 'var(--ck-warn)',
@@ -371,7 +829,7 @@ const kpiCards = computed(() => {
       key: 'open',
       label: '在办事项',
       icon: CheckCircle2,
-      value: String(s.openEvents.length),
+      value: shownNum(tw.open),
       unit: '件',
       sub: s.overdueCnt ? `已超时 ${s.overdueCnt} 件` : '均在时限内',
       tone: s.overdueCnt ? 'var(--ck-danger)' : 'var(--ck-ok)',
@@ -393,12 +851,6 @@ const focusCoord = computed(() => {
 function syncBodyClass() {
   document.body.classList.add('view-cockpit')
   document.body.classList.toggle('cockpit-dark', isDark.value)
-}
-
-function updateClock() {
-  const d = new Date()
-  clockTime.value = d.toTimeString().slice(0, 8)
-  clockDate.value = `${d.getFullYear()}年${String(d.getMonth() + 1).padStart(2, '0')}月${String(d.getDate()).padStart(2, '0')}日`
 }
 
 function stopTour() {
@@ -435,7 +887,7 @@ function toggleTour() {
   showToast('已开启「长河治理解码」五章自动巡演')
   tourTimer = setInterval(() => {
     selectChapter((activeChapter.value + 1) % CHAPTERS.length)
-  }, 5000)
+  }, TOUR_MS)
 }
 
 function toggleCockpitLightDark() {
@@ -466,60 +918,65 @@ function toggleCommunityLock(name) {
   radiusActive.value = false
 }
 
-// ── 三维楼栋一楼一档 / 实体点位 / 300 米联动圈计算 ──
+// ── 三维楼栋一楼一档 / 实体点位 / 300 米联动圈计算（异步按需载入空间索引模块，零首屏阻塞） ──
 const selectedBuildingDetail = computed(() => {
   void store.events.length
   void aidTick.value
-  if (selectedBuildingIndex.value < 0) return null
-  const idx = getCockpitBuildingIndex()
+  const mod = bldgIdxMod.value
+  if (!mod || selectedBuildingIndex.value < 0) return null
+  const idx = mod.getCockpitBuildingIndex()
   const b = idx.buildings[selectedBuildingIndex.value]
   if (!b) return null
-  return buildBuildingDetail(b, store)
+  return mod.buildBuildingDetail(b, store)
 })
 
 const selectedEventBuilding = computed(() => {
-  if (!selectedEvent.value) return null
-  const { eventToBldg } = buildEventBuildingMap(store.events)
+  const mod = bldgIdxMod.value
+  if (!mod || !selectedEvent.value) return null
+  const { eventToBldg } = mod.buildEventBuildingMap(store.events)
   return eventToBldg.get(selectedEvent.value.id) || null
 })
 
 const emergencyInfo = computed(() => {
   void store.events.length
   void aidTick.value
-  if (!radiusActive.value) return null
+  const mod = bldgIdxMod.value
+  if (!mod || !radiusActive.value) return null
   if (selectedBuildingDetail.value) {
     const b = selectedBuildingDetail.value.bldg
-    return queryEmergencyRadius(b.cx, b.cz, 30, store)
+    return mod.queryEmergencyRadius(b.cx, b.cz, 30, store)
   }
   if (selectedEntity.value) {
-    return queryEmergencyRadius(selectedEntity.value.x, selectedEntity.value.z, 30, store)
+    return mod.queryEmergencyRadius(selectedEntity.value.x, selectedEntity.value.z, 30, store)
   }
   if (selectedEvent.value) {
     const [ex, ez] = latLngToWorldXZ(selectedEvent.value.lat, selectedEvent.value.lng)
-    return queryEmergencyRadius(ex, ez, 30, store)
+    return mod.queryEmergencyRadius(ex, ez, 30, store)
   }
   return null
 })
 
-function handleSelectBuilding(bldg) {
+async function handleSelectBuilding(bldg) {
   if (!bldg) return
   if (role.value.scope !== '全街道' && bldg.community !== role.value.scope) {
     showToast(`当前角色权限仅限查看「${role.value.scope}」楼栋`)
     return
   }
+  await loadBldgIdxMod()
   stopTour()
   narrowPanel.value = 'events'
   selectedBuildingIndex.value = bldg.index
   selectedEntity.value = null
   selectedEvent.value = null
-  // 有隐患或在办事件的楼栋自动展开 300 米应急联动圈
-  const detail = buildBuildingDetail(bldg, store)
+  // 直接读取 selectedBuildingDetail computed，避免重复调用 buildBuildingDetail
+  const detail = selectedBuildingDetail.value
   radiusActive.value = Boolean(detail && (detail.openEvents.length > 0 || detail.hazardCount > 0))
   addAuditLog(`三维驾驶舱穿透查阅「${bldg.name}」一楼一档`, '楼栋穿透')
 }
 
-function handleSelectBuildingByIndex(bIdx) {
-  const idx = getCockpitBuildingIndex()
+async function handleSelectBuildingByIndex(bIdx) {
+  const mod = await loadBldgIdxMod()
+  const idx = mod.getCockpitBuildingIndex()
   const b = idx.buildings[bIdx]
   if (b) handleSelectBuilding(b)
 }
@@ -701,26 +1158,36 @@ function remindEvent(ev) {
   showToast(`督办提醒已送达「${ev.community}」，待社区签收`)
 }
 
-function openDrill(type) {
+async function openDrill(type) {
+  const mod = await import('../utils/drilldownData')
+  if (isViewUnmounted) return
   const list = visibleComms.value
   const sc = scope.value
   if (type === 'party') {
-    drill.value = { open: true, ...buildPartyBranchDrill(list, sc) }
+    drill.value = { open: true, ...mod.buildPartyBranchDrill(list, sc) }
   } else if (type === 'special') {
-    drill.value = { open: true, ...buildSpecialGroupDrill(list, sc) }
+    drill.value = { open: true, ...mod.buildSpecialGroupDrill(list, sc) }
   } else if (type === 'housing') {
-    drill.value = { open: true, ...buildHousingDrill(list, sc, 'all') }
+    drill.value = { open: true, ...mod.buildHousingDrill(list, sc, 'all') }
   } else if (type === 'economy') {
-    drill.value = { open: true, ...buildUnitResourceDrill(list, sc, 'large') }
+    drill.value = { open: true, ...mod.buildUnitResourceDrill(list, sc, 'large') }
   } else {
-    drill.value = { open: true, ...buildSafetyHazardsDrill(list, sc, '待销号整改') }
+    drill.value = { open: true, ...mod.buildSafetyHazardsDrill(list, sc, '待销号整改') }
   }
   addAuditLog(`驾驶舱下钻查阅「${drill.value.title}」`, '明细下钻')
 }
 
 watch(isDark, syncBodyClass)
+watch(mapBase, (val) => {
+  if (val === 'city3d' && !city3dMounted.value) {
+    city3dMounted.value = true
+  }
+})
 
 onMounted(() => {
+  isViewUnmounted = false
+  prefersReducedMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
   // 进入驾驶舱一律默认恢复全街道「全景鸟瞰」，避免跨页缓存的社区锁定导致一进来就放大
   if (role.value.scope === '全街道') {
     store.selectedCommunity = '全街道'
@@ -730,19 +1197,59 @@ onMounted(() => {
   selectedEvent.value = null
   radiusActive.value = false
   syncBodyClass()
-  updateClock()
-  clockTimer = setInterval(updateClock, 1000)
+  document.addEventListener('pointerdown', onDocPointerDown, true)
+  document.addEventListener('keydown', onDocKeydown)
+
+  if (loaderVisible.value) {
+    if (mapBase.value === 'city3d') {
+      watchdogTimer = setTimeout(() => {
+        triggerPreviewFallback('正在载入三维沙盘静态视图')
+      }, LOAD_TIMEOUT_MS)
+    } else {
+      loaderSceneReady.value = true
+      loaderTargetProgress.value = 100
+    }
+  } else {
+    // 二次切回大屏：跳过进度页，短暂等待 WebGL 首帧预热稳住后立即播三幕渐进动画
+    revisitSafetyTimer = setTimeout(() => {
+      beginReveal()
+    }, 1200)
+  }
 })
 
 onBeforeUnmount(() => {
+  isViewUnmounted = true
+  clearEntranceTimers()
   clearInterval(tourTimer)
-  clearInterval(clockTimer)
+  tweenRafs.forEach((id) => cancelAnimationFrame(id))
+  tweenRafs.clear()
+  document.removeEventListener('pointerdown', onDocPointerDown, true)
+  document.removeEventListener('keydown', onDocKeydown)
   document.body.classList.remove('view-cockpit', 'cockpit-dark')
 })
 </script>
 
 <template>
-  <div class="ck-shell">
+  <div
+    class="ck-shell"
+    :class="{
+      'is-pre-enter': entrancePhase === 'pre',
+      'is-revealing': entrancePhase === 'revealing',
+      'is-dark': isDark
+    }"
+  >
+    <!-- 全屏资源预加载等待序幕（长河街道真实疆域脉络测绘 + 实时阶段光轨进度条） -->
+    <CockpitLoader
+      :visible="loaderVisible"
+      :target-progress="loaderTargetProgress"
+      :scene-ready="loaderSceneReady"
+      :min-curtain-ms="MIN_CURTAIN_MS"
+      :hold-ms="CURTAIN_HOLD_MS"
+      :dark="isDark"
+      :fallback-notice="loaderFallbackNotice"
+      @reveal-ready="beginReveal"
+    />
+
     <!-- 顶部 68px 三段对称指挥导航栏：左双态切 ｜ 中大标题居中放大 ｜ 右工具与管理工作台 -->
     <header class="ck-header ck-header-center">
       <div class="ck-head-left">
@@ -797,24 +1304,47 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="ck-tools">
-        <div class="ck-preset-bar" role="group" aria-label="切换驾驶舱与三维建模配色">
-          <button
-            v-for="p in PRESETS"
-            :key="p.id"
-            type="button"
-            class="ck-preset-dot"
-            :class="{ active: store.preset === p.id }"
-            :title="`切换配色：${p.label}`"
-            :aria-label="p.label"
-            @click="applyPreset(p.id, $event)"
-          >
-            <i :style="{ background: `linear-gradient(135deg, ${p.sw1} 52%, ${p.sw2} 52%)` }"></i>
-          </button>
-        </div>
-        <div class="ck-clock">
-          <strong class="num">{{ clockTime }}</strong>
-          <span>{{ clockDate }}</span>
-        </div>
+        <button
+          ref="presetBtnEl"
+          type="button"
+          class="ck-preset-trigger"
+          :class="{ open: presetMenuOpen }"
+          :aria-expanded="presetMenuOpen"
+          aria-haspopup="listbox"
+          title="切换配色方案"
+          @click="togglePresetMenu"
+        >
+          <i :style="{ background: `linear-gradient(135deg, ${currentPreset.sw1} 52%, ${currentPreset.sw2} 52%)` }"></i>
+          <span>配色</span>
+          <ChevronDown :size="13" class="ck-preset-caret" />
+        </button>
+        <Teleport to="body">
+          <Transition name="ck-pop">
+            <div
+              v-if="presetMenuOpen"
+              class="ck-preset-menu"
+              :class="{ 'is-dark': isDark }"
+              role="listbox"
+              aria-label="配色方案"
+              :style="{ top: presetMenuPos.top + 'px', right: presetMenuPos.right + 'px' }"
+            >
+              <button
+                v-for="p in PRESETS"
+                :key="p.id"
+                type="button"
+                role="option"
+                :aria-selected="store.preset === p.id"
+                :class="{ active: store.preset === p.id }"
+                @click="pickPreset(p.id, $event)"
+              >
+                <i :style="{ background: `linear-gradient(135deg, ${p.sw1} 52%, ${p.sw2} 52%)` }"></i>
+                <span>{{ p.label }}</span>
+                <CheckCircle2 v-if="store.preset === p.id" :size="13" />
+              </button>
+            </div>
+          </Transition>
+        </Teleport>
+        <CockpitClock />
         <button type="button" class="ck-btn primary" @click="router.push('/portal')">
           <span>管理工作台</span>
           <ArrowRight :size="15" />
@@ -845,34 +1375,43 @@ onBeforeUnmount(() => {
     <!-- 满铺实景地图 + 满载实效双悬浮玻璃轨 -->
     <main class="ck-stage" :data-panel="narrowPanel">
       <nav class="ck-narrow-panels ck-nav-tabs" aria-label="驾驶舱内容">
-        <button v-for="item in [{key:'map', label:'地图'}, {key:'data', label:'辖区数据'}, {key:'events', label:'治理事项'}]"
+        <button v-for="item in NARROW_PANEL_TABS"
           :key="item.key" type="button" :class="{ active: narrowPanel === item.key }" :aria-pressed="narrowPanel === item.key"
           @click="narrowPanel = item.key">{{ item.label }}</button>
       </nav>
       <div class="ck-map-layer">
         <ChangheCity3D
-          v-if="mapBase === 'city3d'"
+          v-if="city3dMounted"
+          v-show="mapBase === 'city3d'"
+          ref="city3dRef"
           mode="cockpit"
           :dark="isDark"
+          :paused="mapBase !== 'city3d'"
           :selected-community="scope"
           :hovered-community="hoveredComm"
           :slice="activeSlice"
           :chapter-index="activeChapter"
-          :events="stats.events"
+          :events="scopedEvents"
           :narrow-panel-open="narrowPanel !== 'map'"
           :cockpit-view-mode="viewMode"
           :selected-building-index="selectedBuildingIndex"
           :selected-entity-id="selectedEntity?.id || ''"
           :selected-event-id="selectedEvent?.id || ''"
           :emergency-info="emergencyInfo"
+          :external-loader="loaderVisible || entrancePhase === 'pre'"
+          :defer-reveal="entrancePhase === 'pre'"
+          :labels-visible="city3dLabelsVisible"
           @select-community="toggleCommunityLock"
           @select-event="handleSelectEvent"
           @select-building="handleSelectBuilding"
           @select-entity="handleSelectEntity"
           @reset-panorama="handleResetPanorama"
-          @webgl-fallback="mapBase = 'preview'"
+          @load-progress="handleCityLoadProgress"
+          @scene-ready="handleCitySceneReady"
+          @webgl-fallback="handleCityWebglFallback"
+          @hover-community="mapHoverComm = $event"
         />
-        <div v-else-if="mapBase === 'preview'" class="ck-model-preview">
+        <div v-if="mapBase === 'preview'" class="ck-model-preview">
           <img :src="previewRoot + previewPose + (isDark ? '-night.webp' : '-day.webp')" :alt="previewViews[previewPose] + '三维模型静态视图'" />
           <div class="ck-preview-controls ck-nav-tabs" role="group" aria-label="模型预览视角">
             <span>模型静态预览</span>
@@ -881,14 +1420,14 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <GeoMap
-          v-else
+          v-if="mapBase !== 'city3d' && mapBase !== 'preview'"
           mode="cockpit"
           :base-mode="mapBase"
           :dark="isDark"
           :selected-community="scope"
           :hovered-community="hoveredComm"
           :slice="activeSlice"
-          :events="stats.events"
+          :events="scopedEvents"
           :focus-coord="focusCoord"
           @select-community="toggleCommunityLock"
           @select-event="handleSelectEvent"
@@ -899,11 +1438,11 @@ onBeforeUnmount(() => {
       <div class="ck-map-topbar">
         <section class="ck-kpi-grid" aria-label="辖区六大核心指标">
           <button
-            v-for="item in kpiCards"
+            v-for="(item, kIdx) in kpiCards"
             :key="item.key"
             type="button"
             class="ck-kpi-card"
-            :style="{ '--kpi-tone': item.tone }"
+            :style="{ '--kpi-tone': item.tone, '--kpi-idx': kIdx }"
             :title="item.tip"
             @click="item.action()"
           >
@@ -931,6 +1470,13 @@ onBeforeUnmount(() => {
               @click="viewMode = 'report'; selectChapter(idx)"
             >
               {{ ch.short }}
+              <i
+                v-if="tourRunning && activeChapter === idx && viewMode === 'report'"
+                :key="'tp-' + idx"
+                class="ck-tour-progress"
+                :style="{ animationDuration: TOUR_MS + 'ms' }"
+                aria-hidden="true"
+              ></i>
             </button>
           </div>
         </div>
@@ -951,6 +1497,7 @@ onBeforeUnmount(() => {
             <X :size="11" />
           </button>
           <div v-else class="ck-brief-health num">
+            <span><i class="c14-dot d-lead"></i>标杆 {{ stats.healthCounts.lead }}</span>
             <span><i class="c14-dot d-ok"></i>平稳 {{ stats.healthCounts.ok }}</span>
             <span><i class="c14-dot d-warn"></i>关注 {{ stats.healthCounts.warn }}</span>
             <span><i class="c14-dot d-bad"></i>督办 {{ stats.healthCounts.bad }}</span>
@@ -995,39 +1542,39 @@ onBeforeUnmount(() => {
               <div class="ck-ring-box-sm">
                 <svg viewBox="0 0 88 88" width="82" height="82" aria-hidden="true">
                   <circle cx="44" cy="44" r="35" fill="none" stroke="rgba(160,160,160,0.16)" stroke-width="8" />
-                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-1)" stroke-width="8" :stroke-dasharray="`${(stats.youthPct / 100) * 219.9} 219.9`" transform="rotate(-90 44 44)" />
-                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-2)" stroke-width="8" :stroke-dasharray="`${(stats.elderPct / 100) * 219.9} 219.9`" :stroke-dashoffset="`-${(stats.youthPct / 100) * 219.9}`" transform="rotate(-90 44 44)" />
-                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-3)" stroke-width="8" :stroke-dasharray="`${(stats.teenPct / 100) * 219.9} 219.9`" :stroke-dashoffset="`-${((stats.youthPct + stats.elderPct) / 100) * 219.9}`" transform="rotate(-90 44 44)" />
+                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-1)" stroke-width="8" :stroke-dasharray="`${ringArcs.y} ${RING_C}`" transform="rotate(-90 44 44)" />
+                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-2)" stroke-width="8" :stroke-dasharray="`${ringArcs.e} ${RING_C}`" :stroke-dashoffset="-ringArcs.y" transform="rotate(-90 44 44)" />
+                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-3)" stroke-width="8" :stroke-dasharray="`${ringArcs.t} ${RING_C}`" :stroke-dashoffset="-(ringArcs.y + ringArcs.e)" transform="rotate(-90 44 44)" />
                 </svg>
                 <div class="ck-ring-center">
-                  <strong class="num" style="font-size: 19px">{{ stats.youthPct }}<small style="font-size: 10px">%</small></strong>
+                  <strong class="num" style="font-size: 19px">{{ shownNum(tw.youth) }}<small style="font-size: 10px">%</small></strong>
                   <span style="font-size: 10px">中青年</span>
                 </div>
               </div>
               <div class="ck-legend-list" style="gap: 4px; font-size: 11.5px">
-                <div><i style="background: var(--chart-1)"></i><span>中青年</span><strong class="num">{{ stats.youthPct }}%</strong></div>
-                <div><i style="background: var(--chart-2)"></i><span>老年人</span><strong class="num">{{ stats.elderPct }}%</strong></div>
-                <div><i style="background: var(--chart-3)"></i><span>在校生</span><strong class="num">{{ stats.teenPct }}%</strong></div>
-                <div class="ck-legend-foot"><span style="white-space: nowrap">户籍 {{ stats.hukouPct }}%</span><span style="white-space: nowrap">格均 {{ stats.avgPerGrid }}人</span></div>
+                <div><i style="background: var(--chart-1)"></i><span>中青年</span><strong class="num">{{ shownNum(tw.youth) }}%</strong></div>
+                <div><i style="background: var(--chart-2)"></i><span>老年人</span><strong class="num">{{ shownNum(tw.elder) }}%</strong></div>
+                <div><i style="background: var(--chart-3)"></i><span>在校生</span><strong class="num">{{ shownNum(tw.teen) }}%</strong></div>
+                <div class="ck-legend-foot"><span style="white-space: nowrap">户籍 {{ stats.hukouPct }}%</span><span style="white-space: nowrap">格均 {{ stats.avgPerGrid.toLocaleString() }} 人</span></div>
               </div>
             </div>
 
             <div class="ck-quad-strip">
               <button type="button" class="ck-quad-cell" style="--cell-tone: var(--ck-warn)" @click="openDrill('special')">
                 <span>独居高龄</span>
-                <strong class="num">{{ stats.special.elderAlone }}</strong>
+                <strong class="num">{{ shownNum(tw.elderAlone) }}</strong>
               </button>
               <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-2)" @click="openDrill('special')">
                 <span>低保特困</span>
-                <strong class="num">{{ stats.special.lowIncome }}</strong>
+                <strong class="num">{{ shownNum(tw.lowIncome) }}</strong>
               </button>
               <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-5)" @click="openDrill('special')">
                 <span>残障帮扶</span>
-                <strong class="num">{{ stats.special.disabled }}</strong>
+                <strong class="num">{{ shownNum(tw.disabled) }}</strong>
               </button>
               <button type="button" class="ck-quad-cell" style="--cell-tone: var(--primary)" @click="openDrill('special')">
                 <span>退役优抚</span>
-                <strong class="num">{{ stats.special.veteran }}</strong>
+                <strong class="num">{{ shownNum(tw.veteran) }}</strong>
               </button>
             </div>
           </section>
@@ -1051,129 +1598,79 @@ onBeforeUnmount(() => {
             <div class="ck-trio-compact">
               <button type="button" class="ck-mini-stat" style="--cell-tone: var(--chart-4)" @click="openDrill('economy')">
                 <span>规上企业</span>
-                <strong class="num">{{ stats.largeEnt }}<small>家</small></strong>
+                <strong class="num">{{ shownNum(tw.largeEnt) }}<small>家</small></strong>
               </button>
               <button type="button" class="ck-mini-stat" style="--cell-tone: var(--primary)" @click="openDrill('economy')">
                 <span>规上产值</span>
-                <strong class="num">{{ stats.revenue }}<small>亿</small></strong>
+                <strong class="num">{{ shownNum(tw.revenue, 1) }}<small>亿</small></strong>
               </button>
               <button type="button" class="ck-mini-stat" style="--cell-tone: var(--chart-5)" @click="openDrill('economy')">
                 <span>吸纳就业</span>
-                <strong class="num">{{ stats.employeesWan }}<small>万</small></strong>
+                <strong class="num">{{ shownNum(tw.employeesWan, 2) }}<small>万</small></strong>
               </button>
             </div>
           </section>
 
-          <!-- 板块 3：当前汇报章 · 专题实数洞察（随顶部五章动态换图表） -->
-          <section class="ck-block ck-tight-block">
+          <!-- 板块 3：当前汇报章 · 专题实数 + 全街道排行（随五章交叉淡入切换，排行按剩余高度整条适配） -->
+          <section class="ck-block ck-tight-block ck-chapter-block">
             <div class="ck-block-head">
               <span class="ck-block-label">{{ currentChapterObj.label }}</span>
-              <span class="ck-block-note">{{ scope }}</span>
+              <span class="ck-block-note">{{ rankBoard.note }}</span>
             </div>
 
-            <!-- 第 1 章：党建引领与社区治理力量排行 -->
-            <template v-if="activeChapter === 0">
-              <div class="ck-trio-compact">
-                <div class="ck-mini-stat" style="--cell-tone: var(--primary)"><span>基层支部</span><strong class="num">{{ stats.branches }}<small>个</small></strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-2)"><span>网格力量</span><strong class="num">{{ stats.gridStaff + stats.publicPost }}<small>人</small></strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-3)"><span>共驻单位</span><strong class="num">{{ stats.coBuild }}<small>家</small></strong></div>
-              </div>
-              <div class="ck-rank-list">
-                <button
-                  v-for="c in stats.partyTop"
-                  :key="c.id"
-                  type="button"
-                  class="ck-rank-row"
-                  @click="toggleCommunityLock(c.name)"
-                >
-                  <span class="ck-rank-name">{{ shortName(c.name) }}</span>
-                  <span class="ck-cat-track"><i :style="{ width: barPct(c.party, stats.rankMax.party) + '%', background: 'var(--chart-1)' }"></i></span>
-                  <b class="num">{{ c.party }}名</b>
-                </button>
-              </div>
-            </template>
+            <Transition name="ck-swap" mode="out-in" :duration="{ enter: 760, leave: 150 }">
+              <div :key="activeChapter" class="ck-chapter-body">
+                <div v-if="activeChapter === 0" class="ck-trio-compact">
+                  <div class="ck-mini-stat" style="--cell-tone: var(--primary)"><span>基层支部</span><strong class="num">{{ stats.branches }}<small>个</small></strong></div>
+                  <div class="ck-mini-stat" style="--cell-tone: var(--chart-2)"><span>网格力量</span><strong class="num">{{ stats.gridStaff + stats.publicPost }}<small>人</small></strong></div>
+                  <div class="ck-mini-stat" style="--cell-tone: var(--chart-3)"><span>共驻单位</span><strong class="num">{{ stats.coBuild }}<small>家</small></strong></div>
+                </div>
+                <div v-else-if="activeChapter === 1" class="ck-dual-compact">
+                  <div class="ck-mini-stat" style="--cell-tone: var(--ck-ok)"><span>安全检查覆盖率</span><strong class="num">{{ stats.avgCoverage }}<small>%</small></strong></div>
+                  <div class="ck-mini-stat" style="--cell-tone: var(--chart-2)"><span>政务抽查合格率</span><strong class="num">{{ stats.avgGovPass }}<small>%</small></strong></div>
+                </div>
+                <div v-else-if="activeChapter === 2" class="ck-dual-compact">
+                  <div class="ck-mini-stat" style="--cell-tone: var(--ck-warn)"><span>重点监管企业</span><strong class="num">{{ stats.regEnt }}<small>家</small></strong></div>
+                  <div class="ck-mini-stat" style="--cell-tone: var(--ck-ok)"><span>隐患整改销号率</span><strong class="num">{{ stats.fixRate }}<small>%</small></strong></div>
+                </div>
+                <div v-else-if="activeChapter === 3" class="ck-quad-strip">
+                  <div class="ck-quad-cell" style="--cell-tone: var(--ck-run)"><span>易涝点</span><strong class="num">{{ stats.floodPts }}</strong></div>
+                  <div class="ck-quad-cell" style="--cell-tone: var(--ck-danger)"><span>防火点</span><strong class="num">{{ stats.firePts }}</strong></div>
+                  <div class="ck-quad-cell" style="--cell-tone: var(--chart-2)"><span>河道公里</span><strong class="num">{{ stats.riversKm }}</strong></div>
+                  <div class="ck-quad-cell" style="--cell-tone: var(--chart-5)"><span>裸土万㎡</span><strong class="num">{{ stats.bareSoilWan }}</strong></div>
+                </div>
+                <template v-else>
+                  <div class="ck-aid-grid">
+                    <div class="ck-mini-stat" style="--cell-tone: var(--chart-2)"><span>轮椅</span><strong class="num">{{ stats.aidDetail.wheelchair }}</strong></div>
+                    <div class="ck-mini-stat" style="--cell-tone: var(--chart-3)"><span>拐杖</span><strong class="num">{{ stats.aidDetail.crutch }}</strong></div>
+                    <div class="ck-mini-stat" style="--cell-tone: var(--primary)"><span>急救箱</span><strong class="num">{{ stats.aidDetail.medkit }}</strong></div>
+                    <div class="ck-mini-stat" style="--cell-tone: var(--chart-4)"><span>工具箱</span><strong class="num">{{ stats.aidDetail.toolbox }}</strong></div>
+                    <div class="ck-mini-stat" style="--cell-tone: var(--chart-5)"><span>爱心伞</span><strong class="num">{{ stats.aidDetail.umbrella }}</strong></div>
+                  </div>
+                  <p class="ck-note-p">{{ stats.commCount }} 处共享辅助站在库物资合计 <b class="num">{{ stats.aidItems }}</b> 件，楼栋档案内可就近调拨。</p>
+                </template>
 
-            <!-- 第 2 章：十四社区治理体检与待销号盯防 -->
-            <template v-else-if="activeChapter === 1">
-              <div class="ck-dual-compact">
-                <div class="ck-mini-stat" style="--cell-tone: var(--ck-ok)"><span>安全检查覆盖率</span><strong class="num">{{ stats.avgCoverage }}<small>%</small></strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-2)"><span>政务抽查合格率</span><strong class="num">{{ stats.avgGovPass }}<small>%</small></strong></div>
+                <div ref="rankListEl" class="ck-rank-list ck-rank-fit">
+                  <button
+                    v-for="(r, rIdx) in rankRowsShown"
+                    :key="r.c.id"
+                    type="button"
+                    class="ck-rank-row"
+                    :class="{ 'is-scope': r.isScope, 'is-clipped': rIdx >= rankFit }"
+                    :tabindex="rIdx >= rankFit ? -1 : 0"
+                    @click="toggleCommunityLock(r.c.name)"
+                  >
+                    <span class="ck-rank-no num">{{ r.rank }}</span>
+                    <span class="ck-rank-name">{{ shortName(r.c.name) }}</span>
+                    <span class="ck-cat-track"><i :style="{ width: r.pct + '%', background: r.color }"></i></span>
+                    <b class="num" :style="activeChapter === 1 ? { color: r.color } : null">{{ r.text }}</b>
+                  </button>
+                </div>
               </div>
-              <div class="ck-rank-list">
-                <button
-                  v-for="c in stats.riskTop"
-                  :key="c.id"
-                  type="button"
-                  class="ck-rank-row"
-                  @click="toggleCommunityLock(c.name)"
-                >
-                  <span class="ck-rank-name">{{ shortName(c.name) }}</span>
-                  <span class="ck-cat-track">
-                    <i :style="{ width: barPct(c.safety.hazards - c.safety.fixed, stats.rankMax.risk) + '%', background: c.health === 'bad' ? 'var(--ck-danger)' : 'var(--ck-warn)' }"></i>
-                  </span>
-                  <b class="num" :style="{ color: c.health === 'bad' ? 'var(--ck-danger)' : 'var(--ck-warn)' }">待销 {{ c.safety.hazards - c.safety.fixed }} 处</b>
-                </button>
-              </div>
-            </template>
-
-            <!-- 第 3 章：安全生产与产值前四强社区 -->
-            <template v-else-if="activeChapter === 2">
-              <div class="ck-dual-compact">
-                <div class="ck-mini-stat" style="--cell-tone: var(--ck-warn)"><span>重点监管企业</span><strong class="num">{{ stats.regEnt }}<small>家</small></strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--ck-ok)"><span>隐患整改销号率</span><strong class="num">{{ stats.hazards ? ((stats.fixed / stats.hazards) * 100).toFixed(1) : '100.0' }}<small>%</small></strong></div>
-              </div>
-              <div class="ck-rank-list">
-                <button
-                  v-for="c in stats.revenueTop"
-                  :key="c.id"
-                  type="button"
-                  class="ck-rank-row"
-                  @click="toggleCommunityLock(c.name)"
-                >
-                  <span class="ck-rank-name">{{ shortName(c.name) }}</span>
-                  <span class="ck-cat-track"><i :style="{ width: barPct(c.biz.revenue, stats.rankMax.revenue) + '%', background: 'var(--ck-accent)' }"></i></span>
-                  <b class="num">{{ c.biz.revenue }}亿</b>
-                </button>
-              </div>
-            </template>
-
-            <!-- 第 4 章：城乡生态与防汛防火盯防 -->
-            <template v-else-if="activeChapter === 3">
-              <div class="ck-quad-strip">
-                <div class="ck-quad-cell" style="--cell-tone: var(--ck-run)"><span>易涝点</span><strong class="num">{{ stats.floodPts }}</strong></div>
-                <div class="ck-quad-cell" style="--cell-tone: var(--ck-danger)"><span>防火点</span><strong class="num">{{ stats.firePts }}</strong></div>
-                <div class="ck-quad-cell" style="--cell-tone: var(--chart-2)"><span>河道公里</span><strong class="num">{{ stats.riversKm }}</strong></div>
-                <div class="ck-quad-cell" style="--cell-tone: var(--chart-5)"><span>裸土万㎡</span><strong class="num">{{ stats.bareSoilWan }}</strong></div>
-              </div>
-              <div class="ck-rank-list">
-                <button
-                  v-for="c in stats.ecoTop"
-                  :key="c.id"
-                  type="button"
-                  class="ck-rank-row"
-                  @click="toggleCommunityLock(c.name)"
-                >
-                  <span class="ck-rank-name">{{ shortName(c.name) }}</span>
-                  <span class="ck-cat-track"><i :style="{ width: barPct(c.env.floodPts + c.env.firePts, stats.rankMax.eco) + '%', background: 'var(--ck-run)' }"></i></span>
-                  <b class="num">易涝 {{ c.env.floodPts }} · 防火 {{ c.env.firePts }}</b>
-                </button>
-              </div>
-            </template>
-
-            <!-- 第 5 章：共享辅助站 5 类物资库存实数 -->
-            <template v-else>
-              <div class="ck-aid-grid">
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-2)"><span>轮椅</span><strong class="num">{{ stats.aidDetail.wheelchair }}</strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-3)"><span>拐杖</span><strong class="num">{{ stats.aidDetail.crutch }}</strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--primary)"><span>急救箱</span><strong class="num">{{ stats.aidDetail.medkit }}</strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-4)"><span>工具箱</span><strong class="num">{{ stats.aidDetail.toolbox }}</strong></div>
-                <div class="ck-mini-stat" style="--cell-tone: var(--chart-5)"><span>爱心伞</span><strong class="num">{{ stats.aidDetail.umbrella }}</strong></div>
-              </div>
-              <p class="ck-note-p">{{ stats.commCount }} 处共享辅助站在库物资合计 <b class="num">{{ stats.aidItems }}</b> 件，楼栋档案内可就近调拨。</p>
-            </template>
+            </Transition>
           </section>
 
-          <!-- 板块 4：基层减负「数据直达」宽表采集脉搏 -->
+          <!-- 板块 4：基层减负「数据直达」宽表采集脉搏（锁定社区时仅显示分派至本社区的任务） -->
           <section class="ck-block ck-tight-block">
             <button type="button" class="ck-block-head" @click="router.push('/data-direct')">
               <span class="ck-block-label">数据直达 · 一表通减负</span>
@@ -1190,16 +1687,22 @@ onBeforeUnmount(() => {
               >
                 <div class="ck-direct-top">
                   <span>{{ t.title }}</span>
-                  <b class="num">{{ t.done }}/{{ t.total }}条 · <em>{{ t.pct }}%</em></b>
+                  <b class="num">{{ t.done }}/{{ t.total }} 条 · <em>{{ t.pct }}%</em></b>
                 </div>
                 <div class="ck-cat-track">
                   <i :style="{ width: Math.max(t.pct, 4) + '%', background: 'var(--task-tone)' }"></i>
                 </div>
               </button>
+              <div v-if="!stats.directTasks.length" class="ck-empty-card">
+                <span class="ck-empty-badge">无待采</span>
+                <div class="ck-empty-body">
+                  <strong>{{ scope }}本期无分派的宽表采集任务</strong>
+                  <span>街道各科室下发任务后将在此同步进度</span>
+                </div>
+              </div>
             </div>
           </section>
         </template>
-
         <!-- 日常调度态：左轨变为今日急难愁盼待办流 -->
         <template v-else>
           <div class="ck-rail-title ck-tight-title">
@@ -1221,13 +1724,13 @@ onBeforeUnmount(() => {
             <div class="ck-mini-stat" style="--cell-tone: var(--ck-warn)"><span>办理复核</span><strong class="num">{{ stats.handleReview }}</strong></div>
             <div class="ck-mini-stat" :style="{ '--cell-tone': stats.overdueCnt ? 'var(--ck-danger)' : 'var(--ck-ok)' }"><span>已超时</span><strong class="num">{{ stats.overdueCnt }}</strong></div>
           </div>
-          <div class="ck-live-list ck-dispatch-list">
+          <TransitionGroup tag="div" name="ck-list" class="ck-live-list ck-dispatch-list">
             <button
               v-for="ev in dispatchEvents"
               :key="ev.id"
               type="button"
               class="ck-live-item"
-              :class="{ 'is-selected': selectedEvent?.id === ev.id }"
+              :class="{ 'is-selected': selectedEvent?.id === ev.id, 'is-fresh': freshIds.has(ev.id) }"
               @click="handleSelectEvent(ev)"
             >
               <span class="ck-live-dot" :style="{ background: stageDotColor(ev) }"></span>
@@ -1240,8 +1743,32 @@ onBeforeUnmount(() => {
               </div>
               <span class="tag" :class="stageTagClass(ev)">{{ isOverdue(ev) ? '已超时' : ev.stage }}</span>
             </button>
-            <div v-if="!dispatchEvents.length" class="ck-empty">当前范围内暂无在办事项</div>
-          </div>
+            <div v-if="!dispatchEvents.length" key="empty" class="ck-empty">当前范围内暂无在办事项</div>
+          </TransitionGroup>
+          <section v-if="recentDoneEvents.length" class="ck-block ck-tight-block ck-fill-block">
+            <div class="ck-block-head">
+              <span class="ck-block-label">近期办结</span>
+              <span class="ck-block-note num">已结 {{ stats.doneCnt }} 件 · 均 {{ stats.avgHours }} 小时</span>
+            </div>
+            <div ref="doneListEl" class="ck-live-list ck-live-compact ck-fit-list">
+              <button
+                v-for="(e, dIdx) in recentDoneEvents"
+                :key="e.id"
+                type="button"
+                class="ck-live-item"
+                :class="{ 'is-clipped': dIdx >= doneFit }"
+                :tabindex="dIdx >= doneFit ? -1 : 0"
+                @click="handleSelectEvent(e)"
+              >
+                <span class="ck-live-dot" style="background: var(--ck-ok)"></span>
+                <div class="ck-live-body">
+                  <span class="ck-live-title">{{ e.title }}</span>
+                  <span class="ck-live-sub num">{{ e.community }} · {{ e.category }} · 用时 {{ e.elapsedHours }} 小时</span>
+                </div>
+                <span class="tag st-ok">已办结</span>
+              </button>
+            </div>
+          </section>
         </template>
       </aside>
 
@@ -1319,7 +1846,7 @@ onBeforeUnmount(() => {
             />
             <div v-if="emergencyInfo?.nearbyStaff?.[0]" class="ck-emg-mini">
               <div>
-                <strong>300 米内最近网格员 · {{ emergencyInfo.nearbyStaff[0].name }}</strong>
+                <strong>{{ emergencyInfo.nearbyStaff[0].distMeters <= 300 ? '300 米内最近网格员' : '最近在岗网格员' }} · {{ emergencyInfo.nearbyStaff[0].name }}</strong>
                 <span class="num">距 {{ emergencyInfo.nearbyStaff[0].distMeters }} 米 · 周边独居楼 {{ emergencyInfo.careBuildingsTotal }} 栋</span>
               </div>
               <button
@@ -1347,6 +1874,25 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </section>
+          <section v-if="selectedTimeline.length" class="ck-block ck-tight-block ck-fill-block">
+            <div class="ck-block-head">
+              <span class="ck-block-label">处置进程</span>
+              <span class="ck-block-note num">共 {{ selectedTimeline.length }} 个节点</span>
+            </div>
+            <ol ref="timelineEl" class="ck-timeline ck-fit-list">
+              <li
+                v-for="(h, hIdx) in selectedTimeline"
+                :key="hIdx + h.time"
+                :class="{ 'is-latest': hIdx === 0, 'is-clipped': hIdx >= timelineFit }"
+              >
+                <div class="ck-tl-head">
+                  <strong>{{ h.node }}</strong>
+                  <span class="num">{{ String(h.time).slice(5, 16) }}</span>
+                </div>
+                <p>{{ h.detail }}</p>
+              </li>
+            </ol>
+          </section>
         </template>
 
         <template v-else>
@@ -1369,7 +1915,7 @@ onBeforeUnmount(() => {
           <section class="ck-block ck-tight-block">
             <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 6px; min-width: 0">
               <div class="ck-big-figure" style="flex-shrink: 0; white-space: nowrap">
-                <strong class="num" style="font-size: 26px; color: var(--ck-ok)">{{ stats.rateExact }}<small v-if="stats.rateExact !== '—'" style="font-size: 13px">%</small></strong>
+                <strong class="num" style="font-size: 26px; color: var(--ck-ok)">{{ stats.rateExact === '—' ? '—' : shownNum(tw.rate, 1) }}<small v-if="stats.rateExact !== '—'" style="font-size: 13px">%</small></strong>
                 <span style="font-size: 11.5px; white-space: nowrap">办结率</span>
               </div>
               <span class="ck-block-note num" style="white-space: nowrap; font-size: 11px">已结 {{ stats.doneCnt }}/{{ stats.events.length }} · 均 {{ stats.avgHours }} 小时</span>
@@ -1415,18 +1961,19 @@ onBeforeUnmount(() => {
           </section>
 
           <!-- 板块 3：实时急难愁盼与最新闭环流（自然高度不强撑，使下方警网联勤自然上浮对齐左栏） -->
-          <section class="ck-block ck-tight-block">
+          <section class="ck-block ck-tight-block ck-fill-block">
             <button type="button" class="ck-block-head" @click="router.push('/grid')">
               <span class="ck-block-label">{{ activeCategoryFilter ? `${activeCategoryFilter}事项` : '近期治理事项' }}</span>
               <span class="ck-mini-link num">研判台 ›</span>
             </button>
-            <div class="ck-live-list ck-live-compact">
+            <TransitionGroup ref="liveListEl" tag="div" name="ck-list" class="ck-live-list ck-live-compact ck-fit-list">
               <button
-                v-for="e in filteredStreamEvents"
+                v-for="(e, eIdx) in filteredStreamEvents"
                 :key="e.id"
                 type="button"
                 class="ck-live-item"
-                :class="{ 'is-selected': selectedEvent?.id === e.id }"
+                :class="{ 'is-selected': selectedEvent?.id === e.id, 'is-fresh': freshIds.has(e.id), 'is-clipped': eIdx >= liveFit }"
+                :tabindex="eIdx >= liveFit ? -1 : 0"
                 @click="handleSelectEvent(e)"
               >
                 <span class="ck-live-dot" :style="{ background: stageDotColor(e) }"></span>
@@ -1436,7 +1983,7 @@ onBeforeUnmount(() => {
                 </div>
                 <span class="tag" :class="stageTagClass(e)">{{ isOverdue(e) ? '已超时' : e.stage }}</span>
               </button>
-            </div>
+            </TransitionGroup>
           </section>
 
           <!-- 板块 4：警网联勤快报 / 数字武装战备底数 双切微看板 -->
@@ -1510,20 +2057,21 @@ onBeforeUnmount(() => {
         <div class="c14-divider" aria-hidden="true"></div>
         <div class="c14-grid">
           <button
-            v-for="c in COMMUNITIES"
+            v-for="(c, cIdx) in COMMUNITIES"
             :key="c.id"
             type="button"
             class="ck-comm-mini"
-            :class="['h-' + c.health, { active: scope === c.name }]"
+            :class="['h-' + c.health, 'lv-' + commLevel(c), { active: scope === c.name, 'is-map-hover': mapHoverComm === c.name }]"
+            :style="{ '--comm-idx': cIdx }"
             :disabled="role.scope !== '全街道' && role.scope !== c.name"
             @mouseenter="hoveredComm = c.name"
             @mouseleave="hoveredComm = ''"
             @click="toggleCommunityLock(c.name)"
           >
             <span class="c14-name">
-              <i class="c14-dot" :class="'d-' + c.health"></i>{{ shortName(c.name) }}
+              <i class="c14-dot" :class="'d-' + commLevel(c)"></i>{{ shortName(c.name) }}
             </span>
-            <strong class="num">{{ c.safety.hazards - c.safety.fixed ? `待销 ${c.safety.hazards - c.safety.fixed}` : '平稳' }}</strong>
+            <strong class="num">{{ commChipText(c) }}</strong>
           </button>
         </div>
       </section>
@@ -1551,47 +2099,6 @@ onBeforeUnmount(() => {
     inset 0 2px 0 var(--ck-rail-top-bar),
     var(--e3),
     var(--ck-edge) !important;
-}
-
-.ck-preset-bar {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 34px;
-  padding: 0 9px;
-  border-radius: var(--r-control);
-  border: var(--hair) solid var(--ck-border);
-  background: var(--ck-panel);
-  box-shadow: var(--e1), var(--ck-edge);
-}
-
-.ck-preset-dot {
-  width: 18px;
-  height: 18px;
-  padding: 2px;
-  border-radius: 50%;
-  border: 1.5px solid transparent;
-  background: transparent;
-  display: grid;
-  place-items: center;
-  cursor: pointer;
-  transition: transform 0.14s ease, border-color 0.14s ease;
-}
-
-.ck-preset-dot:hover {
-  transform: scale(1.12);
-}
-
-.ck-preset-dot.active {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 2px var(--primary-soft);
-}
-
-.ck-preset-dot i {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border-radius: 50%;
 }
 
 /* ── 侧轨一级轨顶主标题：实色朱印斜切铭牌（等比 SVG 斜尾 + 单条鎏金切线 + 红金渐隐底线） ── */
@@ -2857,5 +3364,627 @@ button.ck-mini-stat:hover {
   .ck-map-layer :deep(.city3d-legend.is-cockpit) { bottom: 153px; }
   .ck-stage .ck-map-fab { flex-direction: row; align-items: center; flex-wrap: wrap; left: 8px; }
   .ck-map-topbar .ck-pill { padding-inline: 2px; }
+}
+
+/* ==========================================================================
+   驾驶舱 UI 优化：配色下拉 / 侧轨填充与整条适配 / 分级口径 / 章节与列表动效
+   ========================================================================== */
+.ck-shell {
+  --lv-lead: #2a8a5e;
+  --lv-ok: #3d7ea6;
+}
+.ck-shell.is-dark {
+  --lv-lead: #5cc394;
+  --lv-ok: #74abd4;
+}
+
+/* 配色方案：单按钮 + 顶层实色下拉 */
+.ck-preset-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 9px 0 8px;
+  border-radius: var(--r-control);
+  border: var(--hair) solid var(--ck-border);
+  background: var(--ck-panel);
+  color: var(--ck-muted);
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: var(--e1), var(--ck-edge);
+  cursor: pointer;
+  transition: border-color var(--d-fade) ease, color var(--d-fade) ease;
+}
+.ck-preset-trigger:hover,
+.ck-preset-trigger.open {
+  color: var(--ck-ink);
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--ck-border));
+}
+.ck-preset-trigger i {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px var(--ck-panel-solid), 0 0 0 2.5px color-mix(in srgb, var(--primary) 50%, transparent);
+}
+.ck-preset-caret {
+  transition: transform 0.18s ease;
+}
+.ck-preset-trigger.open .ck-preset-caret {
+  transform: rotate(180deg);
+}
+.ck-preset-menu {
+  position: fixed;
+  z-index: 3000;
+  min-width: 172px;
+  padding: 5px;
+  display: grid;
+  gap: 2px;
+  border-radius: var(--r-card, 10px);
+  border: 1px solid var(--ck-border, rgba(60, 48, 42, 0.16));
+  background: var(--ck-panel-solid, #ffffff);
+  box-shadow: 0 12px 32px rgba(24, 20, 18, 0.18), 0 2px 6px rgba(24, 20, 18, 0.08);
+}
+.ck-preset-menu button {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ck-ink, #1a1718);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.ck-preset-menu button:hover {
+  background: rgba(128, 148, 170, 0.12);
+}
+.ck-preset-menu button.active {
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+.ck-preset-menu button i {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+}
+.ck-preset-menu button span {
+  white-space: nowrap;
+}
+.ck-pop-enter-active,
+.ck-pop-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ck-pop-enter-from,
+.ck-pop-leave-to {
+  opacity: 0;
+  transform: translate3d(0, -4px, 0);
+}
+
+/* 实时联动呼吸点：跟随主题成功色 */
+.ck-shell .live-dot-badge {
+  color: var(--ck-ok);
+}
+.ck-shell .live-dot-badge::before {
+  background: var(--ck-ok);
+}
+.ck-shell .live-dot-badge::after {
+  background: color-mix(in srgb, var(--ck-ok) 55%, transparent);
+}
+
+/* 侧轨剩余高度填充 + 列表整条适配 */
+.ck-chapter-block,
+.ck-fill-block {
+  flex: 1 1 0;
+  min-height: 112px;
+}
+.ck-chapter-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 1;
+  min-height: 0;
+}
+.ck-rank-fit,
+.ck-fit-list {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  max-height: none !important;
+  overflow: hidden !important;
+  align-content: start;
+}
+.ck-rank-fit {
+  gap: 3px;
+}
+.is-clipped {
+  visibility: hidden;
+  pointer-events: none;
+}
+.ck-dispatch-list {
+  flex: 0 1 auto;
+}
+.ck-fit-list .ck-live-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 排行：序号 + 名称 + 条 + 值，锁定社区高亮 */
+.ck-rank-fit .ck-rank-row {
+  grid-template-columns: 16px 40px minmax(0, 1fr) minmax(56px, auto);
+  height: 24px;
+  padding: 0 4px;
+}
+.ck-rank-no {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--ck-muted);
+  text-align: center;
+}
+.ck-rank-row:nth-child(-n + 3) .ck-rank-no {
+  color: var(--primary);
+}
+.ck-rank-row.is-scope {
+  background: var(--primary-soft);
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+.ck-rank-row.is-scope .ck-rank-name {
+  color: var(--primary);
+}
+
+/* 处置进程时间轴 */
+.ck-timeline {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ck-timeline li {
+  position: relative;
+  padding: 0 0 9px 16px;
+}
+.ck-timeline li::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ck-panel-solid);
+  border: 1.5px solid color-mix(in srgb, var(--ck-muted) 60%, transparent);
+}
+.ck-timeline li::after {
+  content: '';
+  position: absolute;
+  left: 6.5px;
+  top: 14px;
+  bottom: 0;
+  width: 1px;
+  background: var(--ck-line);
+}
+.ck-timeline li:last-child::after {
+  display: none;
+}
+.ck-timeline li.is-latest::before {
+  border-color: var(--primary);
+  background: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.ck-tl-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+}
+.ck-tl-head strong {
+  color: var(--ck-ink);
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ck-tl-head span {
+  flex-shrink: 0;
+  color: var(--ck-muted);
+  font-size: 10.5px;
+}
+.ck-timeline p {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ck-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 分级口径：标杆 / 平稳 / 关注 / 督办（与三维图例一致） */
+.c14-dot.d-lead { background: var(--lv-lead); }
+.ck-14-strip .c14-dot.d-ok,
+.ck-brief-health .c14-dot.d-ok { background: var(--lv-ok); }
+.ck-14-strip .ck-comm-mini.lv-lead strong { color: var(--lv-lead); }
+.ck-14-strip .ck-comm-mini.is-map-hover:not(.active) {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--primary) 48%, var(--ck-border));
+  background: rgba(128, 148, 170, 0.13);
+  box-shadow: 0 4px 10px rgba(24, 20, 18, 0.09);
+}
+.ck-14-strip .ck-comm-mini {
+  transition: transform 0.18s ease, border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+/* 地图右下：图层开关与底图切换并为一行 */
+.ck-stage .ck-map-fab {
+  flex-direction: row;
+  align-items: center;
+}
+.ck-stage .ck-map-fab .ck-fab-btn {
+  height: 34px;
+}
+.ck-fab-btn.active {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+.ck-map-layer :deep(.city3d-ctrl.is-cockpit) {
+  bottom: 126px;
+}
+
+/* 条形数据变化平滑过渡 */
+.ck-cat-track > i,
+.ck-share-bar > i,
+.ck-sla-track > i {
+  transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 章节切换：旧内容淡出 → 新内容上浮淡入，排行条从左舒展 */
+.ck-swap-enter-active {
+  transition: opacity 0.26s ease, transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ck-swap-leave-active {
+  transition: opacity 0.15s ease;
+}
+.ck-swap-enter-from {
+  opacity: 0;
+  transform: translate3d(0, 6px, 0);
+}
+.ck-swap-leave-to {
+  opacity: 0;
+}
+.ck-swap-enter-active .ck-cat-track > i {
+  transform-origin: left center;
+  animation: ckBarExpand 0.7s cubic-bezier(0.22, 1, 0.36, 1) 0.06s both;
+}
+
+/* 巡演进度线 */
+.ck-map-toprow .ck-pill {
+  position: relative;
+  overflow: hidden;
+}
+.ck-tour-progress {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 2px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  opacity: 0.75;
+  transform-origin: left center;
+  animation-name: ckTourProgress;
+  animation-timing-function: linear;
+  animation-fill-mode: both;
+}
+@keyframes ckTourProgress {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+/* 事项列表：新进入条目上滑淡入，新增事项短暂高亮 */
+.ck-list-enter-active {
+  animation: ckRowIn 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.ck-list-leave-active {
+  display: none;
+}
+.ck-list-move {
+  transition: transform 0.36s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes ckRowIn {
+  from { opacity: 0; transform: translate3d(0, -6px, 0); }
+  to { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+.ck-live-item.is-fresh {
+  animation: ckRowFlash 2s ease-out;
+}
+@keyframes ckRowFlash {
+  0%, 30% { background: color-mix(in srgb, var(--primary) 14%, transparent); }
+  100% { background: transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ck-swap-enter-active,
+  .ck-swap-leave-active,
+  .ck-list-move,
+  .ck-cat-track > i,
+  .ck-share-bar > i,
+  .ck-sla-track > i {
+    transition: none !important;
+  }
+  .ck-swap-enter-active .ck-cat-track > i,
+  .ck-list-enter-active,
+  .ck-live-item.is-fresh,
+  .ck-tour-progress {
+    animation: none !important;
+  }
+}
+
+
+/* ==========================================================================
+   电影级丝绸三幕二级分层入场动效（纯 GPU 合成层 transform/opacity，杜绝与 backdrop-filter 叠加模糊掉帧）
+   ========================================================================== */
+.ck-shell.is-pre-enter .ck-brand-center,
+.ck-shell.is-pre-enter .ck-head-left,
+.ck-shell.is-pre-enter .ck-tools,
+.ck-shell.is-pre-enter .ck-rail-left,
+.ck-shell.is-pre-enter .ck-rail-right,
+.ck-shell.is-pre-enter .ck-rail .ck-block,
+.ck-shell.is-pre-enter .ck-collect-bar,
+.ck-shell.is-pre-enter .c14-grid .ck-comm-mini,
+.ck-shell.is-pre-enter .ck-map-fab,
+.ck-shell.is-pre-enter .ck-map-toprow,
+.ck-shell.is-pre-enter .ck-chapter-brief,
+.ck-shell.is-pre-enter .ck-kpi-card {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ck-shell.is-pre-enter .ck-share-bar > i,
+.ck-shell.is-pre-enter .ck-cat-track > i,
+.ck-shell.is-pre-enter .ck-sla-track > i {
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+@keyframes ckSilkCrest {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -12px, 0) scale(0.968);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes ckSilkFromCenterLeft {
+  0% {
+    opacity: 0;
+    transform: translate3d(14px, -4px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckSilkFromCenterRight {
+  0% {
+    opacity: 0;
+    transform: translate3d(-14px, -4px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckEnterLeft {
+  0% {
+    opacity: 0;
+    transform: translate3d(-18px, 0, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckEnterRight {
+  0% {
+    opacity: 0;
+    transform: translate3d(18px, 0, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckSilkSubBlock {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckEnterRise {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 16px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckSilkPianoKey {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes ckEnterSoftDown {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -10px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes ckEnterKpi {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 12px, 0) scale(0.975);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes ckBarExpand {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+/* 第二幕：顶部冠冕自中央凝现向两翼舒展 */
+.ck-shell.is-revealing .ck-brand-center {
+  will-change: transform, opacity;
+  animation: ckSilkCrest 0.78s cubic-bezier(0.22, 1, 0.36, 1) 0.68s both;
+}
+
+.ck-shell.is-revealing .ck-head-left {
+  will-change: transform, opacity;
+  animation: ckSilkFromCenterLeft 0.68s cubic-bezier(0.22, 1, 0.36, 1) 0.84s both;
+}
+
+.ck-shell.is-revealing .ck-tools {
+  will-change: transform, opacity;
+  animation: ckSilkFromCenterRight 0.68s cubic-bezier(0.22, 1, 0.36, 1) 0.86s both;
+}
+
+/* 第二幕：左右侧轨柔滑落位 + 内部 4 大板块二级错峰轻显 */
+.ck-shell.is-revealing .ck-rail-left {
+  will-change: transform, opacity;
+  animation: ckEnterLeft 0.82s cubic-bezier(0.22, 1, 0.36, 1) 0.86s both;
+}
+
+.ck-shell.is-revealing .ck-rail-right {
+  will-change: transform, opacity;
+  animation: ckEnterRight 0.82s cubic-bezier(0.22, 1, 0.36, 1) 0.98s both;
+}
+
+.ck-shell.is-revealing .ck-rail-left .ck-block:nth-of-type(1) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.04s both;
+}
+.ck-shell.is-revealing .ck-rail-left .ck-block:nth-of-type(2) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.13s both;
+}
+.ck-shell.is-revealing .ck-rail-left .ck-block:nth-of-type(3) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.22s both;
+}
+.ck-shell.is-revealing .ck-rail-left .ck-block:nth-of-type(4) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.31s both;
+}
+
+.ck-shell.is-revealing .ck-rail-right .ck-block:nth-of-type(1) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.14s both;
+}
+.ck-shell.is-revealing .ck-rail-right .ck-block:nth-of-type(2) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.23s both;
+}
+.ck-shell.is-revealing .ck-rail-right .ck-block:nth-of-type(3) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.32s both;
+}
+.ck-shell.is-revealing .ck-rail-right .ck-block:nth-of-type(4) {
+  animation: ckSilkSubBlock 0.58s cubic-bezier(0.22, 1, 0.36, 1) 1.41s both;
+}
+
+/* 第二幕：底部 14 社区浮坞升起 + 14 社区格如琴键自左向右波浪点亮 */
+.ck-shell.is-revealing .ck-collect-bar {
+  will-change: transform, opacity;
+  animation: ckEnterRise 0.76s cubic-bezier(0.22, 1, 0.36, 1) 1.14s both;
+}
+
+.ck-shell.is-revealing .c14-grid .ck-comm-mini {
+  will-change: transform, opacity;
+  animation: ckSilkPianoKey 0.48s cubic-bezier(0.22, 1, 0.36, 1) calc(1.34s + var(--comm-idx, 0) * 0.028s) both;
+}
+
+.ck-shell.is-revealing .ck-map-toprow {
+  will-change: transform, opacity;
+  animation: ckEnterSoftDown 0.68s cubic-bezier(0.22, 1, 0.36, 1) 1.24s both;
+}
+
+.ck-shell.is-revealing .ck-map-fab {
+  will-change: transform, opacity;
+  animation: ckEnterRise 0.68s cubic-bezier(0.22, 1, 0.36, 1) 1.32s both;
+}
+
+.ck-shell.is-revealing .ck-chapter-brief {
+  will-change: transform, opacity;
+  animation: ckEnterSoftDown 0.66s cubic-bezier(0.22, 1, 0.36, 1) 1.38s both;
+}
+
+/* 第三幕：6 张核心 KPI 卡片 110ms 阶梯点亮 + 进度条丝滑舒展 */
+.ck-shell.is-revealing .ck-kpi-card {
+  will-change: transform, opacity;
+  animation: ckEnterKpi 0.64s cubic-bezier(0.22, 1, 0.36, 1) calc(1.38s + var(--kpi-idx, 0) * 0.11s) both;
+}
+
+.ck-shell.is-revealing .ck-share-bar > i,
+.ck-shell.is-revealing .ck-cat-track > i,
+.ck-shell.is-revealing .ck-sla-track > i {
+  transform-origin: left center;
+  animation: ckBarExpand 1.08s cubic-bezier(0.22, 1, 0.36, 1) 1.54s both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ck-shell.is-revealing .ck-brand-center,
+  .ck-shell.is-revealing .ck-head-left,
+  .ck-shell.is-revealing .ck-tools,
+  .ck-shell.is-revealing .ck-rail-left,
+  .ck-shell.is-revealing .ck-rail-right,
+  .ck-shell.is-revealing .ck-rail .ck-block,
+  .ck-shell.is-revealing .ck-collect-bar,
+  .ck-shell.is-revealing .c14-grid .ck-comm-mini,
+  .ck-shell.is-revealing .ck-map-fab,
+  .ck-shell.is-revealing .ck-map-toprow,
+  .ck-shell.is-revealing .ck-chapter-brief,
+  .ck-shell.is-revealing .ck-kpi-card,
+  .ck-shell.is-revealing .ck-share-bar > i,
+  .ck-shell.is-revealing .ck-cat-track > i,
+  .ck-shell.is-revealing .ck-sla-track > i {
+    animation: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+    transform: none !important;
+  }
 }
 </style>

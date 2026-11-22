@@ -5,25 +5,25 @@ const BASE = (import.meta.env?.BASE_URL || './').replace(/\/?$/, '/')
 const p = (file) => `${BASE}photos/${file}`
 
 const BASE_PHOTOS = {
-  fireBefore: p('fire-corridor-before.jpg'),
-  fireAfter: p('fire-corridor-after.jpg'),
-  kitchenBefore: p('kitchen-gas-before.jpg'),
-  kitchenAfter: p('kitchen-gas-after.jpg'),
-  dustBefore: p('construction-dust-before.jpg'),
-  dustAfter: p('construction-dust-after.jpg'),
-  drainBefore: p('drain-grate-before.jpg'),
-  drainAfter: p('drain-grate-after.jpg'),
-  parkingBefore: p('parking-shed-before.jpg'),
-  parkingAfter: p('parking-shed-after.jpg'),
-  sidewalkAfter: p('sidewalk-clutter-after.jpg'),
-  forestBefore: p('forest-fire-before.jpg'),
-  forestAfter: p('forest-fire-after.jpg'),
-  aerial: p('changhe-aerial.jpg'),
-  visit1: p('armed-visit-1.jpg'),
-  visit2: p('armed-visit-2.jpg'),
-  militia1: p('armed-militia-1.jpg'),
-  double1: p('armed-double-1.jpg'),
-  edu1: p('armed-edu-1.jpg')
+  fireBefore: p('fire-corridor-before.webp'),
+  fireAfter: p('fire-corridor-after.webp'),
+  kitchenBefore: p('kitchen-gas-before.webp'),
+  kitchenAfter: p('kitchen-gas-after.webp'),
+  dustBefore: p('construction-dust-before.webp'),
+  dustAfter: p('construction-dust-after.webp'),
+  drainBefore: p('drain-grate-before.webp'),
+  drainAfter: p('drain-grate-after.webp'),
+  parkingBefore: p('parking-shed-before.webp'),
+  parkingAfter: p('parking-shed-after.webp'),
+  sidewalkAfter: p('sidewalk-clutter-after.webp'),
+  forestBefore: p('forest-fire-before.webp'),
+  forestAfter: p('forest-fire-after.webp'),
+  aerial: p('changhe-aerial.webp'),
+  visit1: p('armed-visit-1.webp'),
+  visit2: p('armed-visit-2.webp'),
+  militia1: p('armed-militia-1.webp'),
+  double1: p('armed-double-1.webp'),
+  edu1: p('armed-edu-1.webp')
 }
 
 function pickEventPair(text) {
