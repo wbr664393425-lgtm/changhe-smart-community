@@ -24,21 +24,27 @@ export const COMMUNITY_ESTATES = {
   芦李府社区: ['德州汽配城', '金鼎公馆', '地勘局水文家园', '百佳花园小区']
 }
 
-const COMMUNITY_STAFF_SEEDS = {
-  德馨社区: { name: '李敏', phone: '13853418801', grid: '第一网格', task: '高层楼道隐患排查与独居老人入户核验' },
-  八里庄社区: { name: '王琪', phone: '13853418802', grid: '第一网格', task: '工地裸土扬尘巡检与农贸市场秩序维护' },
-  杨庄社区: { name: '赵磊', phone: '13853418803', grid: '第二网格', task: '住宅小区物业巡查与反诈宣传入户' },
-  堤口社区: { name: '张强', phone: '13853418804', grid: '第二网格', task: '沿街九小燃气复检与岔河低洼点排查' },
-  星凯社区: { name: '刘洋', phone: '13853418805', grid: '商务网格', task: '星凯商务楼宇企业走访与充电棚复查' },
-  尚德社区: { name: '马芳', phone: '13853418806', grid: '第一网格', task: '老旧小区飞线整治与双拥优抚走访' },
-  赵辛社区: { name: '高翔', phone: '13853418807', grid: '第三网格', task: '林缘防火巡防与回迁区消防通道排查' },
-  泰和社区: { name: '张伟', phone: '13853418808', grid: '商圈网格', task: '东风东路沿街商铺燃气与门前三包巡查' },
-  锦绣社区: { name: '郑涛', phone: '13853418809', grid: '第二网格', task: '岔河沿岸巡河及高层住宅消防闭门器排查' },
-  明德社区: { name: '韩雪', phone: '13853418810', grid: '第一网格', task: '校园周边秩序值守与居民诉求回访' },
-  岳庄社区: { name: '曹明', phone: '13853418811', grid: '第二网格', task: '安置小区物业协同与林缘防火点巡查' },
-  郭家庵社区: { name: '郭亮', phone: '13853418812', grid: '第一网格', task: '减河水系巡堤与农居人居环境整治' },
-  华嬉社区: { name: '沈佳', phone: '13853418813', grid: '第二网格', task: '文创园区安全检查与青少年阵地保障' },
-  芦李府社区: { name: '芦飞', phone: '13853418814', grid: '第一网格', task: '林地防火卡口巡护与易涝沟渠清淤检查' }
+// 本地演示主岗档案，地图与巡防名录共用同一人员属性。
+export const COMMUNITY_STAFF_SEEDS = {
+  德馨社区: { name: '李敏', gender: 'female', phone: '13853418801', grid: '第一网格', task: '高层楼道隐患排查与独居老人入户核验' },
+  八里庄社区: { name: '王琪', gender: 'female', phone: '13853418802', grid: '第一网格', task: '工地裸土扬尘巡检与农贸市场秩序维护' },
+  杨庄社区: { name: '赵磊', gender: 'male', phone: '13853418803', grid: '第二网格', task: '住宅小区物业巡查与反诈宣传入户' },
+  堤口社区: { name: '张强', gender: 'male', phone: '13853418804', grid: '第二网格', task: '沿街九小燃气复检与岔河低洼点排查' },
+  星凯社区: { name: '刘洋', gender: 'male', phone: '13853418805', grid: '商务网格', task: '星凯商务楼宇企业走访与充电棚复查' },
+  尚德社区: { name: '马芳', gender: 'female', phone: '13853418806', grid: '第一网格', task: '老旧小区飞线整治与双拥优抚走访' },
+  赵辛社区: { name: '高翔', gender: 'male', phone: '13853418807', grid: '第三网格', task: '林缘防火巡防与回迁区消防通道排查' },
+  泰和社区: { name: '张伟', gender: 'male', phone: '13853418808', grid: '商圈网格', task: '东风东路沿街商铺燃气与门前三包巡查' },
+  锦绣社区: { name: '郑涛', gender: 'male', phone: '13853418809', grid: '第二网格', task: '岔河沿岸巡河及高层住宅消防闭门器排查' },
+  明德社区: { name: '韩雪', gender: 'female', phone: '13853418810', grid: '第一网格', task: '校园周边秩序值守与居民诉求回访' },
+  岳庄社区: { name: '曹明', gender: 'male', phone: '13853418811', grid: '第二网格', task: '安置小区物业协同与林缘防火点巡查' },
+  郭家庵社区: { name: '郭亮', gender: 'male', phone: '13853418812', grid: '第一网格', task: '减河水系巡堤与农居人居环境整治' },
+  华嬉社区: { name: '沈佳', gender: 'female', phone: '13853418813', grid: '第二网格', task: '文创园区安全检查与青少年阵地保障' },
+  芦李府社区: { name: '芦飞', gender: 'male', phone: '13853418814', grid: '第一网格', task: '林地防火卡口巡护与易涝沟渠清淤检查' }
+}
+
+export function getStaffGender(profile) {
+  const value = profile?.gender
+  return value === 'male' || value === 'female' ? value : null
 }
 
 const ECO_RISK_SEEDS = [
@@ -630,6 +636,7 @@ export function buildCockpitEntities(store) {
       id: `staff-${c.id}`,
       entityType: 'staff',
       name: seed.name,
+      gender: getStaffGender(seed),
       shortLabel: `网格员·${seed.name}`,
       community: c.name,
       grid: patrol?.grid || seed.grid,
@@ -891,13 +898,15 @@ export function buildBuildingDetail(bldg, store) {
 
 /**
  * 300 米应急空间联动查询（radiusUnits = 30，对应 300 米）
+ * 可选传入实时网格员快照 liveStaffList，优先基于实时定位计算距离
  */
-export function queryEmergencyRadius(cx, cz, radiusUnits = 30, store) {
+export function queryEmergencyRadius(cx, cz, radiusUnits = 30, store, liveStaffList = null) {
   const index = getCockpitBuildingIndex()
   const entities = buildCockpitEntities(store)
+  const staffPool = Array.isArray(liveStaffList) && liveStaffList.length ? liveStaffList : entities.gridStaff
 
   // 1. 周边网格员（优先 300 米内，同时保证返回最近的 3 名供一键派单）
-  const staffSorted = entities.gridStaff
+  const staffSorted = staffPool
     .map((s) => {
       const d = Math.hypot(s.x - cx, s.z - cz)
       return { ...s, distUnits: d, distMeters: Math.round(d * 10) }

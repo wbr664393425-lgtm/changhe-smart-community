@@ -8,23 +8,25 @@ import { ref, shallowRef, computed, defineAsyncComponent, onMounted, onBeforeUnm
 import { useRouter } from 'vue-router'
 import {
   Sun, Moon, Play, Pause, Maximize2, ArrowRight, Bell, Send, ChevronDown,
-  Users, Flag, Building2, Briefcase, AlertTriangle, CheckCircle2, ChevronRight, X
+  Users, Flag, Building2, Briefcase, AlertTriangle, CheckCircle2, ChevronRight, ChevronLeft, X,
+  Search, PanelLeftClose, PanelLeftOpen, Navigation
 } from 'lucide-vue-next'
 import BrandLogo from '../components/BrandLogo.vue'
 import CockpitLoader from '../components/CockpitLoader.vue'
 import CockpitClock from '../components/CockpitClock.vue'
 import EvidencePhoto from '../components/EvidencePhoto.vue'
+import BuildingProfilePanel from '../components/BuildingProfilePanel.vue'
 import {
   store, PRESETS, COMMUNITIES, EVENT_CATEGORIES, getCurrentRole, getEffectiveCommunity, getVisibleCommunities,
-  applyPreset, showToast, addAuditLog, nowStr
+  applyPreset, runThemeViewTransition, showToast, addAuditLog, nowStr, consumeCockpitLoginHandoff
 } from '../store/appStore'
 import { buildScenePhoto } from '../utils/sampleImages'
 
-// 重型 3D / 2D / 抽屉 / 档案面板按需异步分包，让全屏加载序幕首绘零阻塞
+// 重型 3D / 2D / 抽屉 / 检索弹窗按需异步分包，让全屏加载序幕首绘零阻塞；楼栋档案直连导入避免点击瞬白
 const ChangheCity3D = defineAsyncComponent(() => import('../components/ChangheCity3D.vue'))
 const GeoMap = defineAsyncComponent(() => import('../components/GeoMap.vue'))
 const DrilldownDrawer = defineAsyncComponent(() => import('../components/DrilldownDrawer.vue'))
-const BuildingProfilePanel = defineAsyncComponent(() => import('../components/BuildingProfilePanel.vue'))
+const SpatialSearchModal = defineAsyncComponent(() => import('../components/SpatialSearchModal.vue'))
 
 // 纯算术经纬度投影，避免在 CockpitView 首屏引入含 Three.js 的 cityModelCache
 const _ORIGIN_LAT = 37.4408
@@ -41,10 +43,15 @@ let bldgIdxModPromise = null
 function loadBldgIdxMod() {
   if (bldgIdxMod.value) return Promise.resolve(bldgIdxMod.value)
   if (!bldgIdxModPromise) {
-    bldgIdxModPromise = import('../utils/cockpitBuildingIndex').then((mod) => {
-      bldgIdxMod.value = mod
-      return mod
-    })
+    bldgIdxModPromise = import('../utils/cockpitBuildingIndex')
+      .then((mod) => {
+        bldgIdxMod.value = mod
+        return mod
+      })
+      .catch((err) => {
+        bldgIdxModPromise = null
+        throw err
+      })
   }
   return bldgIdxModPromise
 }
@@ -72,19 +79,42 @@ const hoveredComm = ref('')
 const selectedEvent = ref(null)
 const selectedBuildingIndex = ref(-1)
 const selectedEntity = shallowRef(null)
+const focusedFloor = shallowRef(null)
 const radiusActive = ref(false)
 const aidTick = ref(0)
 const activeCategoryFilter = ref('')
 const rightFootTab = ref('police') // police | armed
 const tourRunning = ref(false)
+const theaterMode = ref(false)
+const searchOpen = ref(false)
+const staffLayerActive = ref(true)
+const staffDirectoryOpen = ref(false)
+const staffSearch = ref('')
+const staffStatusFilter = ref('all')
+const STAFF_FILTERS = [
+  { status: 'all', label: '全员', key: 'total', tone: 'var(--ck-ink)' },
+  { status: '在岗巡查', label: '巡查', key: 'patrol', tone: 'var(--ck-ok)' },
+  { status: '在办处置', label: '处置', key: 'handling', tone: 'var(--ck-run)' },
+  { status: '滞留提醒', label: '滞留', key: 'alert', tone: 'var(--ck-danger)' }
+]
+const liveStaffList = shallowRef([])
+const staffRosterReady = ref(false)
+let staffEngine = null
+const followStaffId = ref('')
+const followAltitude = ref('low') // low | mid
+const activeStaffTelemetry = shallowRef(null)
+const hoveredPopSeg = ref('') // '' | 'youth' | 'elder' | 'teen'
+const hoveredTrendIdx = ref(-1)
 let tourTimer = null
 let isViewUnmounted = false
 
 // ── 大屏全屏资源加载序幕 & 电影级三幕渐进入场编排 ──
 const city3dRef = ref(null)
-const isFirstSessionEntry = !cockpitSessionCurtainShown
+const geoMapRef = ref(null)
+const fromLoginHandoff = consumeCockpitLoginHandoff()
+const isFirstSessionEntry = !cockpitSessionCurtainShown || fromLoginHandoff
 const loaderVisible = ref(isFirstSessionEntry)
-const loaderTargetProgress = ref(isFirstSessionEntry ? 4 : 100)
+const loaderTargetProgress = ref(isFirstSessionEntry ? (fromLoginHandoff ? 2 : 4) : 100)
 const loaderSceneReady = ref(false)
 const loaderFallbackNotice = ref('')
 const entrancePhase = ref('pre') // pre | revealing | ready
@@ -102,7 +132,7 @@ let prefersReducedMotion = false
 const MIN_CURTAIN_MS = 3000
 const CURTAIN_HOLD_MS = 460
 const LOAD_TIMEOUT_MS = 16000
-const TOUR_MS = 6000
+const TOUR_MS = 7800
 
 // 配色方案下拉（顶层挂载实色浮层）
 const presetMenuOpen = ref(false)
@@ -126,7 +156,36 @@ function onDocPointerDown(e) {
   presetMenuOpen.value = false
 }
 function onDocKeydown(e) {
-  if (e.key === 'Escape') presetMenuOpen.value = false
+  if (e.key === 'Escape') {
+    if (searchOpen.value) {
+      searchOpen.value = false
+      return
+    }
+    if (followStaffId.value) {
+      followStaffId.value = ''
+      return
+    }
+    if (staffDirectoryOpen.value) {
+      if (selectedEntity.value?.entityType === 'staff') closeRightPenetration()
+      else closeStaffDirectory()
+      return
+    }
+    if (presetMenuOpen.value || mobileCommOpen.value) {
+      presetMenuOpen.value = false
+      mobileCommOpen.value = false
+      return
+    }
+    if (theaterMode.value) {
+      theaterMode.value = false
+    }
+    return
+  }
+  const tag = e.target?.tagName
+  const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable
+  if (((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') || (!isTyping && e.key === '/')) {
+    e.preventDefault()
+    searchOpen.value = true
+  }
 }
 
 function clearEntranceTimers() {
@@ -298,7 +357,7 @@ function handleCityWebglFallback() {
 
 // 数值补间：入场阶段由 countUpFactor 统一跳数；入场完成后数据变化（锁定社区、复位、派单）从旧值平滑滚到新值
 const tweenRafs = new Set()
-function useTween(getter, duration = 560) {
+function useTween(getter, duration = 320) {
   const out = ref(Number(getter()) || 0)
   let raf = null
   watch(getter, (next) => {
@@ -309,12 +368,17 @@ function useTween(getter, duration = 560) {
       return
     }
     const from = out.value
+    if (Math.abs(to - from) < 0.01) {
+      out.value = to
+      return
+    }
     const t0 = performance.now()
     const step = (now) => {
       tweenRafs.delete(raf)
       const p = Math.min(1, (now - t0) / duration)
-      out.value = from + (to - from) * (1 - Math.pow(1 - p, 3))
-      if (p < 1 && !isViewUnmounted) {
+      const cur = from + (to - from) * (1 - Math.pow(1 - p, 3))
+      if (p < 1 && Math.abs(to - cur) >= 0.35 && !isViewUnmounted) {
+        out.value = cur
         raf = requestAnimationFrame(step)
         tweenRafs.add(raf)
       } else {
@@ -352,6 +416,7 @@ const CHAPTERS = [
 
 const PENDING_STAGES = ['待受理', '待补充', '待派单']
 const isOverdue = (ev) => ev.stage !== '已办结' && Number(ev.elapsedHours) > Number(ev.deadlineHours)
+const fmtHours = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(1) : '0.0')
 
 // 社区治理分级（与三维沙盘图例同一口径）：标杆 / 平稳 / 关注 / 督办
 const LEVEL_LABEL = { lead: '标杆', ok: '平稳', warn: '关注', bad: '督办' }
@@ -518,19 +583,60 @@ const stats = computed(() => {
     eco: Math.max(0, ...ecoTop.map((c) => c.env.floodPts + c.env.firePts))
   }
 
-  // 数据直达宽表采集任务实时进度（读取真实 doneCount / totalTarget 字段）
+  // 数据直达宽表采集任务实时进度（全街道显示汇总，单社区下钻按分派社区精确拆分本社区配额）
+  const splitShare = (val, count, idx) => {
+    if (count <= 1) return val
+    const base = Math.floor(val / count)
+    const rem = val - base * count
+    return base + (idx < rem ? 1 : 0)
+  }
   const directTasks = store.dataDirect.tasks
     .filter((t) => !t.expiredLocked && (scope.value === '全街道' || (t.assignees || []).includes(scope.value)))
     .slice(0, 3)
     .map((t) => {
-      const done = Number(t.doneCount || 0)
-      const total = Number(t.totalTarget || 1)
+      const rawDone = Number(t.doneCount || 0)
+      const rawTotal = Number(t.totalTarget || 1)
+      const assignees = Array.isArray(t.assignees) && t.assignees.length ? t.assignees : []
+      let done = rawDone
+      let total = rawTotal
+      if (scope.value !== '全街道' && assignees.length > 0) {
+        const idx = Math.max(0, assignees.indexOf(scope.value))
+        total = Math.max(1, splitShare(rawTotal, assignees.length, idx))
+        done = Math.min(total, splitShare(rawDone, assignees.length, idx))
+      }
       const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0
       return { id: t.id, title: t.name || t.title || '宽表采集任务', done, total, pct }
     })
 
   // 警网联勤通报
   const policeList = store.policeAlerts.filter((p) => scope.value === '全街道' || p.community === scope.value)
+
+  // 近 7 日受理与办结微趋势（锚定全量事件最新日期，随社区锁定实时联动）
+  const allDates = (store.events || [])
+    .map((e) => String(e.createdAt || '').slice(0, 10))
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort()
+  const anchorStr = allDates[allDates.length - 1] || '2026-11-20'
+  const anchorDate = new Date(`${anchorStr}T00:00:00`)
+  const trend7d = []
+  for (let offset = 6; offset >= 0; offset--) {
+    const d = new Date(anchorDate)
+    d.setDate(d.getDate() - offset)
+    const yyyy = d.getFullYear()
+    const mm = String(d.getMonth() + 1).padStart(2, '0')
+    const dd = String(d.getDate()).padStart(2, '0')
+    const iso = `${yyyy}-${mm}-${dd}`
+    let intake = 0
+    let closed = 0
+    for (let j = 0; j < events.length; j++) {
+      const ev = events[j]
+      if (String(ev.createdAt || '').slice(0, 10) === iso) intake += 1
+      const lastHist = ev.history?.[ev.history.length - 1]
+      const closeDay = ev.stage === '已办结' ? String(lastHist?.time || ev.createdAt || '').slice(0, 10) : ''
+      if (closeDay === iso) closed += 1
+    }
+    trend7d.push({ iso, label: `${mm}-${dd}`, intake, closed })
+  }
 
   return {
     pop, hukou, hukouPct, party, branches, grids, gridStaff, publicPost,
@@ -553,8 +659,52 @@ const stats = computed(() => {
     categoryStats, partyTop, riskTop, revenueTop, ecoTop, rankMax, directTasks,
     commCount: list.length,
     policeList,
+    trend7d,
     avgPerGrid: grids ? Math.round(pop / grids) : 0
   }
+})
+
+const popRingCenter = computed(() => {
+  if (hoveredPopSeg.value === 'youth') return { pct: shownNum(tw.youth), label: '中青年', color: 'var(--chart-1)' }
+  if (hoveredPopSeg.value === 'elder') return { pct: shownNum(tw.elder), label: '老年人', color: 'var(--chart-2)' }
+  if (hoveredPopSeg.value === 'teen') return { pct: shownNum(tw.teen), label: '在校生', color: 'var(--chart-3)' }
+  return { pct: shownNum(tw.youth), label: '中青年', color: '' }
+})
+
+const trendChart = computed(() => {
+  const days = stats.value.trend7d || []
+  const maxVal = Math.max(2, ...days.flatMap((d) => [d.intake, d.closed]))
+  const W = 252
+  const H = 40
+  const padX = 8
+  const padTop = 5
+  const padBot = 5
+  const spanX = W - padX * 2
+  const spanY = H - padTop - padBot
+  const pts = days.map((d, i) => {
+    const x = days.length > 1 ? padX + (i / (days.length - 1)) * spanX : W / 2
+    const yIn = padTop + spanY * (1 - d.intake / maxVal)
+    const yCl = padTop + spanY * (1 - d.closed / maxVal)
+    return { ...d, x: Math.round(x * 10) / 10, yIn: Math.round(yIn * 10) / 10, yCl: Math.round(yCl * 10) / 10 }
+  })
+  const smoothPath = (arr, key) => {
+    if (!arr.length) return ''
+    if (arr.length === 1) return `M ${arr[0].x},${arr[0][key]}`
+    let d = `M ${arr[0].x},${arr[0][key]}`
+    for (let i = 0; i < arr.length - 1; i++) {
+      const p0 = arr[i]
+      const p1 = arr[i + 1]
+      const cx = ((p0.x + p1.x) / 2).toFixed(1)
+      d += ` C ${cx},${p0[key]} ${cx},${p1[key]} ${p1.x},${p1[key]}`
+    }
+    return d
+  }
+  const intakePath = smoothPath(pts, 'yIn')
+  const closedPath = smoothPath(pts, 'yCl')
+  const areaBase = H - padBot
+  const intakeArea = pts.length ? `${intakePath} L ${pts[pts.length - 1].x},${areaBase} L ${pts[0].x},${areaBase} Z` : ''
+  const closedArea = pts.length ? `${closedPath} L ${pts[pts.length - 1].x},${areaBase} L ${pts[0].x},${areaBase} Z` : ''
+  return { pts, intakePath, closedPath, intakeArea, closedArea, width: W, height: H }
 })
 
 // 优先展示未办结事项，其次展示近期已闭环事项；支持四类构成条点选过滤
@@ -593,6 +743,7 @@ const tw = {
   employeesWan: useTween(() => Number(stats.value.employeesWan))
 }
 const RING_C = 219.9
+const GAUGE_ARC = 109.96
 // 环图三段弧长随补间与入场扫描同步
 const ringArcs = computed(() => {
   const f = chartSweepFactor.value
@@ -600,6 +751,10 @@ const ringArcs = computed(() => {
   const e = (tw.elder.value / 100) * RING_C * f
   const t = (tw.teen.value / 100) * RING_C * f
   return { y, e, t }
+})
+const rateGaugeDash = computed(() => {
+  const pct = Math.max(0, Math.min(100, tw.rate.value)) / 100
+  return pct * GAUGE_ARC * chartSweepFactor.value
 })
 
 // ── 当前章专题排行：全街道口径排序，锁定社区时高亮并保证其可见 ──
@@ -643,7 +798,8 @@ const rankBoard = computed(() => {
       isScope: c.name === scope.value
     }
   })
-  return { note: def.note, rows, total: sorted.length }
+  const note = scope.value !== '全街道' ? `全街道 · ${def.note}` : def.note
+  return { note, rows, total: sorted.length }
 })
 
 // ── 列表按剩余高度整条适配：只显示能完整放下的条目，杜绝半截行 ──
@@ -652,6 +808,7 @@ function useFitCount(elRef, deps) {
   const count = ref(99)
   let ro = null
   const measure = () => {
+    if (loaderVisible.value) return
     if (typeof window !== 'undefined' && window.innerWidth <= 1100) {
       count.value = 99
       return
@@ -668,6 +825,7 @@ function useFitCount(elRef, deps) {
   }
   onMounted(() => {
     ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null
+    if (typeof window !== 'undefined') window.addEventListener('resize', measure)
     watch(
       () => unwrapEl(elRef.value),
       (el, old) => {
@@ -677,9 +835,15 @@ function useFitCount(elRef, deps) {
       },
       { immediate: true }
     )
+    watch(loaderVisible, (vis) => {
+      if (!vis) requestAnimationFrame(measure)
+    })
   })
   watch(deps, () => nextTick(measure))
-  onBeforeUnmount(() => ro?.disconnect())
+  onBeforeUnmount(() => {
+    ro?.disconnect()
+    if (typeof window !== 'undefined') window.removeEventListener('resize', measure)
+  })
   return count
 }
 const rankListEl = ref(null)
@@ -736,6 +900,241 @@ const mapHoverComm = ref('')
 
 const currentChapterObj = computed(() => CHAPTERS[activeChapter.value])
 
+// 调度态：全街道实时在岗网格员名录与状态统计（随锁定社区联动）
+const scopedLiveStaff = computed(() => {
+  const rank = { 滞留提醒: 0, 在办处置: 1, 在岗巡查: 2 }
+  return liveStaffList.value
+    .filter((s) => scope.value === '全街道' || s.community === scope.value)
+    .slice()
+    .sort((a, b) => {
+      const dr = (rank[a.status] ?? 9) - (rank[b.status] ?? 9)
+      if (dr !== 0) return dr
+      if (a.status === '滞留提醒' && a.stayMinutes !== b.stayMinutes) {
+        return (b.stayMinutes || 0) - (a.stayMinutes || 0)
+      }
+      return (b.isPrimary ? 1 : 0) - (a.isPrimary ? 1 : 0) || a.idx - b.idx
+    })
+})
+
+const staffCounts = computed(() => {
+  const list = scopedLiveStaff.value
+  let patrol = 0
+  let handling = 0
+  let alert = 0
+  for (let i = 0; i < list.length; i++) {
+    const st = list[i].status
+    if (st === '滞留提醒') alert++
+    else if (st === '在办处置') handling++
+    else if (st === '在岗巡查') patrol++
+  }
+  return { total: list.length, patrol, handling, alert }
+})
+
+const statusLiveStaff = computed(() => staffStatusFilter.value === 'all'
+  ? scopedLiveStaff.value
+  : scopedLiveStaff.value.filter((st) => st.status === staffStatusFilter.value)
+)
+const filteredLiveStaff = computed(() => {
+  const term = staffSearch.value.trim().toLowerCase()
+  if (!term) return statusLiveStaff.value
+  return statusLiveStaff.value.filter((st) =>
+    [st.name, st.community, st.grid].some((v) => String(v || '').toLowerCase().includes(term))
+  )
+})
+const showStaffDirectory = computed(() =>
+  staffDirectoryOpen.value && !selectedEntity.value && selectedBuildingIndex.value < 0 && !selectedEvent.value
+)
+
+const followStaffObj = computed(() => {
+  if (!followStaffId.value) return null
+  if (activeStaffTelemetry.value?.id === followStaffId.value) return activeStaffTelemetry.value
+  return liveStaffList.value.find((s) => s.id === followStaffId.value) || selectedEntity.value || null
+})
+
+function onStaffRosterReady(list) {
+  liveStaffList.value = Array.isArray(list) ? list : []
+  staffRosterReady.value = true
+  if (selectedEntity.value?.entityType === 'staff') {
+    const fresh = liveStaffList.value.find((s) => s.id === selectedEntity.value.id)
+    if (fresh) {
+      selectedEntity.value = fresh
+      activeStaffTelemetry.value = fresh
+    }
+  }
+}
+
+// 三维渲染与平面地图轮流推进同一份巡防位置，切图不会重置人员或处置状态。
+let staffEnginePromise = null
+function getStaffEngine(buildingIndex, createEngine) {
+  if (!staffEngine) staffEngine = createEngine(store, buildingIndex)
+  return staffEngine
+}
+async function getStaffEngineAsync(buildingIndex, createEngineAsync, yieldFn) {
+  if (staffEngine) return staffEngine
+  if (!staffEnginePromise) {
+    staffEnginePromise = createEngineAsync(store, buildingIndex, yieldFn)
+      .then((eng) => {
+        staffEngine = eng
+        return eng
+      })
+      .catch((err) => {
+        staffEnginePromise = null
+        throw err
+      })
+  }
+  return staffEnginePromise
+}
+
+function updateStaffStatus(id, status, extra) {
+  const fromScene = city3dRef.value?.updateLiveStaffStatus?.(id, status, extra)
+  if (fromScene) return fromScene
+  const updated = staffEngine?.setStatus(id, status, extra)
+  if (updated) onStaffRosterReady(staffEngine.getAll())
+  return updated
+}
+
+const flatStaffMode = computed(() => {
+  if (mapBase.value === 'city3d') return ''
+  if (!staffLayerActive.value && !staffDirectoryOpen.value && selectedEntity.value?.entityType !== 'staff') return ''
+  return mapBase.value === 'preview' ? 'preview' : 'map'
+})
+
+watch(flatStaffMode, async (mode, _previous, onCleanup) => {
+  if (!mode) return
+  let cancelled = false
+  let timer
+  onCleanup(() => {
+    cancelled = true
+    clearInterval(timer)
+  })
+  if (!staffEngine) {
+    try {
+      const [indexModule, staffModule] = await Promise.all([loadBldgIdxMod(), import('../utils/cockpitStaffLive')])
+      if (cancelled) return
+      const index = await indexModule.getCockpitBuildingIndexAsync(() => new Promise(resolve => setTimeout(resolve, 0)))
+      if (cancelled) return
+      getStaffEngine(index, staffModule.createStaffLiveEngine)
+    } catch {
+      if (!cancelled) showToast('网格员定位数据暂时无法加载')
+      return
+    }
+  }
+  onStaffRosterReady(staffEngine.getAll())
+  if (mode === 'preview') return
+  let lastTick = performance.now()
+  timer = setInterval(() => {
+    const now = performance.now()
+    const elapsed = (now - lastTick) / 1000
+    lastTick = now
+    if (document.hidden) return
+    staffEngine.step(elapsed, 1)
+    onStaffRosterReady(staffEngine.getAll())
+  }, 1000)
+})
+
+function onStaffLiveTick(snap) {
+  if (!snap) return
+  activeStaffTelemetry.value = snap
+  if (selectedEntity.value?.id === snap.id) {
+    selectedEntity.value = { ...selectedEntity.value, ...snap }
+  }
+}
+
+function openStaffDirectory(status = 'all') {
+  stopTour()
+  if (mapBase.value === 'preview') mapBase.value = 'gov'
+  staffLayerActive.value = true
+  if (staffStatusFilter.value !== status) staffSearch.value = ''
+  staffStatusFilter.value = status
+  closeRightPenetration()
+  selectedEvent.value = null
+  staffDirectoryOpen.value = true
+  narrowPanel.value = 'events'
+}
+
+function closeStaffDirectory() {
+  staffDirectoryOpen.value = false
+  staffSearch.value = ''
+  narrowPanel.value = 'map'
+}
+
+function resetStaffContext() {
+  if (staffDirectoryOpen.value || selectedEntity.value?.entityType === 'staff') narrowPanel.value = 'map'
+  staffDirectoryOpen.value = false
+  staffStatusFilter.value = 'all'
+  staffSearch.value = ''
+  if (selectedEntity.value?.entityType === 'staff') closeRightPenetration()
+  stopFollowStaff()
+}
+
+watch(scope, resetStaffContext)
+watch(staffLayerActive, (active) => { if (!active) resetStaffContext() })
+
+function viewStaffClose(st) {
+  if (!st || st.entityType !== 'staff') return
+  stopTour()
+  stopFollowStaff()
+  narrowPanel.value = 'map'
+  if (mapBase.value === 'preview') mapBase.value = 'gov'
+  nextTick(() => {
+    if (mapBase.value === 'city3d') city3dRef.value?.focusOnStaff(st.id)
+    else geoMapRef.value?.focusOnStaff(staffEngine?.getById(st.id) || st)
+  })
+}
+
+function toggleFollowStaff(ent) {
+  if (!ent || ent.entityType !== 'staff') return
+  if (!city3dMounted.value) return
+  if (followStaffId.value === ent.id) {
+    followStaffId.value = ''
+    showToast(`已退出对「${ent.name}」的低空跟拍`)
+    return
+  }
+  if (mapBase.value !== 'city3d') mapBase.value = 'city3d'
+  narrowPanel.value = 'map'
+  staffLayerActive.value = true
+  radiusActive.value = false
+  followStaffId.value = ent.id
+  activeStaffTelemetry.value = ent
+  addAuditLog(`驾驶舱开启对网格员「${ent.name}」的低空实时跟拍`, '实时跟拍')
+}
+
+function stepFollowStaff(dir = 1) {
+  const pool = statusLiveStaff.value.length ? statusLiveStaff.value : scopedLiveStaff.value
+  if (!pool.length) return
+  const curIdx = pool.findIndex((s) => s.id === followStaffId.value)
+  const nextIdx = curIdx < 0 ? 0 : (curIdx + dir + pool.length) % pool.length
+  const nextSt = pool[nextIdx]
+  if (nextSt.id !== followStaffId.value) {
+    handleSelectEntity(nextSt)
+    toggleFollowStaff(nextSt)
+  }
+}
+
+function stopFollowStaff() {
+  if (!followStaffId.value) return
+  followStaffId.value = ''
+}
+
+function handleSuperviseStaff(staff) {
+  if (!staff) return
+  const updated = updateStaffStatus(staff.id, '在岗巡查', {
+    task: '已接收街道督办提醒，恢复网格正常巡防'
+  })
+  const rec = (store.patrolRecords || []).find((p) => p.staff === staff.name && p.community === staff.community)
+  if (rec) {
+    rec.superviseStatus = '已督办'
+    rec.superviseNote = '驾驶舱实时定位下发提醒督办'
+    rec.stayMinutes = 0
+  }
+  if (updated) {
+    activeStaffTelemetry.value = updated
+    if (selectedEntity.value?.id === updated.id) selectedEntity.value = updated
+  }
+  addAuditLog(`驾驶舱对滞留网格员「${staff.name}（${staff.community}）」发送提醒督办`, '巡防督办')
+  showToast(`已向「${staff.name}」发送滞留提醒督办，对方已恢复巡查`)
+}
+
 // 调度态待办：超时优先，其次按时限消耗比例倒序
 const dispatchEvents = computed(() => {
   const ratio = (e) => Number(e.elapsedHours || 0) / Math.max(0.1, Number(e.deadlineHours || 1))
@@ -779,8 +1178,8 @@ const kpiCards = computed(() => {
       sub: `户籍占比 ${s.hukouPct}%`,
       tone: 'var(--chart-2)',
       valColor: 'var(--chart-2)',
-      tip: '点击下钻重点关怀与人口结构明细',
-      action: () => openDrill('special')
+      tip: '点击下钻分网格常住与流动人口明细',
+      action: () => openDrill('pop')
     },
     {
       key: 'party',
@@ -866,12 +1265,23 @@ function stopTour() {
   tourRunning.value = false
 }
 
+function switchToReport() {
+  resetStaffContext()
+  viewMode.value = 'report'
+  followStaffId.value = ''
+  activeSlice.value = CHAPTERS[activeChapter.value]?.slice || 'party'
+}
+
 function switchToDispatch() {
   stopTour()
+  resetStaffContext()
   viewMode.value = 'dispatch'
+  activeSlice.value = 'safety'
+  staffLayerActive.value = true
 }
 
 function selectChapter(idx) {
+  resetStaffContext()
   activeChapter.value = idx
   activeSlice.value = CHAPTERS[idx].slice
   selectedEvent.value = null
@@ -895,16 +1305,86 @@ function toggleTour() {
   }, TOUR_MS)
 }
 
-function toggleCockpitLightDark() {
-  if (isDark.value) {
-    if (store.preset === 'command-dark') {
-      applyPreset('vermilion-seal')
+function toggleCockpitLightDark(ev) {
+  const commit = () => {
+    if (isDark.value) {
+      if (store.preset === 'command-dark') {
+        applyPreset('vermilion-seal')
+      }
+      store.cockpitTheme = 'light'
+    } else {
+      store.cockpitTheme = 'dark'
     }
-    store.cockpitTheme = 'light'
-  } else {
-    store.cockpitTheme = 'dark'
+    syncBodyClass()
+  }
+  runThemeViewTransition(commit, ev)
+}
+
+function toggleTheaterMode() {
+  theaterMode.value = !theaterMode.value
+}
+
+function handleSpatialSelect(item) {
+  if (!item) return
+  stopTour()
+  const isStaffTarget = item.kind === 'staff' && item.payload?.entityType === 'staff'
+  if (isStaffTarget && mapBase.value === 'preview') {
+    mapBase.value = 'gov'
+  } else if (!isStaffTarget && mapBase.value !== 'city3d') {
+    mapBase.value = 'city3d'
+  }
+  if (item.kind === 'community') {
+    store.selectedCommunity = item.payload
+    selectedEvent.value = null
+    selectedBuildingIndex.value = -1
+    selectedEntity.value = null
+    focusedFloor.value = null
+    radiusActive.value = false
+    addAuditLog(`空间检索直达「${item.payload}」`, '空间检索')
+  } else if (item.kind === 'building') {
+    handleSelectBuilding(item.payload)
+  } else if (item.kind === 'staff') {
+    const liveMatch = staffEngine?.getById(item.payload?.id) || item.payload
+    handleSelectEntity(liveMatch)
+    if (!isStaffTarget && liveMatch?.x != null && liveMatch?.z != null) {
+      nextTick(() => city3dRef.value?.focusOnPointXZ(liveMatch.x, liveMatch.z, 96, 102))
+    }
+  } else if (item.kind === 'event') {
+    handleSelectEvent(item.payload)
+    nextTick(() => {
+      const ev = item.payload
+      if (ev?.lat && ev?.lng) {
+        const [ex, ez] = latLngToWorldXZ(ev.lat, ev.lng)
+        city3dRef.value?.focusOnPointXZ(ex, ez, 96, 102)
+      }
+    })
+  } else if (item.kind === 'camera') {
+    handleResetPanorama()
+    nextTick(() => {
+      city3dRef.value?.applyCameraPreset(item.payload)
+    })
   }
 }
+
+let glazeRaf = null
+function onKpiPointerMove(e) {
+  if (prefersReducedMotion) return
+  const card = e.currentTarget
+  if (!card) return
+  const cx = e.clientX
+  const cy = e.clientY
+  if (glazeRaf) return
+  glazeRaf = requestAnimationFrame(() => {
+    glazeRaf = null
+    const r = card.getBoundingClientRect()
+    card.style.setProperty('--gx', `${Math.round(cx - r.left)}px`)
+    card.style.setProperty('--gy', `${Math.round(cy - r.top)}px`)
+  })
+}
+
+const hasRightPenetration = computed(() =>
+  Boolean(showStaffDirectory.value || selectedBuildingDetail.value || selectedEntity.value || (viewMode.value === 'dispatch' && selectedEvent.value))
+)
 
 function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
@@ -916,10 +1396,15 @@ function toggleCommunityLock(name) {
     showToast(`当前角色权限仅限查看「${role.value.scope}」`)
     return
   }
-  store.selectedCommunity = store.selectedCommunity === name ? '全街道' : name
+  const nextScope = store.selectedCommunity === name ? '全街道' : name
+  store.selectedCommunity = nextScope
+  if (followStaffObj.value && nextScope !== '全街道' && followStaffObj.value.community !== nextScope) {
+    followStaffId.value = ''
+  }
   selectedEvent.value = null
   selectedBuildingIndex.value = -1
   selectedEntity.value = null
+  focusedFloor.value = null
   radiusActive.value = false
 }
 
@@ -946,17 +1431,21 @@ const emergencyInfo = computed(() => {
   void store.events.length
   void aidTick.value
   const mod = bldgIdxMod.value
-  if (!mod || !radiusActive.value) return null
+  // 网格员侧栏始终可以查阅周边资源，地图覆盖范围由侧栏按钮独立控制。
+  if (!mod || (!radiusActive.value && selectedEntity.value?.entityType !== 'staff')) return null
+  const snapList = mapBase.value === 'city3d' && staffEngine ? staffEngine.getAll() : liveStaffList.value
   if (selectedBuildingDetail.value) {
     const b = selectedBuildingDetail.value.bldg
-    return mod.queryEmergencyRadius(b.cx, b.cz, 30, store)
+    return mod.queryEmergencyRadius(b.cx, b.cz, 30, store, snapList)
   }
   if (selectedEntity.value) {
-    return mod.queryEmergencyRadius(selectedEntity.value.x, selectedEntity.value.z, 30, store)
+    const ex = activeStaffTelemetry.value?.id === selectedEntity.value.id ? activeStaffTelemetry.value.x : selectedEntity.value.x
+    const ez = activeStaffTelemetry.value?.id === selectedEntity.value.id ? activeStaffTelemetry.value.z : selectedEntity.value.z
+    return mod.queryEmergencyRadius(ex, ez, 30, store, snapList)
   }
   if (selectedEvent.value) {
     const [ex, ez] = latLngToWorldXZ(selectedEvent.value.lat, selectedEvent.value.lng)
-    return mod.queryEmergencyRadius(ex, ez, 30, store)
+    return mod.queryEmergencyRadius(ex, ez, 30, store, snapList)
   }
   return null
 })
@@ -967,8 +1456,14 @@ async function handleSelectBuilding(bldg) {
     showToast(`当前角色权限仅限查看「${role.value.scope}」楼栋`)
     return
   }
-  await loadBldgIdxMod()
+  try {
+    await loadBldgIdxMod()
+  } catch {
+    showToast('楼栋空间索引加载异常，请刷新页面后重试')
+    return
+  }
   stopTour()
+  resetStaffContext()
   narrowPanel.value = 'events'
   selectedBuildingIndex.value = bldg.index
   selectedEntity.value = null
@@ -993,37 +1488,59 @@ function handleSelectEntity(ent) {
     return
   }
   stopTour()
+  if (ent.entityType !== 'staff') resetStaffContext()
   narrowPanel.value = 'events'
-  selectedEntity.value = ent
+  const resolved = ent.entityType === 'staff'
+    ? (staffEngine?.getById(ent.id) || ent)
+    : ent
+  selectedEntity.value = resolved
   selectedBuildingIndex.value = -1
   selectedEvent.value = null
-  radiusActive.value = ent.entityType === 'eco' || ent.entityType === 'staff'
+  focusedFloor.value = null
+  radiusActive.value = resolved.entityType === 'eco'
+  if (resolved.entityType === 'staff') {
+    staffLayerActive.value = true
+    activeStaffTelemetry.value = resolved
+    if (followStaffId.value !== resolved.id) stopFollowStaff()
+  } else {
+    followStaffId.value = ''
+    activeStaffTelemetry.value = null
+  }
 }
 
 function handleSelectEvent(ev) {
   if (!ev) return
   stopTour()
+  resetStaffContext()
   narrowPanel.value = 'events'
   selectedEvent.value = ev
   selectedBuildingIndex.value = -1
   selectedEntity.value = null
+  focusedFloor.value = null
   viewMode.value = 'dispatch'
   radiusActive.value = true
 }
 
 function handleResetPanorama() {
+  resetStaffContext()
   if (role.value.scope === '全街道') {
     store.selectedCommunity = '全街道'
   }
+  followStaffId.value = ''
+  activeStaffTelemetry.value = null
   selectedBuildingIndex.value = -1
   selectedEntity.value = null
   selectedEvent.value = null
+  focusedFloor.value = null
   radiusActive.value = false
 }
 
 function closeRightPenetration() {
+  followStaffId.value = ''
+  activeStaffTelemetry.value = null
   selectedBuildingIndex.value = -1
   selectedEntity.value = null
+  focusedFloor.value = null
   radiusActive.value = false
 }
 
@@ -1046,6 +1563,8 @@ function handleDispatchStaff({ staff, building }) {
       detail: `基于 300 米空间联动圈就近分派至在岗网格员 ${staff.name}（距 ${staff.distMeters || 120} 米）现场核查处置`,
       time: t
     })
+    const updatedSt = updateStaffStatus(staff.id, '在办处置', { task: targetEv.title })
+    if (updatedSt && selectedEntity.value?.id === updatedSt.id) selectedEntity.value = updatedSt
     addAuditLog(`驾驶舱将「${targetEv.title}」就近派单至网格员 ${staff.name}`, '就近派单')
     showToast(`已派单给最近网格员「${staff.name}」，事件已转入处置中`)
     return
@@ -1092,7 +1611,9 @@ function handleDispatchStaff({ staff, building }) {
     ]
   }
   store.events.unshift(newEv)
-  radiusActive.value = true
+  if (selectedEntity.value?.entityType !== 'staff') radiusActive.value = true
+  const updatedSt = updateStaffStatus(staff.id, '在办处置', { task: newEv.title })
+  if (updatedSt && selectedEntity.value?.id === updatedSt.id) selectedEntity.value = updatedSt
   addAuditLog(`驾驶舱向网格员 ${staff.name} 派发「${newEv.title}」`, '三维派单')
   showToast(`已向网格员「${staff.name}」派发核查单，三维沙盘已同步标红`)
 }
@@ -1139,7 +1660,7 @@ function handleCreateInspection(payload) {
     ]
   }
   store.events.unshift(newEv)
-  radiusActive.value = true
+  if (selectedEntity.value?.entityType !== 'staff') radiusActive.value = true
   addAuditLog(`驾驶舱针对「${payload.address}」发起排查工单`, '三维派单')
   showToast(`排查工单已下发至「${payload.assignee}」，该楼已同步标红`)
 }
@@ -1163,15 +1684,17 @@ function remindEvent(ev) {
   showToast(`督办提醒已送达「${ev.community}」，待社区签收`)
 }
 
-async function openDrill(type) {
+async function openDrill(type, subFilter = '') {
   const mod = await import('../utils/drilldownData')
   if (isViewUnmounted) return
   const list = visibleComms.value
   const sc = scope.value
-  if (type === 'party') {
+  if (type === 'pop') {
+    drill.value = { open: true, ...mod.buildGridPopulationDrill(list, sc, 'pop') }
+  } else if (type === 'party') {
     drill.value = { open: true, ...mod.buildPartyBranchDrill(list, sc) }
   } else if (type === 'special') {
-    drill.value = { open: true, ...mod.buildSpecialGroupDrill(list, sc) }
+    drill.value = { open: true, ...mod.buildSpecialGroupDrill(list, sc, subFilter) }
   } else if (type === 'housing') {
     drill.value = { open: true, ...mod.buildHousingDrill(list, sc, 'all') }
   } else if (type === 'economy') {
@@ -1186,6 +1709,9 @@ watch(isDark, syncBodyClass)
 watch(mapBase, (val) => {
   if (val === 'city3d' && !city3dMounted.value) {
     city3dMounted.value = true
+  }
+  if (val !== 'city3d' && followStaffId.value) {
+    followStaffId.value = ''
   }
 })
 
@@ -1228,6 +1754,10 @@ onBeforeUnmount(() => {
   clearInterval(tourTimer)
   tweenRafs.forEach((id) => cancelAnimationFrame(id))
   tweenRafs.clear()
+  if (glazeRaf !== null) {
+    cancelAnimationFrame(glazeRaf)
+    glazeRaf = null
+  }
   document.removeEventListener('pointerdown', onDocPointerDown, true)
   document.removeEventListener('keydown', onDocKeydown)
   document.body.classList.remove('view-cockpit', 'cockpit-dark')
@@ -1240,7 +1770,10 @@ onBeforeUnmount(() => {
     :class="{
       'is-pre-enter': entrancePhase === 'pre',
       'is-revealing': entrancePhase === 'revealing',
-      'is-dark': isDark
+      'is-dark': isDark,
+      'is-theater': theaterMode,
+      'is-following': Boolean(followStaffId),
+      'has-penetration': hasRightPenetration
     }"
   >
     <!-- 全屏资源预加载等待序幕（长河街道真实疆域脉络测绘 + 实时阶段光轨进度条） -->
@@ -1248,9 +1781,10 @@ onBeforeUnmount(() => {
       :visible="loaderVisible"
       :target-progress="loaderTargetProgress"
       :scene-ready="loaderSceneReady"
-      :min-curtain-ms="MIN_CURTAIN_MS"
-      :hold-ms="CURTAIN_HOLD_MS"
+      :min-curtain-ms="fromLoginHandoff ? 2100 : MIN_CURTAIN_MS"
+      :hold-ms="fromLoginHandoff ? 380 : CURTAIN_HOLD_MS"
       :dark="isDark"
+      :from-login="fromLoginHandoff"
       :fallback-notice="loaderFallbackNotice"
       @reveal-ready="beginReveal"
     />
@@ -1259,8 +1793,41 @@ onBeforeUnmount(() => {
     <header class="ck-header ck-header-center">
       <div class="ck-head-left">
         <div class="ck-nav-tabs" role="navigation" aria-label="驾驶舱模式切换">
-          <button type="button" :class="{ active: viewMode === 'report' }" @click="viewMode = 'report'">汇报叙事态</button>
+          <button type="button" :class="{ active: viewMode === 'report' }" @click="switchToReport">汇报叙事态</button>
           <button type="button" :class="{ active: viewMode === 'dispatch' }" @click="switchToDispatch">日常调度态</button>
+        </div>
+        <div class="ck-head-ops">
+          <button
+            type="button"
+            class="ck-btn ck-btn-op"
+            title="搜索社区、楼栋、网格员或治理事项"
+            @click="searchOpen = true"
+          >
+            <Search :size="14" />
+            <span>空间检索</span>
+          </button>
+          <button
+            type="button"
+            class="ck-btn ck-btn-op ck-btn-theater"
+            :class="{ active: theaterMode }"
+            :title="theaterMode ? '恢复完整数据驾驶舱' : '收拢两侧面板沉浸看城'"
+            @click="toggleTheaterMode"
+          >
+            <component :is="theaterMode ? PanelLeftOpen : PanelLeftClose" :size="14" />
+            <span>{{ theaterMode ? '退出沉浸' : '沉浸剧场' }}</span>
+          </button>
+          <button
+            type="button"
+            class="ck-btn ck-btn-op ck-btn-staff-entry"
+            :class="{ active: showStaffDirectory }"
+            :aria-expanded="showStaffDirectory"
+            title="查看当前辖区在岗网格员名录"
+            @click="showStaffDirectory ? closeStaffDirectory() : openStaffDirectory()"
+          >
+            <Users :size="15" aria-hidden="true" />
+            <span>网格员</span>
+            <em v-if="staffRosterReady" class="ck-op-badge num">{{ staffCounts.total }}</em>
+          </button>
         </div>
       </div>
 
@@ -1358,7 +1925,7 @@ onBeforeUnmount(() => {
           type="button"
           class="ck-btn sq"
           :title="isDark ? '切换浅色大屏' : '切换深色大屏'"
-          @click="toggleCockpitLightDark"
+          @click="toggleCockpitLightDark($event)"
         >
           <component :is="isDark ? Sun : Moon" :size="16" />
         </button>
@@ -1453,6 +2020,8 @@ onBeforeUnmount(() => {
           v-show="mapBase === 'city3d'"
           ref="city3dRef"
           mode="cockpit"
+          :get-staff-engine="getStaffEngine"
+          :get-staff-engine-async="getStaffEngineAsync"
           :dark="isDark"
           :paused="mapBase !== 'city3d'"
           :selected-community="scope"
@@ -1465,10 +2034,17 @@ onBeforeUnmount(() => {
           :selected-building-index="selectedBuildingIndex"
           :selected-entity-id="selectedEntity?.id || ''"
           :selected-event-id="selectedEvent?.id || ''"
-          :emergency-info="emergencyInfo"
+          :emergency-info="radiusActive ? emergencyInfo : null"
+          :focused-floor="focusedFloor"
+          :theater-mode="theaterMode"
+          :tour-running="tourRunning"
           :external-loader="loaderVisible || entrancePhase === 'pre'"
           :defer-reveal="entrancePhase === 'pre'"
           :labels-visible="city3dLabelsVisible"
+          v-model:staff-layer-active="staffLayerActive"
+          :staff-status-focus="staffStatusFilter"
+          :follow-staff-id="followStaffId"
+          :follow-altitude="followAltitude"
           @select-community="toggleCommunityLock"
           @select-event="handleSelectEvent"
           @select-building="handleSelectBuilding"
@@ -1478,6 +2054,9 @@ onBeforeUnmount(() => {
           @scene-ready="handleCitySceneReady"
           @webgl-fallback="handleCityWebglFallback"
           @hover-community="mapHoverComm = $event"
+          @stop-follow="stopFollowStaff"
+          @staff-roster-ready="onStaffRosterReady"
+          @staff-live-tick="onStaffLiveTick"
         />
         <div v-if="mapBase === 'preview'" class="ck-model-preview">
           <img :src="previewRoot + previewPose + (isDark ? '-night.webp' : '-day.webp')" :alt="previewViews[previewPose] + '三维模型静态视图'" />
@@ -1489,6 +2068,7 @@ onBeforeUnmount(() => {
         </div>
         <GeoMap
           v-if="mapBase !== 'city3d' && mapBase !== 'preview'"
+          ref="geoMapRef"
           mode="cockpit"
           :base-mode="mapBase"
           :dark="isDark"
@@ -1497,8 +2077,13 @@ onBeforeUnmount(() => {
           :slice="activeSlice"
           :events="scopedEvents"
           :focus-coord="focusCoord"
+          :live-staff="scopedLiveStaff"
+          :staff-layer-active="staffLayerActive"
+          :staff-status-focus="staffStatusFilter"
+          :selected-staff-id="selectedEntity?.entityType === 'staff' ? selectedEntity.id : ''"
           @select-community="toggleCommunityLock"
           @select-event="handleSelectEvent"
+          @select-staff="handleSelectEntity"
         />
       </div>
 
@@ -1512,6 +2097,7 @@ onBeforeUnmount(() => {
             class="ck-kpi-card"
             :style="{ '--kpi-tone': item.tone, '--kpi-idx': kIdx }"
             :title="item.tip"
+            @pointermove="onKpiPointerMove"
             @click="item.action()"
           >
             <div class="ck-kpi-head">
@@ -1571,11 +2157,45 @@ onBeforeUnmount(() => {
             <span><i class="c14-dot d-bad"></i>督办 {{ stats.healthCounts.bad }}</span>
           </div>
         </div>
+
+        <div
+          v-if="staffLayerActive && mapBase !== 'preview'"
+          class="ck-staff-summary"
+          role="group"
+          aria-label="网格员状态"
+        >
+          <button
+            v-for="item in STAFF_FILTERS" :key="item.status" type="button"
+            class="ck-staff-filter" :class="{ active: staffStatusFilter === item.status }"
+            :style="{ '--staff-tone': item.tone }" :aria-pressed="staffStatusFilter === item.status"
+            :aria-label="(item.status === 'all' ? '全员' : item.status) + '名录'"
+            @click="openStaffDirectory(item.status)"
+          >
+            <i v-if="item.status !== 'all'" aria-hidden="true"></i>
+            <Users v-else :size="13" aria-hidden="true" />
+            {{ item.label }} <b class="num">{{ staffRosterReady ? staffCounts[item.key] : '—' }}</b>
+          </button>
+          <button type="button" class="ck-staff-directory-toggle" :aria-expanded="showStaffDirectory"
+            :title="showStaffDirectory ? '收起网格员名录' : '打开网格员名录'"
+            @click="showStaffDirectory ? closeStaffDirectory() : openStaffDirectory(staffStatusFilter)">
+            名录 <ChevronRight :size="12" aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
-      <!-- 右下角悬浮图层与四态沙盘/底图切换（默认三维立体沙盘，一键切政务图/卫星影像/电子路网） -->
+      <!-- 右下角悬浮图层与四态沙盘/底图切换（三维沙盘时隐藏冗余图层大钮，由左下角图例精准控制） -->
       <div class="ck-map-fab">
-        <button v-if="mapBase !== 'preview'" type="button" class="ck-fab-btn" :class="{ active: activeSlice === 'eco' }" @click="activeSlice = activeSlice === 'eco' ? 'safety' : 'eco'">
+        <button
+          v-if="mapBase !== 'preview' && mapBase !== 'city3d'"
+          type="button"
+          class="ck-fab-btn"
+          :class="{ active: staffLayerActive }"
+          :aria-pressed="staffLayerActive"
+          @click="staffLayerActive = !staffLayerActive"
+        >
+          网格员图层
+        </button>
+        <button v-if="mapBase !== 'preview' && mapBase !== 'city3d'" type="button" class="ck-fab-btn" :class="{ active: activeSlice === 'eco' }" :aria-pressed="activeSlice === 'eco'" @click="activeSlice = activeSlice === 'eco' ? 'safety' : 'eco'">
           防汛防火图层
         </button>
         <div class="ck-base-seg" role="group" aria-label="切换驾驶舱底图">
@@ -1607,41 +2227,67 @@ onBeforeUnmount(() => {
           <!-- 板块 1：人口结构环 + 四类重点关怀底数 -->
           <section class="ck-block ck-tight-block">
             <div class="ck-ring-wrap ck-ring-compact">
-              <div class="ck-ring-box-sm">
+              <div class="ck-ring-box-sm" @mouseleave="hoveredPopSeg = ''">
                 <svg viewBox="0 0 88 88" width="82" height="82" aria-hidden="true">
                   <circle cx="44" cy="44" r="35" fill="none" stroke="rgba(160,160,160,0.16)" stroke-width="8" />
-                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-1)" stroke-width="8" :stroke-dasharray="`${ringArcs.y} ${RING_C}`" transform="rotate(-90 44 44)" />
-                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-2)" stroke-width="8" :stroke-dasharray="`${ringArcs.e} ${RING_C}`" :stroke-dashoffset="-ringArcs.y" transform="rotate(-90 44 44)" />
-                  <circle cx="44" cy="44" r="35" fill="none" stroke="var(--chart-3)" stroke-width="8" :stroke-dasharray="`${ringArcs.t} ${RING_C}`" :stroke-dashoffset="-(ringArcs.y + ringArcs.e)" transform="rotate(-90 44 44)" />
+                  <circle
+                    cx="44" cy="44" r="35" fill="none" stroke="var(--chart-1)"
+                    class="ck-ring-arc"
+                    :class="{ active: hoveredPopSeg === 'youth', dimmed: hoveredPopSeg && hoveredPopSeg !== 'youth' }"
+                    :stroke-width="hoveredPopSeg === 'youth' ? 10.5 : 8"
+                    :stroke-dasharray="`${ringArcs.y} ${RING_C}`"
+                    transform="rotate(-90 44 44)"
+                    @mouseenter="hoveredPopSeg = 'youth'"
+                  />
+                  <circle
+                    cx="44" cy="44" r="35" fill="none" stroke="var(--chart-2)"
+                    class="ck-ring-arc"
+                    :class="{ active: hoveredPopSeg === 'elder', dimmed: hoveredPopSeg && hoveredPopSeg !== 'elder' }"
+                    :stroke-width="hoveredPopSeg === 'elder' ? 10.5 : 8"
+                    :stroke-dasharray="`${ringArcs.e} ${RING_C}`"
+                    :stroke-dashoffset="-ringArcs.y"
+                    transform="rotate(-90 44 44)"
+                    @mouseenter="hoveredPopSeg = 'elder'"
+                  />
+                  <circle
+                    cx="44" cy="44" r="35" fill="none" stroke="var(--chart-3)"
+                    class="ck-ring-arc"
+                    :class="{ active: hoveredPopSeg === 'teen', dimmed: hoveredPopSeg && hoveredPopSeg !== 'teen' }"
+                    :stroke-width="hoveredPopSeg === 'teen' ? 10.5 : 8"
+                    :stroke-dasharray="`${ringArcs.t} ${RING_C}`"
+                    :stroke-dashoffset="-(ringArcs.y + ringArcs.e)"
+                    transform="rotate(-90 44 44)"
+                    @mouseenter="hoveredPopSeg = 'teen'"
+                  />
                 </svg>
                 <div class="ck-ring-center">
-                  <strong class="num" style="font-size: 19px">{{ shownNum(tw.youth) }}<small style="font-size: 10px">%</small></strong>
-                  <span style="font-size: 10px">中青年</span>
+                  <strong class="num" style="font-size: 19px" :style="popRingCenter.color ? { color: popRingCenter.color } : null">{{ popRingCenter.pct }}<small style="font-size: 10px">%</small></strong>
+                  <span style="font-size: 10px">{{ popRingCenter.label }}</span>
                 </div>
               </div>
-              <div class="ck-legend-list" style="gap: 4px; font-size: 11.5px">
-                <div><i style="background: var(--chart-1)"></i><span>中青年</span><strong class="num">{{ shownNum(tw.youth) }}%</strong></div>
-                <div><i style="background: var(--chart-2)"></i><span>老年人</span><strong class="num">{{ shownNum(tw.elder) }}%</strong></div>
-                <div><i style="background: var(--chart-3)"></i><span>在校生</span><strong class="num">{{ shownNum(tw.teen) }}%</strong></div>
+              <div class="ck-legend-list" style="gap: 4px; font-size: 11.5px" @mouseleave="hoveredPopSeg = ''">
+                <div class="ck-pop-lg-row" :class="{ active: hoveredPopSeg === 'youth' }" @mouseenter="hoveredPopSeg = 'youth'"><i style="background: var(--chart-1)"></i><span>中青年</span><strong class="num">{{ shownNum(tw.youth) }}%</strong></div>
+                <div class="ck-pop-lg-row" :class="{ active: hoveredPopSeg === 'elder' }" @mouseenter="hoveredPopSeg = 'elder'"><i style="background: var(--chart-2)"></i><span>老年人</span><strong class="num">{{ shownNum(tw.elder) }}%</strong></div>
+                <div class="ck-pop-lg-row" :class="{ active: hoveredPopSeg === 'teen' }" @mouseenter="hoveredPopSeg = 'teen'"><i style="background: var(--chart-3)"></i><span>在校生</span><strong class="num">{{ shownNum(tw.teen) }}%</strong></div>
                 <div class="ck-legend-foot"><span style="white-space: nowrap">户籍 {{ stats.hukouPct }}%</span><span style="white-space: nowrap">格均 {{ stats.avgPerGrid.toLocaleString() }} 人</span></div>
               </div>
             </div>
 
             <div class="ck-quad-strip">
-              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--ck-warn)" @click="openDrill('special')">
+              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--ck-warn)" title="点击下钻独居高龄建档明细" @click="openDrill('special', '独居高龄')">
                 <span>独居高龄</span>
                 <strong class="num">{{ shownNum(tw.elderAlone) }}</strong>
               </button>
-              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-2)" @click="openDrill('special')">
+              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-2)" title="点击下钻低保特困建档明细" @click="openDrill('special', '低保特困')">
                 <span>低保特困</span>
                 <strong class="num">{{ shownNum(tw.lowIncome) }}</strong>
               </button>
-              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-5)" @click="openDrill('special')">
+              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-5)" title="点击下钻持证残障帮扶明细" @click="openDrill('special', '持证残障')">
                 <span>残障帮扶</span>
                 <strong class="num">{{ shownNum(tw.disabled) }}</strong>
               </button>
-              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--primary)" @click="openDrill('special')">
-                <span>退役优抚</span>
+              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--primary)" title="点击下钻重点优抚对象明细" @click="openDrill('special', '重点优抚')">
+                <span>重点优抚</span>
                 <strong class="num">{{ shownNum(tw.veteran) }}</strong>
               </button>
             </div>
@@ -1742,7 +2388,7 @@ onBeforeUnmount(() => {
           <section class="ck-block ck-tight-block">
             <button type="button" class="ck-block-head" @click="router.push('/data-direct')">
               <span class="ck-block-label">数据直达 · 一表通减负</span>
-              <span class="ck-accent-pill num">归并减负 78% ›</span>
+              <span class="ck-accent-pill num">{{ scope === '全街道' ? '归并减负 78% ›' : '本社区配额 ›' }}</span>
             </button>
             <div class="ck-direct-list">
               <button
@@ -1750,6 +2396,7 @@ onBeforeUnmount(() => {
                 :key="t.id"
                 type="button"
                 class="ck-direct-item"
+                :title="`${t.title}（${t.done}/${t.total} 条 · ${t.pct}%）`"
                 :style="{ '--task-tone': t.pct >= 100 ? 'var(--ck-ok)' : (tIdx === 0 ? 'var(--chart-2)' : 'var(--primary)') }"
                 @click="router.push('/data-direct')"
               >
@@ -1771,7 +2418,7 @@ onBeforeUnmount(() => {
             </div>
           </section>
         </template>
-        <!-- 日常调度态：左轨变为今日急难愁盼待办流 -->
+        <!-- 日常调度态：左轨展示治理待办，巡防入口打开右轨名录 -->
         <template v-else>
           <div class="ck-rail-title ck-tight-title">
             <span class="ck-title-plaque">
@@ -1785,8 +2432,11 @@ onBeforeUnmount(() => {
                 <line x1="17.8" y1="0.8" x2="8.2" y2="26.2" stroke="var(--ck-plaque-slash)" stroke-width="1.6" stroke-linecap="round" />
               </svg>
             </span>
-            <span class="num ck-title-count">在办 {{ stats.openEvents.length }} 件</span>
+            <button type="button" class="ck-mini-link ck-patrol-link" @click="openStaffDirectory()">
+              <Users :size="13" aria-hidden="true" /> 巡防名录
+            </button>
           </div>
+
           <div class="ck-trio-compact ck-dispatch-trio">
             <div class="ck-mini-stat" style="--cell-tone: var(--ck-danger)"><span>受理派单</span><strong class="num">{{ stats.acceptDispatch }}</strong></div>
             <div class="ck-mini-stat" style="--cell-tone: var(--ck-warn)"><span>办理复核</span><strong class="num">{{ stats.handleReview }}</strong></div>
@@ -1798,13 +2448,14 @@ onBeforeUnmount(() => {
               :key="ev.id"
               type="button"
               class="ck-live-item"
+              :title="`${ev.title}（${ev.community} · 已耗 ${fmtHours(ev.elapsedHours)}/${ev.deadlineHours} 小时）`"
               :class="{ 'is-selected': selectedEvent?.id === ev.id, 'is-fresh': freshIds.has(ev.id) }"
               @click="handleSelectEvent(ev)"
             >
               <span class="ck-live-dot" :style="{ background: stageDotColor(ev) }"></span>
               <div class="ck-live-body">
                 <span class="ck-live-title">{{ ev.title }}</span>
-                <span class="ck-live-sub num">{{ ev.community }} · 已耗 {{ ev.elapsedHours }}/{{ ev.deadlineHours }} 小时</span>
+                <span class="ck-live-sub num">{{ ev.community }} · 已耗 {{ fmtHours(ev.elapsedHours) }}/{{ ev.deadlineHours }} 小时</span>
                 <span class="ck-sla-track" aria-hidden="true">
                   <i :style="{ width: Math.min(100, Math.round((Number(ev.elapsedHours) / Math.max(0.1, Number(ev.deadlineHours))) * 100)) + '%', background: stageDotColor(ev) }"></i>
                 </span>
@@ -1824,6 +2475,7 @@ onBeforeUnmount(() => {
                 :key="e.id"
                 type="button"
                 class="ck-live-item"
+                :title="`${e.title}（${e.community} · 用时 ${fmtHours(e.elapsedHours)} 小时）`"
                 :class="{ 'is-clipped': dIdx >= doneFit }"
                 :tabindex="dIdx >= doneFit ? -1 : 0"
                 @click="handleSelectEvent(e)"
@@ -1831,7 +2483,7 @@ onBeforeUnmount(() => {
                 <span class="ck-live-dot" style="background: var(--ck-ok)"></span>
                 <div class="ck-live-body">
                   <span class="ck-live-title">{{ e.title }}</span>
-                  <span class="ck-live-sub num">{{ e.community }} · {{ e.category }} · 用时 {{ e.elapsedHours }} 小时</span>
+                  <span class="ck-live-sub num">{{ e.community }} · {{ e.category }} · 用时 {{ fmtHours(e.elapsedHours) }} 小时</span>
                 </div>
                 <span class="tag st-ok">已办结</span>
               </button>
@@ -1842,12 +2494,54 @@ onBeforeUnmount(() => {
 
       <!-- 右悬浮轨：楼栋一楼一档 / 实体调度 / 事项穿透 / 默认全闭环统计 -->
       <aside class="ck-rail ck-rail-right ck-dense-rail">
+        <section v-if="showStaffDirectory" class="ck-staff-directory" aria-label="网格员名录">
+          <header class="ck-directory-head">
+            <div>
+              <h2>网格员名录</h2>
+              <p>{{ scope }} · {{ staffStatusFilter === 'all' ? '全部状态' : staffStatusFilter }}<span v-if="staffRosterReady"> · {{ filteredLiveStaff.length }} 人</span></p>
+            </div>
+            <button type="button" class="ck-directory-close" aria-label="关闭网格员名录" @click="closeStaffDirectory">
+              <X :size="15" />
+            </button>
+          </header>
+          <div class="ck-directory-filters" role="group" aria-label="名录状态">
+            <button v-for="item in STAFF_FILTERS" :key="item.status" type="button" class="ck-staff-filter"
+              :class="{ active: staffStatusFilter === item.status }" :style="{ '--staff-tone': item.tone }"
+              :aria-pressed="staffStatusFilter === item.status" @click="openStaffDirectory(item.status)">
+              {{ item.label }} <b class="num">{{ staffRosterReady ? staffCounts[item.key] : '—' }}</b>
+            </button>
+          </div>
+          <label class="ck-directory-search">
+            <Search :size="15" aria-hidden="true" />
+            <input v-model="staffSearch" type="search" placeholder="搜索姓名、社区或网格" aria-label="搜索姓名、社区或网格" />
+          </label>
+          <div class="ck-staff-roster">
+            <button v-for="st in filteredLiveStaff" :key="st.id" type="button" class="ck-staff-row"
+              :class="{ 'is-alert-row': st.status === '滞留提醒', 'is-busy-row': st.status === '在办处置' }"
+              @click="handleSelectEntity(st)">
+              <i class="ck-staff-row-dot" aria-hidden="true"></i>
+              <span class="ck-staff-identity">
+                <b>{{ st.name }}</b>
+                <small>{{ shortName(st.community) }} · {{ st.grid }}</small>
+              </span>
+              <span class="ck-staff-duty">{{ st.status === '滞留提醒' && st.stayMinutes != null ? '滞留 ' + st.stayMinutes + ' 分' : st.status }}</span>
+              <ChevronRight :size="12" aria-hidden="true" />
+            </button>
+            <div v-if="!filteredLiveStaff.length" class="ck-empty">
+              {{ !staffRosterReady ? '正在加载网格员名录' : staffSearch.trim() ? '未找到匹配的网格员' : '当前范围内暂无该状态的网格员' }}
+            </div>
+          </div>
+        </section>
         <BuildingProfilePanel
-          v-if="selectedBuildingDetail || selectedEntity"
+          v-else-if="selectedBuildingDetail || selectedEntity"
           :building-detail="selectedBuildingDetail"
           :entity-detail="selectedEntity"
           :emergency-info="emergencyInfo"
           :radius-active="radiusActive"
+          :can-follow="city3dMounted"
+          :staff-from-directory="staffDirectoryOpen"
+          :is-following="Boolean(followStaffId && selectedEntity?.id === followStaffId)"
+          :live-telemetry="activeStaffTelemetry?.id === selectedEntity?.id ? activeStaffTelemetry : null"
           @close="closeRightPenetration"
           @toggle-radius="radiusActive = !radiusActive"
           @dispatch-staff="handleDispatchStaff"
@@ -1855,6 +2549,10 @@ onBeforeUnmount(() => {
           @borrow-aid="handleBorrowAid"
           @select-building-index="handleSelectBuildingByIndex"
           @select-event="handleSelectEvent"
+          @focus-floor="focusedFloor = $event"
+          @view-staff-close="viewStaffClose"
+          @toggle-follow="toggleFollowStaff"
+          @supervise-staff="handleSuperviseStaff"
         />
 
         <template v-else-if="viewMode === 'dispatch' && selectedEvent">
@@ -1888,7 +2586,7 @@ onBeforeUnmount(() => {
             <div class="ck-ev-facts num">
               <span>{{ selectedEvent.category }}</span>
               <span>责任人 {{ selectedEvent.owner || '待派单' }}</span>
-              <span :class="{ 'is-bad': isOverdue(selectedEvent) }">已耗 {{ selectedEvent.elapsedHours }}/{{ selectedEvent.deadlineHours }} 小时</span>
+              <span :class="{ 'is-bad': isOverdue(selectedEvent) }">已耗 {{ fmtHours(selectedEvent.elapsedHours) }}/{{ selectedEvent.deadlineHours }} 小时</span>
             </div>
             <p class="ck-ev-desc">{{ selectedEvent.description }}</p>
             <EvidencePhoto
@@ -1979,14 +2677,53 @@ onBeforeUnmount(() => {
             <span class="live-dot-badge">实时联动</span>
           </div>
 
-          <!-- 板块 1：按期办结率 + 三态实时槽 -->
+          <!-- 板块 1：按期办结率弧形精工仪表 + 三态实时槽 -->
           <section class="ck-block ck-tight-block">
-            <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 6px; min-width: 0">
-              <div class="ck-big-figure" style="flex-shrink: 0; white-space: nowrap">
-                <strong class="num" style="font-size: 26px; color: var(--ck-ok)">{{ stats.rateExact === '—' ? '—' : shownNum(tw.rate, 1) }}<small v-if="stats.rateExact !== '—'" style="font-size: 13px">%</small></strong>
-                <span style="font-size: 11.5px; white-space: nowrap">办结率</span>
+            <div class="ck-gauge-row">
+              <div class="ck-gauge-box">
+                <svg viewBox="0 0 84 48" width="84" height="48" aria-hidden="true">
+                  <defs>
+                    <linearGradient id="ckRateArcGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stop-color="var(--primary)" />
+                      <stop offset="55%" stop-color="var(--chart-2)" />
+                      <stop offset="100%" stop-color="var(--ck-ok)" />
+                    </linearGradient>
+                  </defs>
+                  <!-- 精细外刻度虚线 -->
+                  <path
+                    d="M 4,41 A 38,38 0 0,1 80,41"
+                    fill="none"
+                    stroke="var(--ck-line)"
+                    stroke-width="1.2"
+                    stroke-dasharray="2 3.5"
+                  />
+                  <!-- 半圆底轨 -->
+                  <path
+                    d="M 7,41 A 35,35 0 0,1 77,41"
+                    fill="none"
+                    stroke="rgba(160, 160, 160, 0.16)"
+                    stroke-width="6"
+                    stroke-linecap="round"
+                  />
+                  <!-- 渐变弧线进度 -->
+                  <path
+                    d="M 7,41 A 35,35 0 0,1 77,41"
+                    fill="none"
+                    stroke="url(#ckRateArcGrad)"
+                    stroke-width="6"
+                    stroke-linecap="round"
+                    :stroke-dasharray="`${rateGaugeDash} ${GAUGE_ARC}`"
+                  />
+                </svg>
+                <div class="ck-gauge-val">
+                  <strong class="num">{{ stats.rateExact === '—' ? '—' : shownNum(tw.rate, 1) }}<small v-if="stats.rateExact !== '—'">%</small></strong>
+                </div>
               </div>
-              <span class="ck-block-note num" style="white-space: nowrap; font-size: 11px">已结 {{ stats.doneCnt }}/{{ stats.events.length }} · 均 {{ stats.avgHours }} 小时</span>
+              <div class="ck-gauge-meta">
+                <span class="ck-gauge-title">按期办结率</span>
+                <span class="ck-block-note num">已结 {{ stats.doneCnt }}/{{ stats.events.length }} 件</span>
+                <span class="ck-block-note num">平均处置 {{ stats.avgHours }} 小时</span>
+              </div>
             </div>
             <div class="ck-stat-trio">
               <button type="button" class="ck-stat-cell ck-stat-sm" style="--cell-tone: var(--ck-danger)" @click="router.push('/grid')">
@@ -2001,6 +2738,69 @@ onBeforeUnmount(() => {
                 <strong class="num">{{ stats.doneCnt }}</strong>
                 <span>已办结</span>
               </button>
+            </div>
+            <!-- 近 7 日受理 / 办结微趋势曲线 -->
+            <div class="ck-trend-box" @mouseleave="hoveredTrendIdx = -1">
+              <div class="ck-trend-head">
+                <span>近 7 日闭环趋势</span>
+                <span v-if="hoveredTrendIdx >= 0 && trendChart.pts[hoveredTrendIdx]" class="ck-trend-readout num">
+                  {{ trendChart.pts[hoveredTrendIdx].label }} · 受理 {{ trendChart.pts[hoveredTrendIdx].intake }} / 办结 {{ trendChart.pts[hoveredTrendIdx].closed }}
+                </span>
+                <span v-else class="ck-trend-legend">
+                  <i><b style="background: var(--primary)"></b>受理</i>
+                  <i><b style="background: var(--ck-ok)"></b>办结</i>
+                </span>
+              </div>
+              <svg
+                class="ck-trend-svg"
+                :viewBox="`0 0 ${trendChart.width} ${trendChart.height}`"
+                preserveAspectRatio="none"
+                aria-label="近七日受理与办结趋势"
+              >
+                <defs>
+                  <linearGradient id="ckTrendInFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="var(--primary)" stop-opacity="0.22" />
+                    <stop offset="100%" stop-color="var(--primary)" stop-opacity="0.01" />
+                  </linearGradient>
+                  <linearGradient id="ckTrendClFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="var(--ck-ok)" stop-opacity="0.24" />
+                    <stop offset="100%" stop-color="var(--ck-ok)" stop-opacity="0.01" />
+                  </linearGradient>
+                </defs>
+                <path v-if="trendChart.intakeArea" :d="trendChart.intakeArea" fill="url(#ckTrendInFill)" />
+                <path v-if="trendChart.closedArea" :d="trendChart.closedArea" fill="url(#ckTrendClFill)" />
+                <path v-if="trendChart.intakePath" :d="trendChart.intakePath" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linecap="round" />
+                <path v-if="trendChart.closedPath" :d="trendChart.closedPath" fill="none" stroke="var(--ck-ok)" stroke-width="1.5" stroke-linecap="round" />
+                <line
+                  v-if="hoveredTrendIdx >= 0 && trendChart.pts[hoveredTrendIdx]"
+                  :x1="trendChart.pts[hoveredTrendIdx].x"
+                  :x2="trendChart.pts[hoveredTrendIdx].x"
+                  y1="3"
+                  :y2="trendChart.height - 4"
+                  stroke="var(--ck-border)"
+                  stroke-dasharray="2 2"
+                  stroke-width="1"
+                />
+                <g v-for="(pt, pIdx) in trendChart.pts" :key="pt.iso">
+                  <circle
+                    v-if="hoveredTrendIdx === pIdx"
+                    :cx="pt.x" :cy="pt.yIn" r="2.8" fill="var(--primary)"
+                  />
+                  <circle
+                    v-if="hoveredTrendIdx === pIdx"
+                    :cx="pt.x" :cy="pt.yCl" r="2.8" fill="var(--ck-ok)"
+                  />
+                  <rect
+                    :x="pt.x - 16"
+                    y="0"
+                    width="32"
+                    :height="trendChart.height"
+                    fill="transparent"
+                    style="cursor: crosshair"
+                    @mouseenter="hoveredTrendIdx = pIdx"
+                  />
+                </g>
+              </svg>
             </div>
           </section>
 
@@ -2040,6 +2840,7 @@ onBeforeUnmount(() => {
                 :key="e.id"
                 type="button"
                 class="ck-live-item"
+                :title="`${e.title}（${e.community} · ${e.category} · ${isOverdue(e) ? '已超时' : e.stage}）`"
                 :class="{ 'is-selected': selectedEvent?.id === e.id, 'is-fresh': freshIds.has(e.id), 'is-clipped': eIdx >= liveFit }"
                 :tabindex="eIdx >= liveFit ? -1 : 0"
                 @click="handleSelectEvent(e)"
@@ -2097,9 +2898,9 @@ onBeforeUnmount(() => {
                 <span>兵役登记</span>
                 <strong class="num">{{ stats.armed.recruitReg }}</strong>
               </button>
-              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-3)" @click="router.push('/armed-forces')">
-                <span>退役优抚</span>
-                <strong class="num">{{ stats.armed.veterans }}</strong>
+              <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-3)" title="全街道在册退役军人服务建档总数" @click="router.push('/armed-forces')">
+                <span>退役军人</span>
+                <strong class="num">{{ stats.armed.veterans.toLocaleString() }}</strong>
               </button>
               <button type="button" class="ck-quad-cell" style="--cell-tone: var(--chart-5)" @click="router.push('/armed-forces')">
                 <span>国防宣教</span>
@@ -2143,7 +2944,84 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </section>
+
+      <!-- 底部极细低空跟拍播控胶囊 -->
+      <div
+        v-if="followStaffObj && mapBase === 'city3d'"
+        class="ck-follow-capsule"
+        role="region"
+        aria-label="网格员实时低空跟拍控制"
+      >
+        <div class="ck-fc-who">
+          <i
+            class="ck-fc-dot"
+            :class="{ 'is-alert': followStaffObj.status === '滞留提醒', 'is-busy': followStaffObj.status === '在办处置' }"
+          ></i>
+          <strong>{{ followStaffObj.name }}</strong>
+          <span class="ck-fc-grid">{{ shortName(followStaffObj.community) }} · {{ followStaffObj.grid }}</span>
+          <span class="ck-fc-sep" aria-hidden="true"></span>
+          <span class="ck-fc-road" :title="followStaffObj.roadLabel">{{ followStaffObj.roadLabel }}</span>
+        </div>
+        <div class="ck-fc-ops">
+          <div class="ck-fc-step">
+            <button type="button" title="上一位网格员" @click="stepFollowStaff(-1)">
+              <ChevronLeft :size="13" />
+              <span>上一位</span>
+            </button>
+            <button type="button" title="下一位网格员" @click="stepFollowStaff(1)">
+              <span>下一位</span>
+              <ChevronRight :size="13" />
+            </button>
+          </div>
+          <div class="ck-fc-alt" role="group" aria-label="跟拍视角高度">
+            <button type="button" :class="{ active: followAltitude === 'low' }" @click="followAltitude = 'low'">低空穿行</button>
+            <button type="button" :class="{ active: followAltitude === 'mid' }" @click="followAltitude = 'mid'">街区中景</button>
+          </div>
+          <button type="button" class="ck-tb-btn" @click="toggleTheaterMode">
+            <component :is="theaterMode ? PanelLeftOpen : PanelLeftClose" :size="12" />
+            <span>{{ theaterMode ? '展开双轨' : '收拢双轨' }}</span>
+          </button>
+          <button type="button" class="ck-tb-btn is-exit" @click="stopFollowStaff">
+            <X :size="12" />
+            <span>退出跟拍</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 纯净剧场沉浸态底部微字幕条（仅保留专题结论、五章快速切换与退出沉浸按钮） -->
+      <div v-if="!followStaffId" class="ck-theater-bar" role="status" aria-label="沉浸剧场导览">
+        <span class="ck-tb-badge">{{ currentChapterObj.short }}</span>
+        <span class="ck-tb-text">{{ chapterConclusion }}</span>
+        <div class="ck-tb-dots" role="group" aria-label="切换汇报章节">
+          <button
+            v-for="(ch, cIdx) in CHAPTERS"
+            :key="'tb-' + ch.id"
+            type="button"
+            :title="ch.label"
+            :class="{ active: activeChapter === cIdx }"
+            @click="viewMode = 'report'; selectChapter(cIdx)"
+          >
+            {{ ch.short.slice(0, 2) }}
+          </button>
+        </div>
+        <button type="button" class="ck-tb-btn" @click="toggleTour">
+          <component :is="tourRunning ? Pause : Play" :size="12" />
+          <span>{{ tourRunning ? '暂停' : '巡演' }}</span>
+        </button>
+        <button type="button" class="ck-tb-btn is-exit" @click="theaterMode = false">
+          <PanelLeftOpen :size="12" />
+          <span>退出沉浸</span>
+        </button>
+      </div>
     </main>
+
+    <SpatialSearchModal
+      :open="searchOpen"
+      :dark="isDark"
+      :load-bldg-idx="loadBldgIdxMod"
+      @close="searchOpen = false"
+      @select="handleSpatialSelect"
+    />
 
     <DrilldownDrawer
       :open="drill.open"
@@ -2154,7 +3032,8 @@ onBeforeUnmount(() => {
       :columns="drill.columns"
       :rows="drill.rows"
       :export-name="drill.exportName"
-      @close="drill.open = false"
+      :sensitive-name="Boolean(drill.sensitiveName)"
+      @close="drill = { ...drill, open: false }"
     />
   </div>
 </template>
@@ -2167,6 +3046,35 @@ onBeforeUnmount(() => {
     inset 0 2px 0 var(--ck-rail-top-bar),
     var(--e3),
     var(--ck-edge) !important;
+}
+/* 双悬浮轨四角 8px 建筑测绘角标（纯 CSS 多重背景，零额外 DOM 与发光球） */
+.ck-dense-rail::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-radius: calc(var(--r-card, 10px) - 3px);
+  pointer-events: none;
+  z-index: 5;
+  opacity: 0.72;
+  background:
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) left top / 8px 1.2px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) left top / 1.2px 8px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) right top / 8px 1.2px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) right top / 1.2px 8px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) left bottom / 8px 1.2px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) left bottom / 1.2px 8px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) right bottom / 8px 1.2px no-repeat,
+    linear-gradient(var(--ck-plaque-rim, var(--primary)), var(--ck-plaque-rim, var(--primary))) right bottom / 1.2px 8px no-repeat;
+}
+
+/* 3D 舞台暗夜四周景深微暗角，收拢视线聚焦中央城市场景 */
+.ck-shell.is-dark .ck-map-layer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 8;
+  background: radial-gradient(ellipse 68% 64% at 50% 52%, transparent 56%, rgba(4, 7, 14, 0.42) 100%);
 }
 
 /* ── 侧轨一级轨顶主标题：实色朱印斜切铭牌（等比 SVG 斜尾 + 单条鎏金切线 + 红金渐隐底线） ── */
@@ -3399,20 +4307,18 @@ button.ck-mini-stat:hover {
     height: 100dvh;
     overflow: hidden;
   }
+  /* 861px–1100px 保持紧凑单行三段式顶栏，零多余留白；仅 ≤860px 窄屏才拆为两行 */
   .ck-header.ck-header-center {
-    grid-template-columns: auto minmax(0, 1fr);
-    grid-template-areas: "brand brand" "mode tools";
-    gap: 5px 8px;
-    padding: 4px 10px 7px;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    gap: 6px 8px;
+    padding: 5px 10px 6px;
     height: auto;
-    min-height: 0;
+    min-height: 44px;
   }
   .ck-brand.ck-brand-center {
-    grid-area: brand;
     height: auto;
-    min-height: 38px;
+    min-height: 36px;
     padding: 0;
-    width: 100%;
     justify-content: center;
   }
   .ck-crest-wing {
@@ -3420,17 +4326,17 @@ button.ck-mini-stat:hover {
   }
   .ck-crest-body {
     height: auto;
-    min-height: 36px;
+    min-height: 35px;
     max-width: 100%;
-    padding: 4px 12px;
+    padding: 3px 12px;
     border-radius: var(--r-md, 8px);
   }
   .ck-brand-inner {
-    gap: 7px;
+    gap: 6px;
     min-width: 0;
   }
   .ck-logo-pedestal {
-    transform: scale(0.82);
+    transform: scale(0.8);
     transform-origin: center;
     flex-shrink: 0;
   }
@@ -3453,7 +4359,6 @@ button.ck-mini-stat:hover {
     height: 11px !important;
   }
   .ck-head-left {
-    grid-area: mode;
     justify-self: start;
   }
   .ck-head-left .ck-nav-tabs button {
@@ -3462,7 +4367,6 @@ button.ck-mini-stat:hover {
     height: 30px;
   }
   .ck-header.ck-header-center .ck-tools {
-    grid-area: tools;
     justify-self: end;
     max-width: 100%;
     min-width: 0;
@@ -3813,6 +4717,24 @@ button.ck-mini-stat:hover {
   }
 }
 
+@media (max-width: 860px) {
+  .ck-header.ck-header-center {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "brand brand" "mode tools";
+    padding: 4px 10px 7px;
+  }
+  .ck-brand.ck-brand-center {
+    grid-area: brand;
+    width: 100%;
+  }
+  .ck-head-left {
+    grid-area: mode;
+  }
+  .ck-header.ck-header-center .ck-tools {
+    grid-area: tools;
+  }
+}
+
 @media (max-width: 520px) {
   .ck-header.ck-header-center {
     padding: 4px 8px 6px;
@@ -3969,34 +4891,36 @@ button.ck-mini-stat:hover {
   background: color-mix(in srgb, var(--ck-ok) 55%, transparent);
 }
 
-/* 侧轨剩余高度填充 + 列表整条适配 */
-.ck-chapter-block,
-.ck-fill-block {
-  flex: 1 1 0;
-  min-height: 112px;
-}
-.ck-chapter-body {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  flex: 1;
-  min-height: 0;
-}
-.ck-rank-fit,
-.ck-fit-list {
-  position: relative;
-  flex: 1;
-  min-height: 0;
-  max-height: none !important;
-  overflow: hidden !important;
-  align-content: start;
+/* 侧轨剩余高度填充 + 列表整条适配（仅限 >1100px 桌面固定高双悬浮轨，避免窄屏纵向流被 flex-basis:0 压扁至 112px） */
+@media (min-width: 1101px) {
+  .ck-chapter-block,
+  .ck-fill-block {
+    flex: 1 1 0;
+    min-height: 112px;
+  }
+  .ck-chapter-body {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    flex: 1;
+    min-height: 0;
+  }
+  .ck-rank-fit,
+  .ck-fit-list {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    max-height: none !important;
+    overflow: hidden !important;
+    align-content: start;
+  }
+  .is-clipped {
+    visibility: hidden;
+    pointer-events: none;
+  }
 }
 .ck-rank-fit {
   gap: 3px;
-}
-.is-clipped {
-  visibility: hidden;
-  pointer-events: none;
 }
 .ck-dispatch-list {
   flex: 0 1 auto;
@@ -4118,17 +5042,423 @@ button.ck-mini-stat:hover {
 .ck-stage .ck-map-fab {
   flex-direction: row;
   align-items: center;
+  transition: right 0.36s cubic-bezier(0.22, 1, 0.36, 1), bottom 0.36s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.32s ease;
 }
 .ck-stage .ck-map-fab .ck-fab-btn {
-  height: 34px;
+  height: 30px;
+}
+.ck-base-seg {
+  padding: 2.5px;
+}
+.ck-base-seg button {
+  height: 24px;
+  padding: 0 7.5px;
+  font-size: 11px;
 }
 .ck-fab-btn.active {
   border-color: var(--primary);
-  color: var(--primary);
-  background: var(--primary-soft);
+  color: var(--on-primary, #ffffff);
+  background: var(--primary);
+  box-shadow: var(--e-accent);
 }
-.ck-map-layer :deep(.city3d-ctrl.is-cockpit) {
-  bottom: 126px;
+.ck-map-layer :deep(.city3d-ctrl.is-cockpit:not(.is-theater)) {
+  bottom: 120px;
+}
+
+/* ── 顶栏左翼：空间检索与沉浸剧场控制 ── */
+.ck-head-left {
+  gap: 8px;
+}
+.ck-head-ops {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ck-btn-op {
+  height: 34px;
+  padding: 0 10px;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--r-control);
+  border: var(--hair) solid var(--ck-border);
+  background: var(--ck-panel);
+  color: var(--ck-muted);
+  box-shadow: var(--e1), var(--ck-edge);
+  white-space: nowrap;
+}
+.ck-btn-op:hover {
+  color: var(--ck-ink);
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--ck-border));
+}
+.ck-btn-op.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary, #ffffff);
+  box-shadow: var(--e-accent);
+}
+.ck-op-badge {
+  font-style: normal;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 0 5px;
+  height: 16px;
+  line-height: 16px;
+  border-radius: 999px;
+  background: rgba(13, 148, 136, 0.14);
+  color: #0b6e64;
+}
+.ck-shell.is-dark .ck-op-badge {
+  background: rgba(56, 242, 214, 0.18);
+  color: #7ff7e8;
+}
+.ck-btn-op.active .ck-op-badge {
+  background: rgba(255, 255, 255, 0.22);
+  color: #ffffff;
+}
+@media (max-width: 1520px) {
+  .ck-head-left {
+    gap: 6px;
+  }
+  .ck-head-ops {
+    gap: 4px;
+  }
+  .ck-btn-op {
+    height: 30px;
+    padding: 0 7px;
+    gap: 4px;
+    font-size: 11px;
+  }
+  .ck-head-left .ck-nav-tabs button {
+    height: 26px;
+    padding: 0 8px;
+    font-size: 11px;
+  }
+}
+@media (max-width: 1360px) {
+  .ck-btn-op {
+    padding: 0 8px;
+  }
+  .ck-btn-op span {
+    display: none;
+  }
+}
+@media (max-width: 1100px) {
+  .ck-btn-theater {
+    display: none;
+  }
+  .ck-btn-op {
+    height: 30px;
+    padding: 0 7px;
+  }
+}
+
+/* ── KPI 卡片 1px 釉面跟手边框高光（无光球，仅 1px 描边随指针轻扫） ── */
+.ck-kpi-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(
+    120px circle at var(--gx, -200px) var(--gy, -200px),
+    color-mix(in srgb, var(--kpi-tone, var(--primary)) 68%, #f4c97a),
+    transparent 72%
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  transition: opacity 0.22s ease;
+}
+@media (hover: hover) {
+  .ck-kpi-card:hover::after {
+    opacity: 1;
+  }
+}
+
+/* ── 人口结构环悬停扇段联动高亮 ── */
+.ck-ring-center {
+  pointer-events: none;
+}
+.ck-ring-arc {
+  cursor: pointer;
+  transition: stroke-width 0.18s ease, opacity 0.18s ease;
+}
+.ck-ring-arc.dimmed {
+  opacity: 0.34;
+}
+.ck-pop-lg-row {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  transition: background-color 0.15s ease;
+}
+.ck-pop-lg-row.active {
+  background: rgba(128, 148, 170, 0.14);
+}
+
+/* ── 右侧办结率弧形精工仪表 ── */
+.ck-gauge-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ck-gauge-box {
+  position: relative;
+  width: 84px;
+  height: 48px;
+  flex-shrink: 0;
+}
+.ck-gauge-val {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 1px;
+  text-align: center;
+  pointer-events: none;
+}
+.ck-gauge-val strong {
+  font-size: 16px;
+  font-weight: 760;
+  color: var(--ck-ok);
+  line-height: 1;
+}
+.ck-gauge-val small {
+  font-size: 9.5px;
+  margin-left: 1px;
+}
+.ck-gauge-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.ck-gauge-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--ck-ink);
+}
+
+/* ── 右侧近 7 日闭环微趋势曲线 ── */
+.ck-trend-box {
+  margin-top: 6px;
+  padding: 5px 7px 4px;
+  border-radius: var(--r-sm);
+  border: var(--hair) solid var(--ck-line);
+  background: rgba(128, 148, 170, 0.06);
+}
+.ck-trend-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 2px;
+  font-size: 10.5px;
+  color: var(--ck-muted);
+}
+.ck-trend-readout {
+  color: var(--ck-ink);
+  font-weight: 650;
+  white-space: nowrap;
+}
+.ck-trend-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.ck-trend-legend i {
+  font-style: normal;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.ck-trend-legend b {
+  width: 6px;
+  height: 2px;
+  border-radius: 1px;
+  display: inline-block;
+}
+.ck-trend-svg {
+  display: block;
+  width: 100%;
+  height: 40px;
+  overflow: visible;
+}
+
+/* ── 纯净剧场沉浸态（收拢左右双轨、KPI 与 14 社区坞，仅留底部微字幕与控件） ── */
+.ck-theater-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 430;
+  display: none;
+  align-items: center;
+  gap: 9px;
+  max-width: min(680px, calc(100vw - 560px));
+  padding: 6px 10px 6px 8px;
+  border-radius: var(--r-pill, 999px);
+  border: var(--hair) solid var(--ck-border);
+  background: var(--ck-panel);
+  backdrop-filter: blur(18px);
+  box-shadow: var(--e3), var(--ck-edge);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate3d(-50%, 16px, 0);
+  transition: transform 0.38s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.28s ease;
+}
+@media (min-width: 1101px) {
+  .ck-rail-left,
+  .ck-rail-right,
+  .ck-map-topbar,
+  .ck-14-strip {
+    transition: transform 0.42s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.32s ease;
+  }
+  .ck-shell.is-theater .ck-rail-left {
+    transform: translate3d(-118%, 0, 0);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ck-shell.is-theater:not(.has-penetration) .ck-rail-right,
+  .ck-shell.is-theater.is-following .ck-rail-right {
+    transform: translate3d(118%, 0, 0);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ck-shell.is-theater .ck-map-topbar {
+    transform: translate3d(0, -28px, 0);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ck-shell.is-theater .ck-14-strip {
+    transform: translate3d(0, 125%, 0);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ck-shell.is-theater:not(.has-penetration) .ck-map-fab,
+  .ck-shell.is-theater.is-following .ck-map-fab {
+    right: 16px;
+    bottom: 18px;
+  }
+  .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-fab {
+    right: 356px;
+    bottom: 18px;
+  }
+  .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-layer :deep(.city3d-ctrl.is-cockpit.is-theater) {
+    right: 356px;
+  }
+  .ck-shell.is-theater.is-following .ck-map-layer :deep(.city3d-ctrl.is-cockpit.is-theater) {
+    right: 16px;
+  }
+  .ck-theater-bar {
+    display: inline-flex;
+  }
+  .ck-shell.is-theater:not(.has-penetration) .ck-theater-bar {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+@media (min-width: 1101px) and (max-width: 1520px) {
+  .ck-shell:not(.is-theater) .ck-map-fab {
+    right: 328px;
+    bottom: 82px;
+  }
+  .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-fab {
+    right: 328px;
+  }
+  .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-layer :deep(.city3d-ctrl.is-cockpit.is-theater) {
+    right: 328px;
+  }
+  .ck-theater-bar {
+    max-width: min(600px, calc(100vw - 490px));
+  }
+}
+@media (min-width: 1101px) and (max-width: 1280px) {
+  .ck-shell:not(.is-theater) .ck-map-fab {
+    right: 318px;
+  }
+}
+.ck-tb-badge {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--primary);
+  color: var(--on-primary, #ffffff);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.ck-tb-text {
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--ck-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ck-tb-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(128, 148, 170, 0.12);
+  flex-shrink: 0;
+}
+.ck-tb-dots button {
+  height: 20px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ck-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ck-tb-dots button.active {
+  background: var(--primary);
+  color: var(--on-primary, #ffffff);
+}
+.ck-tb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: var(--hair) solid var(--ck-border);
+  background: rgba(128, 148, 170, 0.12);
+  color: var(--ck-ink);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.ck-tb-btn:hover {
+  background: rgba(128, 148, 170, 0.22);
+  border-color: color-mix(in srgb, var(--primary) 42%, var(--ck-border));
+}
+.ck-tb-btn.is-exit {
+  background: var(--primary-soft);
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 34%, transparent);
+}
+.ck-shell.is-dark .ck-tb-btn.is-exit {
+  background: rgba(184, 28, 40, 0.38);
+  border-color: rgba(243, 215, 160, 0.52);
+  color: #fde8c2;
 }
 
 /* 条形数据变化平滑过渡 */
@@ -4478,6 +5808,341 @@ button.ck-mini-stat:hover {
     opacity: 1 !important;
     filter: none !important;
     transform: none !important;
+  }
+}
+
+/* 网格员概览与当前辖区名录 */
+.ck-staff-summary,
+.ck-directory-filters {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.ck-staff-summary {
+  align-self: flex-end;
+  max-width: 100%;
+  padding: 3px;
+  border: var(--hair) solid var(--ck-border);
+  border-radius: var(--r-control);
+  background: var(--ck-panel-solid);
+  box-shadow: var(--e2);
+}
+.ck-staff-filter,
+.ck-staff-directory-toggle,
+.ck-directory-close,
+.ck-patrol-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.ck-staff-filter,
+.ck-staff-directory-toggle {
+  min-height: 26px;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--ck-muted);
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+}
+.ck-staff-filter {
+  border: var(--hair) solid transparent;
+}
+.ck-staff-filter i,
+.ck-staff-row-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--staff-tone);
+}
+.ck-staff-filter b {
+  color: var(--ck-ink);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.ck-staff-filter.active,
+.ck-staff-filter:hover {
+  border-color: color-mix(in srgb, var(--staff-tone) 23%, var(--ck-line));
+  background: color-mix(in srgb, var(--staff-tone) 8%, var(--ck-panel-solid));
+  color: var(--ck-ink);
+}
+.ck-staff-directory-toggle {
+  border-left: var(--hair) solid var(--ck-line);
+  border-radius: 0;
+}
+.ck-staff-directory-toggle:hover,
+.ck-directory-close:hover { color: var(--ck-ink); }
+.ck-patrol-link { flex: none; }
+.ck-staff-directory {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  gap: 10px;
+}
+.ck-directory-head,
+.ck-directory-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ck-directory-head { justify-content: space-between; }
+.ck-directory-head h2 {
+  margin: 0;
+  color: var(--ck-ink);
+  font-size: 16px;
+  line-height: 1.4;
+}
+.ck-directory-head p {
+  margin: 3px 0 0;
+  color: var(--ck-muted);
+  font-size: 11px;
+}
+.ck-directory-close {
+  align-self: flex-start;
+  width: 26px;
+  height: 26px;
+  border: var(--hair) solid var(--ck-line);
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--ck-muted);
+}
+.ck-directory-search {
+  padding: 0 8px;
+  border: var(--hair) solid var(--ck-border);
+  border-radius: var(--r-control);
+  background: var(--ck-panel-solid);
+  color: var(--ck-muted);
+}
+.ck-directory-search:focus-within { border-color: var(--ck-accent); }
+.ck-directory-search input {
+  width: 100%;
+  min-width: 0;
+  height: 31px;
+  padding: 0;
+  border: none;
+  outline: none;
+  color: var(--ck-ink);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+}
+.ck-staff-roster {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ck-line) transparent;
+}
+.ck-staff-row {
+  --staff-tone: var(--ck-ok);
+  display: grid;
+  grid-template-columns: 6px minmax(0, 1fr) auto 12px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 46px;
+  border: none;
+  border-bottom: var(--hair) solid var(--ck-line);
+  padding: 5px 2px;
+  color: var(--ck-muted);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.ck-staff-row.is-alert-row { --staff-tone: var(--ck-danger); }
+.ck-staff-row.is-busy-row { --staff-tone: var(--ck-run); }
+.ck-staff-row:hover,
+.ck-staff-row:focus-visible {
+  background: color-mix(in srgb, var(--staff-tone) 6%, var(--ck-panel-solid));
+}
+.ck-staff-identity { display: grid; gap: 2px; }
+.ck-staff-identity b { color: var(--ck-ink); font-size: 13px; }
+.ck-staff-identity small {
+  overflow: hidden;
+  color: var(--ck-muted);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ck-staff-duty {
+  color: var(--staff-tone);
+  font-size: 10.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.ck-directory-filters { display: none; }
+
+@media (min-width: 1101px) {
+  .ck-shell.is-theater .ck-map-topbar {
+    right: 15px;
+    opacity: 1;
+    transform: none;
+  }
+  .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-topbar {
+    right: 356px;
+  }
+  .ck-shell.is-theater .ck-map-topbar > :not(.ck-staff-summary) { display: none; }
+}
+@media (max-width: 1100px) {
+  .ck-stage[data-panel="map"] .ck-map-topbar {
+    display: flex;
+    position: absolute;
+    top: 47px;
+    left: 8px;
+    right: 8px;
+  }
+  .ck-stage[data-panel="map"] .ck-map-topbar > :not(.ck-staff-summary),
+  .ck-stage[data-panel="data"] .ck-staff-summary { display: none; }
+  .ck-staff-summary { align-self: flex-start; }
+  .ck-staff-filter,
+  .ck-staff-directory-toggle { min-height: 32px; }
+  .ck-directory-filters { display: flex; }
+  .ck-directory-filters .ck-staff-filter { flex: 1; }
+  .ck-staff-roster { max-height: 62dvh; flex: auto; }
+}
+@media (max-width: 380px) {
+  .ck-staff-filter,
+  .ck-staff-directory-toggle { gap: 3px; padding-inline: 5px; }
+}
+
+.ck-follow-capsule {
+  position: absolute;
+  left: 50%;
+  bottom: 188px;
+  z-index: 435;
+  transform: translate3d(-50%, 0, 0);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  max-width: min(820px, calc(100vw - 700px));
+  padding: 7px 10px 7px 13px;
+  border-radius: var(--r-pill, 999px);
+  border: var(--hair) solid var(--ck-border);
+  border-top: 2px solid var(--primary);
+  background: var(--ck-panel-solid);
+  box-shadow: var(--e3), var(--ck-edge);
+  color: var(--ck-ink);
+  transition: bottom 0.32s cubic-bezier(0.22, 1, 0.36, 1), max-width 0.32s ease;
+}
+.ck-shell.is-theater .ck-follow-capsule {
+  bottom: 18px;
+  max-width: min(880px, calc(100vw - 440px));
+}
+.ck-fc-who {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+}
+.ck-fc-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ck-ok);
+  flex-shrink: 0;
+}
+.ck-fc-dot.is-busy { background: var(--ck-run); }
+.ck-fc-dot.is-alert {
+  background: var(--ck-danger);
+  animation: ckPulseDot 1.3s ease-in-out infinite;
+}
+.ck-fc-who strong {
+  font-weight: 720;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ck-fc-grid {
+  font-size: 11px;
+  color: var(--ck-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ck-fc-sep {
+  width: 1px;
+  height: 12px;
+  background: var(--ck-border);
+  flex-shrink: 0;
+}
+.ck-fc-road {
+  font-size: 11px;
+  color: var(--ck-ink);
+  font-weight: 560;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.ck-fc-ops {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.ck-fc-step,
+.ck-fc-alt {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(128, 148, 170, 0.12);
+}
+.ck-fc-step button,
+.ck-fc-alt button {
+  height: 22px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ck-muted);
+  font-size: 10.5px;
+  font-weight: 620;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+.ck-fc-step button:hover,
+.ck-fc-alt button:hover:not(.active) {
+  color: var(--ck-ink);
+  background: rgba(128, 148, 170, 0.16);
+}
+.ck-fc-alt button.active {
+  background: var(--primary);
+  color: var(--on-primary, #ffffff);
+}
+
+@media (max-width: 1520px) {
+  .ck-follow-capsule {
+    max-width: min(760px, calc(100vw - 650px));
+    gap: 8px;
+    padding: 6px 8px 6px 11px;
+  }
+  .ck-fc-grid {
+    display: none;
+  }
+}
+@media (max-width: 1100px) {
+  .ck-follow-capsule {
+    bottom: 68px;
+    max-width: calc(100vw - 20px);
+    flex-wrap: wrap;
+    border-radius: var(--r-md, 10px);
+  }
+  .ck-follow-capsule .ck-tb-btn:first-of-type {
+    display: none;
   }
 }
 </style>

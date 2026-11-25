@@ -35,6 +35,15 @@ function onDialogClose() {
   if (props.open) emit('close')
 }
 
+function onDocKeyDown(e) {
+  if (e.key !== 'Escape' || !props.open) return
+  if (document.querySelector('.rui-select-panel')) return
+  e.preventDefault()
+  e.stopPropagation()
+  if (dlgRef.value?.open) dlgRef.value.close()
+  else emit('close')
+}
+
 watch(
   () => props.open,
   (val) => {
@@ -47,6 +56,7 @@ watch(
 
 onMounted(() => {
   const dlg = dlgRef.value
+  document.addEventListener('keydown', onDocKeyDown, true)
   if (!dlg) return
   if (props.open && !dlg.open) dlg.showModal()
   if (!('closedBy' in HTMLDialogElement.prototype)) {
@@ -56,6 +66,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', onDocKeyDown, true)
   const dlg = dlgRef.value
   if (!dlg) return
   dlg.removeEventListener('pointerdown', onPointerDown)

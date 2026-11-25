@@ -21,10 +21,10 @@ const widthPx = computed(() => {
 
 const SHADOW_MAP = {
   'vermilion-seal': 'rgba(130, 18, 22, 0.22)',
-  'cloud-portal': 'rgba(130, 18, 22, 0.20)',
-  'pearl-glass': 'rgba(130, 18, 22, 0.20)',
-  'civic-trust': 'rgba(130, 18, 22, 0.20)',
-  'jade-emerald': 'rgba(130, 18, 22, 0.20)',
+  'cloud-portal': 'rgba(20, 74, 158, 0.16)',
+  'pearl-glass': 'rgba(24, 78, 162, 0.16)',
+  'civic-trust': 'rgba(22, 64, 134, 0.16)',
+  'jade-emerald': 'rgba(15, 92, 84, 0.16)',
   'command-dark': 'rgba(4, 10, 22, 0.45)'
 }
 

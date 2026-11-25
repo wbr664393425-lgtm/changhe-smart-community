@@ -233,6 +233,71 @@ export function ensureAmapTexture(key, onByteProgress) {
 }
 
 /**
+ * 分条带异步上传超大底图（如 3840×3584），每条带约 8~16ms 并让出渲染帧，避免单次 texSubImage2D 阻塞主线程 > 100ms
+ */
+export async function uploadLargeTextureSlicedAsync(renderer, srcTex, yieldFn, strips = 12) {
+  const img = srcTex?.image
+  const w = img?.width || 0
+  const h = img?.height || 0
+  if (
+    !renderer ||
+    !srcTex ||
+    srcTex.flipY !== false ||
+    typeof ImageBitmap === 'undefined' ||
+    !(img instanceof ImageBitmap) ||
+    typeof createImageBitmap !== 'function' ||
+    w * h <= 2000000
+  ) {
+    renderer?.initTexture?.(srcTex)
+    return null
+  }
+
+  const gpuTex = new THREE.DataTexture(null, w, h, THREE.RGBAFormat, THREE.UnsignedByteType)
+  gpuTex.colorSpace = srcTex.colorSpace
+  gpuTex.wrapS = srcTex.wrapS
+  gpuTex.wrapT = srcTex.wrapT
+  gpuTex.minFilter = THREE.LinearMipmapLinearFilter
+  gpuTex.magFilter = THREE.LinearFilter
+  gpuTex.generateMipmaps = false
+  gpuTex.flipY = false
+  gpuTex.anisotropy = srcTex.anisotropy || 1
+  gpuTex.needsUpdate = true
+
+  renderer.initTexture(gpuTex)
+  const gl = renderer.getContext?.()
+  const webglTex = renderer.properties?.get?.(gpuTex)?.__webglTexture
+  if (!gl || !webglTex) {
+    gpuTex.dispose()
+    renderer.initTexture?.(srcTex)
+    return null
+  }
+
+  const stripH = Math.ceil(h / strips)
+  for (let i = 0; i < strips; i++) {
+    const y = i * stripH
+    const sh = Math.min(stripH, h - y)
+    if (sh <= 0) break
+    const stripBmp = await createImageBitmap(img, 0, y, w, sh)
+    gl.bindTexture(gl.TEXTURE_2D, webglTex)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0)
+    gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0)
+    gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y, gl.RGBA, gl.UNSIGNED_BYTE, stripBmp)
+    stripBmp.close()
+    if (yieldFn) await yieldFn()
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, webglTex)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+  gl.generateMipmap(gl.TEXTURE_2D)
+  gl.bindTexture(gl.TEXTURE_2D, null)
+  renderer.resetState?.()
+  return gpuTex
+}
+
+/**
  * 首屏按需加载当前明暗对应的 1 张矢量底图（+ 仅驾驶舱模式加载岸线距离图）
  * 其余非首屏纹理在揭幕后通过 preloadSecondaryAmapAssets 静默预热，或切换时按需秒载
  */

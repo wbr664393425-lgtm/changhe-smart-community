@@ -278,13 +278,21 @@ export function buildCockpitBridges(layout, point, pixelScale) {
     group.add(mesh)
   }
   function setTheme(theme, night) {
+    setAtmosphere(theme, night ? 1 : 0, night ? 1 : 0)
+  }
+  function setAtmosphere(theme, nightFactor = 0, glowFactor = 0) {
+    const night = nightFactor >= 0.5
+    const gf = Math.max(0, Math.min(1, glowFactor))
     materials.stone.color.set(night ? theme.roof : theme.top)
     materials.steel.color.set(night ? '#54758b' : '#718587')
     materials.road.color.set(night ? '#354b60' : '#899297')
-    materials.marking.color.set(night ? '#b4d7dd' : '#efece0')
-    materials.lamp.color.set(night ? '#ffe1b0' : theme.top)
-    materials.lamp.emissive.set(night ? '#e7b377' : '#000000')
+    materials.marking.color.set(gf > 0.25 ? '#ffe3ad' : '#efece0')
+    materials.marking.emissive.set(gf > 0.2 ? '#f4b862' : '#000000')
+    materials.marking.emissiveIntensity = gf * 0.65
+    materials.lamp.color.set(gf > 0.15 ? '#ffe6b8' : theme.top)
+    materials.lamp.emissive.set(gf > 0.12 ? '#ffc870' : '#000000')
+    materials.lamp.emissiveIntensity = gf * 2.8
     materials.stone.emissive.set(night ? theme.outerTop : '#000000').multiplyScalar(0.27)
   }
-  return { group, setTheme }
+  return { group, setTheme, setAtmosphere }
 }

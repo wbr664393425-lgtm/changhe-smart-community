@@ -28,10 +28,14 @@ const props = defineProps({
   patrolThreshold: { type: Number, default: 30 },
   boxSelectActive: { type: Boolean, default: false },
   singleEvent: { type: Object, default: null },
-  focusCoord: { type: Array, default: null }
+  focusCoord: { type: Array, default: null },
+  liveStaff: { type: Array, default: () => [] },
+  staffLayerActive: { type: Boolean, default: false },
+  staffStatusFocus: { type: String, default: 'all' },
+  selectedStaffId: { type: String, default: '' }
 })
 
-const emit = defineEmits(['select-community', 'select-event', 'select-point', 'box-selected', 'update:baseMode'])
+const emit = defineEmits(['select-community', 'select-event', 'select-point', 'select-staff', 'box-selected', 'update:baseMode'])
 
 const mapEl = ref(null)
 const internalBase = ref(props.baseMode === 'vector' ? 'gov' : props.baseMode)
@@ -46,9 +50,20 @@ let vectorGroup = null
 let polyGroup = null
 let roadBlockGroup = null
 let dataGroup = null
+let staffGroup = null
+const staffMarkers = new Map()
+const staffIcon = L.divIcon({
+  className: 'geo-staff-marker',
+  html: '<span class="geo-staff-pin" aria-hidden="true"><i class="geo-staff-mini"></i><i class="geo-staff-portrait"></i></span>',
+  iconSize: [28, 32],
+  iconAnchor: [14, 28]
+})
+let initialFitTimer = 0
+let portraitBlend = -1
 let boxRectLayer = null
 let dragStartLatLng = null
 let resizeObserver = null
+let communityLabelItems = []
 const polyLayerMap = new Map()
 
 const HQ_COORD = [37.44875, 116.36286]
@@ -162,7 +177,7 @@ function getCommunityLevel(c, slice) {
 }
 
 function getCommunityMetricChip(c, slice) {
-  if (slice === 'party') return `${c.party}党`
+  if (slice === 'party') return `${c.party}党员`
   if (slice === 'economy') return `${c.biz.revenue}亿`
   if (slice === 'eco') return `涝${c.env.floodPts}火${c.env.firePts}`
   if (slice === 'aid') {
@@ -206,9 +221,59 @@ function getCockpitPadding() {
   if (props.mode !== 'cockpit') return { padTL: [26, 26], padBR: [26, 26] }
   const compact = typeof window !== 'undefined' && window.innerWidth <= 1520
   return {
-    padTL: compact ? [304, 152] : [330, 168],
-    padBR: compact ? [326, 114] : [354, 116]
+    padTL: compact ? [304, 140] : [330, 148],
+    padBR: compact ? [326, 90] : [354, 92]
   }
+}
+
+function layoutCommunityLabels() {
+  if (!map || !communityLabelItems.length) return
+  const placed = []
+  if (props.mode === 'cockpit' || props.mode === 'grid' || props.mode === 'hub') {
+    const hqPt = map.latLngToContainerPoint(HQ_COORD)
+    placed.push({ x: hqPt.x, y: hqPt.y + 8, bw: 80, bh: 48 })
+  }
+  const cands = [
+    [0, 0],
+    [0, -28],
+    [0, 28],
+    [-46, -24],
+    [46, -24],
+    [-46, 24],
+    [46, 24],
+    [82, 0],
+    [-82, 0],
+    [0, -56],
+    [0, 56],
+    [82, -30],
+    [-82, -30],
+    [82, 30],
+    [-82, 30],
+    [0, -84],
+    [0, 84],
+    [-108, -26],
+    [108, -26]
+  ]
+  const hits = (cx, cy, bw, bh) =>
+    placed.some((p) => Math.abs(cx - p.x) < (bw + p.bw) * 0.5 + 5 && Math.abs(cy - p.y) < (bh + p.bh) * 0.5 + 4)
+
+  const sorted = [...communityLabelItems].sort((a, b) => (b.isSel ? 1 : 0) - (a.isSel ? 1 : 0))
+  sorted.forEach((item) => {
+    const anchorPt = map.latLngToContainerPoint(item.baseLatLng)
+    let chosenX = anchorPt.x
+    let chosenY = anchorPt.y
+    for (const [dx, dy] of cands) {
+      const tx = anchorPt.x + dx
+      const ty = anchorPt.y + dy
+      if (!hits(tx, ty, item.bw, item.bh)) {
+        chosenX = tx
+        chosenY = ty
+        break
+      }
+    }
+    placed.push({ x: chosenX, y: chosenY, bw: item.bw, bh: item.bh })
+    item.marker.setLatLng(map.containerPointToLatLng([chosenX, chosenY]))
+  })
 }
 
 function setBase(mode) {
@@ -567,6 +632,7 @@ function renderDataLayers(shouldFitView = true) {
   polyGroup.clearLayers()
   dataGroup.clearLayers()
   polyLayerMap.clear()
+  communityLabelItems = []
 
   const isDark = effectiveDark.value
   const isGov = effectiveBase.value === 'gov'
@@ -662,7 +728,12 @@ function renderDataLayers(shouldFitView = true) {
     interactive: false
   }).addTo(polyGroup)
 
-  // 4. 14 社区立体数据标牌（含微型强度条 + 督办社区脉冲警戒环）
+  // 先完成视野缩放落位，确保后续社区标牌像素防碰撞按最终缩放级别计算
+  if (shouldFitView && props.mode !== 'patrol') {
+    fitSafeBounds(boundsList)
+  }
+
+  // 4. 14 社区立体数据标牌（含微型强度条 + 督办社区脉冲警戒环 + 屏幕空间防重叠）
   if (props.mode !== 'armed' && props.mode !== 'patrol') {
     COMMUNITIES.forEach((c) => {
       const isSel = props.selectedCommunity === c.name
@@ -700,17 +771,21 @@ function renderDataLayers(shouldFitView = true) {
       const pos = [c.center[0] + offset[0], c.center[1] + offset[1]]
       const shortName = c.name.replace('社区', '')
       const barColor = isSel ? '#f3d7a0' : (props.slice === 'safety' ? dotCol : toneBar)
+      const bw = Math.round(shortName.length * 11.5 + (isGov ? chipText.length * 9.5 + 24 : 18))
+      const bh = isGov ? 26 : 22
 
-      L.marker(pos, {
+      const marker = L.marker(pos, {
         interactive: true,
         zIndexOffset: isSel ? 540 : 140,
         icon: L.divIcon({
           className: '',
-          html: `<div style="display:inline-flex;flex-direction:column;gap:2px;background:${labelBg};color:${labelFg};border:1px solid ${labelBorder};border-left:3px solid ${barColor};padding:2.5px 7px 3px 6px;border-radius:5px;font-size:11px;font-weight:680;white-space:nowrap;box-shadow:0 3px 10px rgba(0,0,0,${isDark ? 0.45 : 0.16})"><div style="display:flex;align-items:center;gap:4px"><span>${shortName}</span>${isGov ? `<em style="font-style:normal;font-size:9.5px;font-weight:650;color:${chipColor};padding-left:4px;border-left:1px solid ${isSel ? 'rgba(255,255,255,0.28)' : 'rgba(128,128,128,0.26)'}">${chipText}</em>` : ''}</div>${isGov ? `<span style="display:block;width:100%;height:2px;border-radius:2px;background:${isSel ? 'rgba(255,255,255,0.22)' : 'rgba(128,128,128,0.16)'};overflow:hidden"><i style="display:block;height:100%;width:${barPct}%;background:${barColor};border-radius:2px"></i></span>` : ''}</div>`,
-          iconSize: [92, 26],
-          iconAnchor: [46, 13]
+          html: `<div style="display:flex;justify-content:center;width:100%"><div style="display:inline-flex;flex-direction:column;gap:2px;background:${labelBg};color:${labelFg};border:1px solid ${labelBorder};border-left:3px solid ${barColor};padding:2.5px 7px 3px 6px;border-radius:5px;font-size:11px;font-weight:680;white-space:nowrap;box-shadow:0 3px 10px rgba(0,0,0,${isDark ? 0.45 : 0.16})"><div style="display:flex;align-items:center;gap:4px"><span>${shortName}</span>${isGov ? `<em style="font-style:normal;font-size:9.5px;font-weight:650;color:${chipColor};padding-left:4px;border-left:1px solid ${isSel ? 'rgba(255,255,255,0.28)' : 'rgba(128,128,128,0.26)'}">${chipText}</em>` : ''}</div>${isGov ? `<span style="display:block;width:100%;height:2px;border-radius:2px;background:${isSel ? 'rgba(255,255,255,0.22)' : 'rgba(128,128,128,0.16)'};overflow:hidden"><i style="display:block;height:100%;width:${barPct}%;background:${barColor};border-radius:2px"></i></span>` : ''}</div></div>`,
+          iconSize: [bw, bh],
+          iconAnchor: [Math.round(bw / 2), Math.round(bh / 2)]
         })
       }).on('click', () => emit('select-community', c.name)).addTo(dataGroup)
+
+      communityLabelItems.push({ marker, baseLatLng: pos, bw, bh, isSel })
     })
   }
 
@@ -862,10 +937,8 @@ function renderDataLayers(shouldFitView = true) {
     return
   }
 
-  // 8. 自动适配安全视野
-  if (shouldFitView) {
-    fitSafeBounds(boundsList)
-  }
+  // 8. 执行社区标牌屏幕像素防重叠排布
+  layoutCommunityLabels()
 }
 
 function fitSafeBounds(boundsList) {
@@ -927,15 +1000,39 @@ function handleFullscreenOrResize() {
   if (props.mode === 'cockpit') {
     fitSafeBounds()
   }
+  layoutCommunityLabels()
 }
+
+function updateStaffZoom(zoom) {
+  if (props.mode !== 'cockpit' || !mapEl.value) return
+  const fraction = Math.max(0, Math.min(1, (zoom - 14) / 1.5))
+  const blend = Math.round(fraction * fraction * (3 - 2 * fraction) * 32) / 32
+  if (blend === portraitBlend) return
+  portraitBlend = blend
+  mapEl.value.style.setProperty('--staff-portrait-blend', String(blend))
+}
+
+function focusOnStaff(staff, animate = true) {
+  if (!map || !Number.isFinite(staff?.lat) || !Number.isFinite(staff?.lng)) return
+  clearTimeout(initialFitTimer)
+  const motion = animate && !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  const point = L.latLng(staff.lat, staff.lng)
+  const zoom = Math.max(map.getZoom(), 15.5)
+  if (map.getZoom() === zoom && map.getCenter().equals(point)) return
+  if (motion) map.flyTo(point, zoom, { duration: 0.65 })
+  else map.setView(point, zoom, { animate: false })
+}
+defineExpose({ focusOnStaff })
 
 onMounted(() => {
   if (!mapEl.value) return
   map = L.map(mapEl.value, {
     center: [37.442, 116.348],
-    zoom: 13,
+    zoom: 13.5,
     minZoom: 11,
     maxZoom: 17,
+    zoomSnap: 0.25,
+    zoomDelta: 0.5,
     zoomControl: props.mode !== 'cockpit',
     attributionControl: false
   })
@@ -943,25 +1040,36 @@ onMounted(() => {
   polyGroup = L.layerGroup().addTo(map)
   roadBlockGroup = L.layerGroup().addTo(map)
   dataGroup = L.layerGroup().addTo(map)
+  staffGroup = L.layerGroup().addTo(map)
   applyBaseLayer()
   drawRoadsAndInnerParks()
   renderDataLayers(true)
+  renderStaffLayer()
   setupBoxSelection()
   updateScaleBar()
-  map.on('zoomend', updateScaleBar)
+  updateStaffZoom(map.getZoom())
+  map.on('zoom', () => updateStaffZoom(map.getZoom()))
+  map.on('zoomanim', e => updateStaffZoom(e.zoom))
+  map.on('zoomend', () => {
+    updateScaleBar()
+    layoutCommunityLabels()
+  })
 
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
       map?.invalidateSize()
+      layoutCommunityLabels()
     })
     resizeObserver.observe(mapEl.value)
   }
   document.addEventListener('fullscreenchange', handleFullscreenOrResize)
-  setTimeout(() => {
-    map?.invalidateSize()
+  initialFitTimer = setTimeout(() => {
+    map.invalidateSize()
     fitSafeBounds()
+    layoutCommunityLabels()
     updateScaleBar()
   }, 160)
+  map.once('movestart', () => clearTimeout(initialFitTimer))
 })
 
 watch(
@@ -1017,6 +1125,66 @@ watch(
   }
 )
 
+function renderStaffLayer() {
+  if (!map || !staffGroup) return
+  if (props.mode !== 'cockpit' || !props.staffLayerActive) {
+    if (staffMarkers.size) staffGroup.clearLayers()
+    staffMarkers.clear()
+    return
+  }
+  const visible = new Set()
+  for (const st of props.liveStaff) {
+    if (!Number.isFinite(st.lat) || !Number.isFinite(st.lng)) continue
+    visible.add(st.id)
+    let entry = staffMarkers.get(st.id)
+    if (!entry) {
+      const tooltip = document.createElement('span')
+      const marker = L.marker([st.lat, st.lng], { icon: staffIcon, autoPanOnFocus: false })
+      entry = { marker, tooltip, staff: null, selected: false, muted: false }
+      marker.bindTooltip(tooltip, { direction: 'top', offset: [0, -23], opacity: 0.96 })
+      marker.on('click', () => emit('select-staff', entry.staff))
+      marker.addTo(staffGroup)
+      staffMarkers.set(st.id, entry)
+    } else if (entry.staff.lat !== st.lat || entry.staff.lng !== st.lng) {
+      entry.marker.setLatLng([st.lat, st.lng])
+    }
+    const selected = props.selectedStaffId === st.id
+    const muted = props.staffStatusFocus !== 'all' && props.staffStatusFocus !== st.status
+    const el = entry.marker.getElement()
+    if (entry.staff?.gender !== st.gender) {
+      el.classList.toggle('is-male', st.gender === 'male')
+      el.classList.toggle('is-female', st.gender === 'female')
+    }
+    if (entry.staff?.status !== st.status || entry.selected !== selected || entry.muted !== muted) {
+      const alert = st.status === '滞留提醒'
+      el.classList.toggle('is-alert', alert)
+      el.classList.toggle('is-busy', st.status === '在办处置')
+      el.classList.toggle('is-selected', selected)
+      el.classList.toggle('is-muted', muted)
+      entry.marker.setZIndexOffset(selected ? 650 : muted ? 370 : alert ? 560 : 480)
+    }
+    const label = `${st.name}（${st.community}·${st.grid}）· ${st.status} · ${st.roadLabel || ''}`
+    if (entry.tooltip.textContent !== label) {
+      entry.tooltip.textContent = label
+      el.setAttribute('aria-label', label)
+    }
+    entry.staff = st
+    entry.selected = selected
+    entry.muted = muted
+  }
+  for (const [id, entry] of staffMarkers) {
+    if (!visible.has(id)) {
+      staffGroup.removeLayer(entry.marker)
+      staffMarkers.delete(id)
+    }
+  }
+}
+
+watch(
+  () => [props.mode, props.staffLayerActive, props.liveStaff, props.selectedStaffId, props.staffStatusFocus],
+  renderStaffLayer
+)
+
 watch(
   () => props.boxSelectActive,
   (active) => {
@@ -1028,9 +1196,12 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  clearTimeout(initialFitTimer)
   document.removeEventListener('fullscreenchange', handleFullscreenOrResize)
   resizeObserver?.disconnect()
   resizeObserver = null
+  staffMarkers.clear()
+  staffGroup = null
   if (map) {
     map.remove()
     map = null
@@ -1483,6 +1654,95 @@ onBeforeUnmount(() => {
 .geo-base-switch button.active {
   background: var(--primary);
   color: var(--on-primary);
+}
+
+:deep(.geo-staff-marker) {
+  --staff-status: #16835d;
+  --staff-edge: #f9fffc;
+  --staff-column: 0%;
+  --staff-row: 100%;
+}
+:deep(.geo-staff-marker.is-busy) {
+  --staff-status: #2869b6;
+  --staff-column: 50%;
+}
+:deep(.geo-staff-marker.is-alert) {
+  --staff-status: #d73c3a;
+  --staff-edge: #a31924;
+  --staff-column: 100%;
+}
+.geo-map-root.dark :deep(.geo-staff-marker) { --staff-status: #51c99a; }
+.geo-map-root.dark :deep(.geo-staff-marker.is-busy) { --staff-status: #77baff; }
+.geo-map-root.dark :deep(.geo-staff-marker.is-alert) {
+  --staff-status: #ff7165;
+  --staff-edge: #ff9a85;
+}
+:deep(.geo-staff-marker.is-male) { --staff-row: 0%; }
+:deep(.geo-staff-marker.is-female) { --staff-row: 50%; }
+
+:deep(.geo-staff-pin) {
+  position: absolute;
+  inset: 0;
+  transition: opacity 140ms ease;
+}
+:deep(.geo-staff-marker.is-muted .geo-staff-pin) { opacity: 0.25; }
+:deep(.geo-staff-marker.is-muted.is-selected .geo-staff-pin) { opacity: 0.50; }
+:deep(.geo-staff-mini),
+:deep(.geo-staff-portrait) {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}
+:deep(.geo-staff-mini) {
+  width: 17px;
+  height: 19px;
+  opacity: calc(1 - var(--staff-portrait-blend, 0));
+  --staff-outline: polygon(35% 6%, 44% 2%, 58% 2%, 66% 8%, 67% 13%, 76% 14%, 76% 19%, 66% 20%, 63% 28%, 58% 32%, 73% 36%, 84% 61%, 74% 65%, 64% 48%, 66% 68%, 70% 98%, 55% 98%, 50% 75%, 44% 98%, 29% 98%, 34% 68%, 36% 48%, 26% 65%, 16% 61%, 28% 36%, 42% 32%, 37% 27%, 34% 20%, 30% 19%, 30% 14%, 34% 13%);
+}
+:deep(.geo-staff-mini::before),
+:deep(.geo-staff-mini::after) {
+  content: '';
+  position: absolute;
+  inset: 0;
+  clip-path: var(--staff-outline);
+}
+:deep(.geo-staff-mini::before) {
+  background: var(--staff-edge);
+  transform: scale(1.16, 1.09);
+  transform-origin: center 82%;
+}
+:deep(.geo-staff-mini::after) {
+  background: linear-gradient(to bottom, #183f47 0% 18%, #edc29d 18% 33%, var(--staff-status) 33% 52%, #f4edce 52% 59%, var(--staff-status) 59% 72%, #263b4b 72% 100%);
+}
+:deep(.geo-staff-portrait) {
+  width: 26px;
+  height: 26px;
+  background-image: url('../assets/staff-map-badges.png');
+  background-size: 300% 300%;
+  background-position: var(--staff-column) var(--staff-row);
+  background-repeat: no-repeat;
+  opacity: var(--staff-portrait-blend, 0);
+}
+:deep(.geo-staff-marker.is-selected .geo-staff-pin::before) {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 2px;
+  width: 18px;
+  height: 6px;
+  transform: translateX(-50%);
+  border: 2px solid var(--staff-status);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px white;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  :deep(.geo-staff-pin),
+  :deep(.geo-staff-mini),
+  :deep(.geo-staff-portrait) { transition: none; }
 }
 
 .offline-ribbon {

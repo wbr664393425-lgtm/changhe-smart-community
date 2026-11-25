@@ -1376,5 +1376,9 @@ export const CHANGHE_NEIGHBORS = [
   { name: '减河生态南延', coord: [37.4102, 116.3540] }
 ];
 
-// 14 社区标牌微调偏移（避免中轴线密集社区与指挥中心「中」标重叠）
-export const CHANGHE_LABEL_OFFSETS = {};
+// 14 社区标牌微调偏移（避免中轴线密集社区与指挥中心「中」标或重点中学地标重叠）
+export const CHANGHE_LABEL_OFFSETS = {
+  '德馨社区': [0.0024, -0.0026],
+  '华嬉社区': [0.0018, 0.0044],
+  '杨庄社区': [0.0005, -0.0014]
+};

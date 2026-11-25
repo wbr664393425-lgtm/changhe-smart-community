@@ -383,8 +383,8 @@ body.cockpit-dark {
   --ck-border: rgba(150, 180, 214, 0.16);
   --ck-line: rgba(150, 180, 214, 0.12);
   --ck-ink: #edf3fa;
-  --ck-muted: #9eb0c4;
-  --ck-faint: #77899e;
+  --ck-muted: #b4c4d8;
+  --ck-faint: #94a6bc;
   --ck-accent: #6ea8ff;
   --ck-run: #4fd3f2;
   --ck-ok: #7be05c;
@@ -725,8 +725,8 @@ html[data-preset="vermilion-seal"] body.cockpit-dark {
   --ck-border: rgba(232, 204, 154, 0.21);
   --ck-line: rgba(232, 204, 154, 0.11);
   --ck-ink: #f7f5f2;
-  --ck-muted: #beb9b4;
-  --ck-faint: #8c8784;
+  --ck-muted: #d2cdc7;
+  --ck-faint: #a8a29c;
   --ck-accent: #e8c484;
   --ck-run: #4ec4db;
   --ck-ok: #3cd09c;
@@ -1287,7 +1287,8 @@ html:not([data-preset="command-dark"]) body:not(.cockpit-dark) .leaflet-tile-pan
 .ck-pill { height: 28px; padding: 0 9px; border: 0; border-radius: calc(var(--r-md) - 4px); background: transparent; color: var(--ck-muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .ck-pill:hover { color: var(--ck-ink); background: rgba(128, 148, 170, 0.12); }
 .ck-pill.active { background: var(--ck-panel-solid); color: var(--ck-ink); box-shadow: var(--e1); }
-body.cockpit-dark .ck-pill.active { background: var(--primary-soft); color: #ffffff; }
+body.cockpit-dark .ck-pill.active,
+html[data-preset="command-dark"] .ck-pill.active { background: var(--primary); color: var(--on-primary, #ffffff); box-shadow: var(--e-accent); }
 
 .ck-rail { position: absolute; z-index: 420; top: 14px; bottom: 14px; display: flex; flex-direction: column; padding: 16px 18px; border-radius: var(--r-card); background: var(--ck-panel); backdrop-filter: blur(24px) saturate(1.12); border: var(--hair) solid var(--ck-border); box-shadow: var(--e2), var(--ck-edge); overflow-y: auto; scrollbar-width: none; contain: layout style; }
 .ck-rail::-webkit-scrollbar { display: none; }
@@ -2168,9 +2169,9 @@ html[data-preset="vermilion-seal"] .tag.st-wait {
 }
 body.cockpit-dark .ck-logo-pedestal,
 html[data-preset="command-dark"] .ck-logo-pedestal {
-  background: radial-gradient(circle at 50% 35%, rgba(255, 252, 246, 0.96) 58%, rgba(242, 234, 224, 0.92) 100%);
-  border-color: rgba(247, 219, 154, 0.72);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45), inset 0 1px 1px #ffffff;
+  background: radial-gradient(circle at 50% 35%, rgba(246, 238, 226, 0.92) 55%, rgba(226, 214, 196, 0.88) 100%);
+  border-color: rgba(247, 219, 154, 0.68);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45), inset 0 1px 1px rgba(255, 250, 240, 0.85);
 }
 .ck-title-group h1 {
   display: inline-flex;

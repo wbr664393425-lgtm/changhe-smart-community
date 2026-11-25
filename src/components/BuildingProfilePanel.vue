@@ -2,15 +2,21 @@
 import { ref, computed, watch } from 'vue'
 import {
   X, Maximize2, Radio, Send, PlusCircle, Building2, ShieldAlert,
-  Users, Phone, Package, Flame, Droplets, CheckCircle2, MapPin
+  Users, Phone, Package, Flame, Droplets, CheckCircle2, MapPin, Navigation, Bell, ChevronLeft
 } from 'lucide-vue-next'
 import NativeDrawer from './NativeDrawer.vue'
+import malePortrait from '../assets/staff-portrait.png'
+import femalePortrait from '../assets/staff-portrait-female.png'
 
 const props = defineProps({
   buildingDetail: { type: Object, default: null },
   entityDetail: { type: Object, default: null },
   emergencyInfo: { type: Object, default: null },
-  radiusActive: { type: Boolean, default: false }
+  radiusActive: { type: Boolean, default: false },
+  canFollow: { type: Boolean, default: true },
+  staffFromDirectory: { type: Boolean, default: false },
+  isFollowing: { type: Boolean, default: false },
+  liveTelemetry: { type: Object, default: null }
 })
 
 const emit = defineEmits([
@@ -20,22 +26,78 @@ const emit = defineEmits([
   'create-inspection',
   'borrow-aid',
   'select-building-index',
-  'select-event'
+  'select-event',
+  'focus-floor',
+  'view-staff-close',
+  'toggle-follow',
+  'supervise-staff'
 ])
 
 const drawerOpen = ref(false)
 const activeUnit = ref('一单元')
 const selectedRoomKey = ref('')
 const selectedFloorIdx = ref(0)
+const hoveredFloorInfo = ref(null)
 const showCreateForm = ref(false)
 const inspectCategory = ref('安全生产')
 const inspectTitle = ref('')
 const inspectDesc = ref('')
 
 // 切换楼栋时自动预选重点户（有隐患或独居关怀优先），减少一次点击
+function parseFloorNumber(floorStr) {
+  const m = String(floorStr || '').match(/\d+/)
+  return m ? Math.max(1, Number(m[0])) : 1
+}
+
+function floorRowTone(row) {
+  const rooms = row?.rooms || []
+  if (rooms.some((r) => r.hazard)) return { tone: 'hazard', label: '存在隐患' }
+  if (rooms.some((r) => r.careTags?.length)) return { tone: 'care', label: '重点关怀' }
+  return { tone: 'normal', label: '巡检达标' }
+}
+
+const activeFloorPayload = computed(() => {
+  const d = props.buildingDetail
+  if (!d) return null
+  if (hoveredFloorInfo.value) return hoveredFloorInfo.value
+  const totalFloors = Math.max(1, Number(d.floorsCount) || 6)
+  if (d.mode === 'residential-full' || d.mode === 'residential-lite') {
+    const sel = selectedRoomObj.value
+    if (sel) {
+      const m = String(sel.room || '').match(/^(\d{1,2})\d{2}$/)
+      const fl = m ? Math.max(1, Math.min(totalFloors, Number(m[1]))) : (compactResFloors.value[0]?.floor || 1)
+      const tone = sel.hazard ? 'hazard' : sel.careTags?.length ? 'care' : 'normal'
+      const label = sel.hazard ? '存在隐患' : sel.careTags?.length ? sel.careTags[0] : `${sel.room}室`
+      return { floor: fl, totalFloors, tone, label }
+    }
+    const first = compactResFloors.value[0]
+    if (first) {
+      const info = floorRowTone(first)
+      return { floor: first.floor, totalFloors, ...info }
+    }
+  } else if (d.mode === 'commercial-full' || d.mode === 'commercial-lite') {
+    const list = d.mode === 'commercial-full' ? (d.profile?.floors || []) : (d.generatedFloors || [])
+    const target = list.find((f) => f.safety && f.safety !== '达标') || list[0]
+    if (target) {
+      const fl = Math.min(totalFloors, parseFloorNumber(target.floor))
+      const warn = target.safety && target.safety !== '达标'
+      return {
+        floor: fl,
+        totalFloors,
+        tone: warn ? 'care' : 'normal',
+        label: String(target.company || '').slice(0, 8)
+      }
+    }
+  } else if (d.mode === 'district-full') {
+    return { floor: 1, totalFloors: Math.max(2, totalFloors), tone: 'care', label: '沿街底商' }
+  }
+  return null
+})
+
 watch(
   () => props.buildingDetail?.bldg?.index,
   () => {
+    hoveredFloorInfo.value = null
     showCreateForm.value = false
     inspectTitle.value = ''
     inspectDesc.value = ''
@@ -176,6 +238,14 @@ function submitInspection() {
   inspectDesc.value = ''
 }
 
+watch(
+  activeFloorPayload,
+  (val) => {
+    emit('focus-floor', val)
+  },
+  { immediate: true, deep: true }
+)
+
 const AID_ITEM_META = [
   { key: 'wheelchair', label: '便民轮椅', unit: '辆' },
   { key: 'crutch', label: '助行拐杖', unit: '副' },
@@ -183,6 +253,31 @@ const AID_ITEM_META = [
   { key: 'toolbox', label: '维修工具箱', unit: '套' },
   { key: 'umbrella', label: '便民爱心伞', unit: '把' }
 ]
+
+const staffIdentities = new Map([
+  ['male', { label: '男', portrait: malePortrait }],
+  ['female', { label: '女', portrait: femalePortrait }]
+])
+const staffIdentity = computed(() => {
+  const person = props.entityDetail
+  if (person?.entityType !== 'staff') return null
+  const live = props.liveTelemetry
+  const gender = live && live.id === person.id && live.gender !== undefined ? live.gender : person.gender
+  return staffIdentities.get(gender)
+})
+const staffLiveStatus = computed(() => props.liveTelemetry?.status || props.entityDetail?.status || '在岗巡查')
+const staffRoadText = computed(() => props.liveTelemetry?.roadLabel || props.entityDetail?.roadLabel || `${props.entityDetail?.community || ''}巡防路段`)
+const staffCoordText = computed(() => {
+  const lat = props.liveTelemetry?.lat ?? props.entityDetail?.lat
+  const lng = props.liveTelemetry?.lng ?? props.entityDetail?.lng
+  if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return ''
+  return `${Number(lat).toFixed(4)}°N, ${Number(lng).toFixed(4)}°E`
+})
+const staffToneClass = computed(() => {
+  if (staffLiveStatus.value === '滞留提醒') return 'is-alert'
+  if (staffLiveStatus.value === '在办处置') return 'is-busy'
+  return 'is-safe'
+})
 </script>
 
 <template>
@@ -260,8 +355,13 @@ const AID_ITEM_META = [
           <button v-else type="button" class="bp-action-pill" @click="drawerOpen = true">完整剖面 ›</button>
         </div>
 
-        <div class="bp-floor-grid">
-          <div v-for="row in compactResFloors" :key="row.floor" class="bp-floor-row">
+        <div class="bp-floor-grid" @mouseleave="hoveredFloorInfo = null">
+          <div
+            v-for="row in compactResFloors"
+            :key="row.floor"
+            class="bp-floor-row"
+            @mouseenter="hoveredFloorInfo = { floor: row.floor, totalFloors: buildingDetail.floorsCount, ...floorRowTone(row) }"
+          >
             <span class="bp-fl-no num">{{ row.floor }}层</span>
             <div class="bp-room-pair">
               <button
@@ -307,12 +407,13 @@ const AID_ITEM_META = [
           <span class="bp-sec-label">楼宇企业分层台账</span>
           <span class="bp-sec-note num">{{ buildingDetail.revenueLabel || '重点税源楼' }}</span>
         </div>
-        <div class="bp-biz-list">
+        <div class="bp-biz-list" @mouseleave="hoveredFloorInfo = null">
           <div
             v-for="(fl, idx) in (buildingDetail.mode === 'commercial-full' ? buildingDetail.profile.floors : buildingDetail.generatedFloors).slice(0, 5)"
             :key="fl.floor + idx"
             class="bp-biz-item"
             :class="{ warn: fl.safety && fl.safety !== '达标' }"
+            @mouseenter="hoveredFloorInfo = { floor: Math.min(buildingDetail.floorsCount, parseFloorNumber(fl.floor)), totalFloors: buildingDetail.floorsCount, tone: fl.safety && fl.safety !== '达标' ? 'care' : 'normal', label: String(fl.company || '').slice(0, 8) }"
           >
             <div class="bp-biz-top">
               <strong class="num">{{ fl.floor }}</strong>
@@ -458,14 +559,21 @@ const AID_ITEM_META = [
   <!-- 情形二：3D 治理实体点位调度卡（在岗网格员 / 共享辅助站 / 易涝防火点） -->
   <div v-else-if="entityDetail" class="bp-wrap">
     <div class="bp-head">
+      <span v-if="entityDetail.entityType === 'staff'" class="bp-staff-portrait" aria-hidden="true">
+        <img v-if="staffIdentity" :src="staffIdentity.portrait" alt="" />
+        <Users v-else :size="18" />
+      </span>
       <div class="bp-head-text">
-        <span class="bp-title">{{ entityDetail.name }}</span>
+        <span class="bp-title">
+          {{ entityDetail.name }}<small v-if="staffIdentity" class="bp-staff-gender" :aria-label="'登记性别' + staffIdentity.label">{{ staffIdentity.label }}</small>
+        </span>
         <span class="bp-sub">
           {{ entityDetail.entityType === 'staff' ? `${entityDetail.community} · ${entityDetail.grid}` : entityDetail.entityType === 'aid' ? entityDetail.address : `${entityDetail.community} · ${entityDetail.level}` }}
         </span>
       </div>
-      <button type="button" class="bp-icon-btn" title="返回综合闭环看板" aria-label="返回综合闭环看板" @click="emit('close')">
-        <X :size="14" />
+      <button type="button" class="bp-icon-btn" :title="staffFromDirectory ? '返回网格员名录' : '关闭详情'"
+        :aria-label="staffFromDirectory ? '返回网格员名录' : '关闭详情'" @click="emit('close')">
+        <component :is="staffFromDirectory ? ChevronLeft : X" :size="14" />
       </button>
     </div>
 
@@ -473,9 +581,9 @@ const AID_ITEM_META = [
     <template v-if="entityDetail.entityType === 'staff'">
       <section class="bp-sec">
         <div class="bp-trio-strip">
-          <div class="bp-trio-cell is-safe">
+          <div class="bp-trio-cell" :class="staffToneClass">
             <span>执勤状态</span>
-            <strong><i class="bp-live-dot"></i>{{ entityDetail.status }}</strong>
+            <strong><i class="bp-live-dot"></i>{{ staffLiveStatus }}</strong>
           </div>
           <div class="bp-trio-cell">
             <span>今日巡查</span>
@@ -486,12 +594,21 @@ const AID_ITEM_META = [
             <strong class="num">{{ entityDetail.mustPoints }}</strong>
           </div>
         </div>
+
+        <div class="bp-live-loc-bar" :class="staffToneClass">
+          <div class="bp-loc-head">
+            <span class="bp-loc-badge"><i class="bp-live-dot"></i>实时定位</span>
+            <span v-if="staffCoordText" class="bp-loc-coord num">{{ staffCoordText }}</span>
+          </div>
+          <div class="bp-loc-road" :title="staffRoadText">{{ staffRoadText }}</div>
+        </div>
+
         <div class="bp-owner-bar">
           <span class="bp-owner-names"><Users :size="11" /> 社区网格长 {{ entityDetail.lead }}</span>
           <span class="bp-owner-tel num"><Phone :size="10" /> {{ entityDetail.phone }}</span>
         </div>
         <div class="bp-task-card">
-          <span class="bp-task-label">当前在办网格任务</span>
+          <span class="bp-task-label">{{ staffLiveStatus === '滞留提醒' ? `原地静止已达 ${entityDetail.stayMinutes || 35} 分钟` : '当前在办网格任务' }}</span>
           <p class="bp-desc">{{ entityDetail.task }}</p>
         </div>
       </section>
@@ -518,18 +635,41 @@ const AID_ITEM_META = [
         </div>
       </section>
 
-      <div class="bp-foot-actions">
-        <button type="button" class="ck-btn" :class="{ active: radiusActive }" @click="emit('toggle-radius')">
-          <Radio :size="12" /> {{ radiusActive ? '隐藏范围' : '300米覆盖' }}
-        </button>
-        <button
-          type="button"
-          class="ck-btn primary"
-          style="flex: 1.5"
-          @click="emit('dispatch-staff', { staff: entityDetail })"
-        >
-          <Send :size="12" /> 一键派发就近任务
-        </button>
+      <div class="bp-staff-foot">
+        <div class="bp-foot-actions is-staff-main">
+          <button type="button" class="ck-btn" @click="emit('view-staff-close', entityDetail)">
+            <MapPin :size="12" /> 查看近景
+          </button>
+          <button
+            v-if="canFollow"
+            type="button"
+            class="ck-btn"
+            :class="isFollowing ? 'active' : 'primary'"
+            @click="emit('toggle-follow', entityDetail)"
+          >
+            <Navigation :size="12" /> {{ isFollowing ? '退出低空跟拍' : '开启低空跟拍' }}
+          </button>
+        </div>
+        <div class="bp-foot-actions is-staff-sub">
+          <button
+            v-if="staffLiveStatus === '滞留提醒'"
+            type="button"
+            class="ck-btn bp-btn-alert"
+            @click="emit('supervise-staff', entityDetail)"
+          >
+            <Bell :size="12" /> 提醒督办
+          </button>
+          <button type="button" class="ck-btn" :class="{ active: radiusActive }" @click="emit('toggle-radius')">
+            <Radio :size="12" /> {{ radiusActive ? '隐藏300米圈' : '300米覆盖' }}
+          </button>
+          <button
+            type="button"
+            class="ck-btn"
+            @click="emit('dispatch-staff', { staff: entityDetail })"
+          >
+            <Send :size="12" /> 一键派单
+          </button>
+        </div>
       </div>
     </template>
 
@@ -884,6 +1024,30 @@ const AID_ITEM_META = [
   flex-direction: column;
   gap: 2px;
 }
+.bp-staff-portrait {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--ck-border);
+  border-radius: var(--r-control, 6px);
+  background: var(--ck-panel-solid);
+  color: var(--ck-muted);
+}
+.bp-staff-portrait img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.bp-staff-gender {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ck-muted);
+}
 .bp-title {
   font-size: 14.5px;
   font-weight: 720;
@@ -1123,12 +1287,103 @@ const AID_ITEM_META = [
   font-size: 12.5px;
   color: var(--ck-ok);
 }
+.bp-trio-cell.is-busy strong {
+  font-size: 12.5px;
+  color: var(--ck-run);
+}
+.bp-trio-cell.is-alert strong {
+  font-size: 12.5px;
+  color: var(--ck-danger);
+}
 .bp-live-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--ck-ok);
   flex-shrink: 0;
+}
+.bp-trio-cell.is-busy .bp-live-dot,
+.bp-live-loc-bar.is-busy .bp-live-dot {
+  background: var(--ck-run);
+}
+.bp-trio-cell.is-alert .bp-live-dot,
+.bp-live-loc-bar.is-alert .bp-live-dot {
+  background: var(--ck-danger);
+  animation: bpPulseDot 1.3s ease-in-out infinite;
+}
+@keyframes bpPulseDot {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.45); opacity: 0.55; }
+}
+
+.bp-live-loc-bar {
+  padding: 6px 8px;
+  border-radius: var(--r-xs);
+  border: var(--hair) solid color-mix(in srgb, var(--ck-ok) 28%, var(--ck-line));
+  border-left: 2.5px solid var(--ck-ok);
+  background: color-mix(in srgb, var(--ck-ok) 6%, var(--ck-panel-solid));
+  display: grid;
+  gap: 3px;
+}
+.bp-live-loc-bar.is-busy {
+  border-color: color-mix(in srgb, var(--ck-run) 28%, var(--ck-line));
+  border-left-color: var(--ck-run);
+  background: color-mix(in srgb, var(--ck-run) 6%, var(--ck-panel-solid));
+}
+.bp-live-loc-bar.is-alert {
+  border-color: color-mix(in srgb, var(--ck-danger) 36%, var(--ck-line));
+  border-left-color: var(--ck-danger);
+  background: color-mix(in srgb, var(--ck-danger) 7%, var(--ck-panel-solid));
+}
+.bp-loc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.bp-loc-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ck-muted);
+}
+.bp-loc-coord {
+  font-size: 10px;
+  color: var(--ck-faint);
+  white-space: nowrap;
+}
+.bp-loc-road {
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--ck-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bp-staff-foot {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: var(--hair) solid var(--ck-line);
+  display: grid;
+  gap: 6px;
+}
+.bp-foot-actions.is-staff-main,
+.bp-foot-actions.is-staff-sub {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.bp-btn-alert {
+  background: color-mix(in srgb, var(--ck-danger) 14%, transparent) !important;
+  border-color: color-mix(in srgb, var(--ck-danger) 48%, transparent) !important;
+  color: var(--ck-danger) !important;
+}
+.bp-btn-alert:hover {
+  background: var(--ck-danger) !important;
+  color: #ffffff !important;
 }
 
 /* ── 网格责任人信息条 ── */

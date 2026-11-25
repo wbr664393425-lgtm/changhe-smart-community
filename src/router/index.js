@@ -23,8 +23,23 @@ const router = createRouter({
 })
 
 router.beforeEach((to) => {
-  if (to.meta.public) return true
-  if (!store.loggedIn) return '/login'
+  if (to.meta.public) {
+    if (to.path === '/login' && store.loggedIn) {
+      const role = getCurrentRole()
+      const rawRedirect = typeof to.query?.redirect === 'string' ? to.query.redirect : ''
+      if (rawRedirect.startsWith('/') && role.allowedRoutes.includes(rawRedirect.split('?')[0])) {
+        return rawRedirect
+      }
+      return '/portal'
+    }
+    return true
+  }
+  if (!store.loggedIn) {
+    return {
+      path: '/login',
+      query: to.fullPath && to.fullPath !== '/' ? { redirect: to.fullPath } : undefined
+    }
+  }
   const role = getCurrentRole()
   if (!role.allowedRoutes.includes(to.path)) {
     addAuditLog(`越权访问路由「${to.path}」被系统路由守卫拦截`, '越权拦截')

@@ -1,20 +1,22 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
-import { ArrowUpDown, Download, Search, RotateCcw, SlidersHorizontal, X } from 'lucide-vue-next'
+import { ArrowUpDown, Download, Search, RotateCcw, SlidersHorizontal, Eye, EyeOff, X } from 'lucide-vue-next'
 import NativeDrawer from './NativeDrawer.vue'
 import AppSelect from './AppSelect.vue'
 import { exportRealCsv } from '../utils/exportFile'
-import { addAuditLog, showToast } from '../store/appStore'
+import { isSensitiveCollisionQuery } from '../utils/validators'
+import { getCurrentRole, addAuditLog, showToast } from '../store/appStore'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
   title: { type: String, default: '指标授权明细下钻' },
   subtitle: { type: String, default: '' },
   summaryText: { type: String, default: '' },
-  columns: { type: Array, default: () => [] }, // [{ key, label, numeric?, align?, badgeMap? }]
+  columns: { type: Array, default: () => [] }, // [{ key, label, numeric?, align?, badgeMap?, rawKey? }]
   rows: { type: Array, default: () => [] },
   filters: { type: Array, default: () => [] }, // [{ key, label, type?: 'select'|'chips', allLabel?, options?, defaultValue? }]
-  exportName: { type: String, default: '长河街道指标明细下钻' }
+  exportName: { type: String, default: '长河街道指标明细下钻' },
+  sensitiveName: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['close'])
@@ -26,6 +28,29 @@ const page = ref(1)
 const pageSize = ref(10)
 const filterValues = ref({})
 const selectedRow = ref(null)
+const revealNames = ref(false)
+
+const canRevealSensitive = computed(() => {
+  const hasRawCol = props.sensitiveName || (props.columns || []).some((c) => Boolean(c.rawKey))
+  return hasRawCol && Boolean(getCurrentRole()?.canViewSensitiveSpecial)
+})
+
+function cellText(row, col) {
+  if (!row || !col) return ''
+  if (revealNames.value && col.rawKey && row[col.rawKey] !== undefined) {
+    return row[col.rawKey]
+  }
+  return row[col.key]
+}
+
+function toggleRevealNames() {
+  if (!canRevealSensitive.value) return
+  revealNames.value = !revealNames.value
+  if (revealNames.value) {
+    addAuditLog(`授权核验解锁「${props.title}」完整实名信息`, '敏感脱敏解锁')
+    showToast('已按当前授权岗位临时显示实名，操作已写入信创审计日志')
+  }
+}
 
 const PAGE_SIZE_OPTIONS = [
   { value: 10, label: '10 条/页' },
@@ -67,6 +92,7 @@ watch(
       sortAsc.value = false
       page.value = 1
       selectedRow.value = null
+      revealNames.value = false
       initFilters()
     }
   },
@@ -97,6 +123,7 @@ function setFilterValue(key, val) {
 
 const filteredRows = computed(() => {
   const q = keyword.value.trim()
+  if (q && isSensitiveCollisionQuery(q)) return []
   let list = props.rows.filter((r) => {
     for (const [k, val] of Object.entries(filterValues.value)) {
       if (val !== '' && val !== undefined && val !== null && String(r[k] ?? '') !== String(val)) {
@@ -104,7 +131,7 @@ const filteredRows = computed(() => {
       }
     }
     if (!q) return true
-    const matchCols = props.columns.some((c) => String(r[c.key] ?? '').includes(q))
+    const matchCols = props.columns.some((c) => String(cellText(r, c) ?? '').includes(q))
     if (matchCols) return true
     return r.remark ? String(r.remark).includes(q) : false
   })
@@ -175,9 +202,9 @@ function handleExport() {
   exportRealCsv(
     props.exportName,
     props.columns.map((c) => c.label),
-    filteredRows.value.map((r) => props.columns.map((c) => r[c.key] ?? ''))
+    filteredRows.value.map((r) => props.columns.map((c) => cellText(r, c) ?? ''))
   )
-  addAuditLog(`导出下钻明细「${props.title}」（${filteredRows.value.length} 条）`, '授权导出')
+  addAuditLog(`导出下钻明细「${props.title}」（${filteredRows.value.length} 条${revealNames.value ? '·含授权显名' : '·脱敏态'}）`, '授权导出')
   showToast(`已按当前授权与筛选条件导出 ${filteredRows.value.length.toLocaleString()} 条明细`)
 }
 </script>
@@ -205,6 +232,16 @@ function handleExport() {
       </div>
 
       <div class="dd-actions">
+        <button
+          v-if="canRevealSensitive"
+          type="button"
+          class="btn sm"
+          @click="toggleRevealNames"
+        >
+          <EyeOff v-if="revealNames" :size="13" />
+          <Eye v-else :size="13" />
+          <span>{{ revealNames ? '恢复脱敏' : '授权显名核验' }}</span>
+        </button>
         <button
           v-if="hasActiveFilters"
           type="button"
@@ -267,7 +304,7 @@ function handleExport() {
     <!-- 选中行档案速览卡片 -->
     <div v-if="selectedRow" class="dd-detail-card">
       <div class="dd-detail-head">
-        <strong>档案详情速览 · {{ selectedRow[columns[0]?.key] }}</strong>
+        <strong>档案详情速览 · {{ cellText(selectedRow, columns[0]) }}</strong>
         <button type="button" class="dd-detail-close" aria-label="收起详情" @click="selectedRow = null">
           <X :size="14" />
         </button>
@@ -275,7 +312,7 @@ function handleExport() {
       <div class="dd-detail-grid">
         <div v-for="col in columns" :key="col.key" class="dd-detail-cell">
           <span>{{ col.label }}</span>
-          <strong :class="{ num: col.numeric }">{{ selectedRow[col.key] ?? '—' }}</strong>
+          <strong :class="{ num: col.numeric }">{{ cellText(selectedRow, col) ?? '—' }}</strong>
         </div>
       </div>
       <p v-if="selectedRow.remark" class="dd-detail-remark">{{ selectedRow.remark }}</p>
@@ -305,12 +342,12 @@ function handleExport() {
               @click="toggleRowDetail(row)"
             >
               <template v-for="(col, cIdx) in columns" :key="col.key">
-                <th v-if="cIdx === 0" scope="row">{{ row[col.key] }}</th>
+                <th v-if="cIdx === 0" scope="row">{{ cellText(row, col) }}</th>
                 <td v-else :class="{ num: col.numeric }">
-                  <span v-if="col.badgeMap" class="tag" :class="getBadgeClass(col, row[col.key])">
-                    {{ row[col.key] }}
+                  <span v-if="col.badgeMap" class="tag" :class="getBadgeClass(col, cellText(row, col))">
+                    {{ cellText(row, col) }}
                   </span>
-                  <template v-else>{{ row[col.key] }}</template>
+                  <template v-else>{{ cellText(row, col) }}</template>
                 </td>
               </template>
             </tr>

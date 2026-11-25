@@ -1,9 +1,18 @@
 import { reactive, ref, watch } from 'vue'
-import { buildScenePhoto, isLegacySvgPhoto } from '../utils/sampleImages'
+import { buildScenePhoto, isLegacySvgPhoto, isBuiltInScenePhoto } from '../utils/sampleImages'
 import { evaluateFormula } from '../utils/validators'
 import { CHANGHE_COMMUNITY_GEO } from '../utils/changheGeo'
 
 const STORAGE_KEY = 'changhe-smart-community-v3'
+const SESSION_AUTH_KEY = 'changhe-auth-session-v3'
+
+function hasSessionAuth() {
+  try {
+    return typeof sessionStorage !== 'undefined' && sessionStorage.getItem(SESSION_AUTH_KEY) === '1'
+  } catch {
+    return false
+  }
+}
 
 export function nowStr() {
   const d = new Date()
@@ -13,7 +22,7 @@ export function nowStr() {
 
 export const PRESETS = [
   { id: 'vermilion-seal', label: '宣瓷墨印', sw1: '#b81c28', sw2: '#b58d42' },
-  { id: 'cloud-portal', label: '移动云智', sw1: '#1464e6', sw2: '#3b9ef8' },
+  { id: 'cloud-portal', label: '晴蓝云智', sw1: '#1464e6', sw2: '#3b9ef8' },
   { id: 'pearl-glass', label: '珍珠玻璃', sw1: '#236de9', sw2: '#82dd2d' },
   { id: 'civic-trust', label: '政务端庄', sw1: '#1a56b8', sw2: '#17703a' },
   { id: 'jade-emerald', label: '翠松玉青', sw1: '#0f766e', sw2: '#f59e0b' },
@@ -683,16 +692,16 @@ export function createInitialState() {
       mustPointsDone: 5,
       mustPointsTotal: 8,
       stayMinutes: 42,
-      stayPlace: '堤口南路某棋牌茶室周边（连续静止 42 分钟）',
-      stayCoord: [37.4481, 116.3436],
+      stayPlace: '三八东路沿街某棋牌茶室周边（连续静止 42 分钟）',
+      stayCoord: [37.4496, 116.3424],
       superviseStatus: '待督办',
       superviseNote: '',
       staffReply: '',
       track: [
-        { lat: 37.4502, lng: 116.3404, time: '08:35', note: '堤口社区服务站签到出发', isCheckpoint: true },
-        { lat: 37.4494, lng: 116.3422, time: '09:10', note: '堤口东路九小商铺巡检', isCheckpoint: true },
-        { lat: 37.4481, lng: 116.3436, time: '10:12', note: '原地静止滞留起点（至 10:54 共 42 分钟）', isCheckpoint: false, isStayAnomaly: true },
-        { lat: 37.4475, lng: 116.3418, time: '11:15', note: '恢复移动至岔河东大道低洼点', isCheckpoint: true }
+        { lat: 37.4508, lng: 116.3402, time: '08:35', note: '堤口社区服务站签到出发', isCheckpoint: true },
+        { lat: 37.4503, lng: 116.3418, time: '09:10', note: '堤口东路九小商铺巡检', isCheckpoint: true },
+        { lat: 37.4496, lng: 116.3424, time: '10:12', note: '原地静止滞留起点（至 10:54 共 42 分钟）', isCheckpoint: false, isStayAnomaly: true },
+        { lat: 37.4494, lng: 116.3396, time: '11:15', note: '恢复移动至三八东路沿街点位', isCheckpoint: true }
       ]
     },
     {
@@ -1286,7 +1295,7 @@ export function createInitialState() {
   }
 
   return {
-    loggedIn: true,
+    loggedIn: hasSessionAuth(),
     preset: 'vermilion-seal',
     sidebarCollapsed: false,
     roleId: 'street_admin',
@@ -1395,13 +1404,13 @@ function loadState() {
             }
           }
         }
-        // 自动升级旧缓存中的内联 SVG 示意占位图为本地高清纪实实景照片
+        // 自动升级旧缓存内联占位图及刷新内置实景照片映射（避免旧版地址误判缓存残留）
         parsed.events = parsed.events.map((ev) => ({
           ...ev,
-          beforePhoto: isLegacySvgPhoto(ev.beforePhoto)
+          beforePhoto: isBuiltInScenePhoto(ev.beforePhoto)
             ? buildScenePhoto({ scene: 'before', title: ev.title, location: ev.address || ev.community })
             : ev.beforePhoto,
-          afterPhoto: isLegacySvgPhoto(ev.afterPhoto)
+          afterPhoto: ev.afterPhoto && isBuiltInScenePhoto(ev.afterPhoto)
             ? buildScenePhoto({ scene: 'after', title: ev.title, location: ev.address || ev.community })
             : ev.afterPhoto
         }))
@@ -1432,6 +1441,7 @@ function loadState() {
             }
           })
         }
+        parsed.loggedIn = hasSessionAuth()
         return syncCanonicalMetrics(parsed)
       }
     }
@@ -1447,30 +1457,14 @@ let toastTimer = null
 let switchFallbackTimer = null
 let activeViewTransition = null
 
-export function applyPreset(id, event) {
-  const valid = PRESETS.some((p) => p.id === id) ? id : 'vermilion-seal'
+export function runThemeViewTransition(commit, event) {
   const root = document.documentElement
-  const prev = root.dataset.preset
-
-  const commit = () => {
-    store.preset = valid
-    root.dataset.preset = valid
-    root.dataset.contrast = 'aa'
-    if (valid === 'command-dark') {
-      store.cockpitTheme = 'dark'
-    } else if (prev === 'command-dark') {
-      store.cockpitTheme = 'light'
-    }
-  }
-
-  // 初始化或重复点击当前主题、或用户开启减少动态效果：直接切换
   const reducedMotion = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-  if (!prev || prev === valid || !event || reducedMotion) {
+  if (!event || reducedMotion) {
     commit()
     return
   }
 
-  // 现代浏览器：使用 View Transitions API 从点击坐标做 60fps 径向涟漪平滑扩散
   if (typeof document.startViewTransition === 'function') {
     const rect = event.currentTarget?.getBoundingClientRect?.()
     const x = typeof event.clientX === 'number' && event.clientX > 0
@@ -1532,6 +1526,30 @@ export function applyPreset(id, event) {
   }, 340)
 }
 
+export function applyPreset(id, event) {
+  const valid = PRESETS.some((p) => p.id === id) ? id : 'vermilion-seal'
+  const root = document.documentElement
+  const prev = root.dataset.preset
+
+  const commit = () => {
+    store.preset = valid
+    root.dataset.preset = valid
+    root.dataset.contrast = 'aa'
+    if (valid === 'command-dark') {
+      store.cockpitTheme = 'dark'
+    } else if (prev === 'command-dark') {
+      store.cockpitTheme = 'light'
+    }
+  }
+
+  if (!prev || prev === valid || !event) {
+    commit()
+    return
+  }
+
+  runThemeViewTransition(commit, event)
+}
+
 export const toastMessage = ref('')
 
 export function showToast(msg) {
@@ -1579,10 +1597,12 @@ export function switchRole(roleId) {
 }
 
 export function resetDemoData() {
+  const keepLogin = store.loggedIn
   const fresh = createInitialState()
   Object.keys(fresh).forEach((k) => {
     store[k] = fresh[k]
   })
+  store.loggedIn = keepLogin
   localStorage.removeItem(STORAGE_KEY)
   showToast('业务数据已恢复至初始基准状态')
 }
@@ -1614,12 +1634,26 @@ function flushStorePersist() {
     persistIdleId = null
   }
   try {
-    const copy = { ...store, toastMessage: '' }
+    const copy = { ...store, loggedIn: false, toastMessage: '' }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(copy))
   } catch {
     // ignore storage quota error
   }
 }
+
+watch(
+  () => store.loggedIn,
+  (val) => {
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        if (val) sessionStorage.setItem(SESSION_AUTH_KEY, '1')
+        else sessionStorage.removeItem(SESSION_AUTH_KEY)
+      }
+    } catch {
+      // ignore storage restriction
+    }
+  }
+)
 
 function scheduleStorePersist() {
   persistDirty = true
@@ -1648,3 +1682,17 @@ watch(
   },
   { deep: true }
 )
+
+let pendingCockpitLoginHandoff = false
+
+/** 标记由登录页无缝转场进入驾驶舱（仅内存一次性状态，不写入本地存储） */
+export function markCockpitLoginHandoff() {
+  pendingCockpitLoginHandoff = true
+}
+
+/** 消费登录页至驾驶舱的一次性无缝承接标记 */
+export function consumeCockpitLoginHandoff() {
+  const active = pendingCockpitLoginHandoff
+  pendingCockpitLoginHandoff = false
+  return active
+}

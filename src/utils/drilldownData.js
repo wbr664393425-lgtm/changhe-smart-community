@@ -384,8 +384,10 @@ export function buildElderlyDrill(communities, scope, initialCommunity = '') {
       const health = pick(healthList, seed + 2)
       const gridIdx = i % c.grids
       const staff = c.name === '德馨社区' && gridIdx === 0 ? '李敏' : makeName(cIdx * 53 + gridIdx * 17 + 11)
+      const rawName = makeName(seed + 800)
       rows.push({
-        name: makeName(seed + 800),
+        rawName,
+        name: maskValue('name_masked', rawName),
         community: c.name,
         ageBand,
         living,
@@ -400,9 +402,10 @@ export function buildElderlyDrill(communities, scope, initialCommunity = '') {
 
   return {
     title: '60岁以上重点关爱长者建档名册',
-    subtitle: `口径范围：${scope} · 辖区 60 岁以上长者共 ${totalElderly.toLocaleString()} 人`,
+    subtitle: `口径范围：${scope} · 辖区 60 岁以上长者共 ${totalElderly.toLocaleString()} 人（姓名与电话默认脱敏）`,
     summary: `已纳入社区重点入户关爱建档 ${rows.length} 人（80岁以上高龄 ${rows.filter((r) => r.ageBand === '80岁以上高龄').length} 人）`,
     exportName: '数据智库_重点关爱长者名册',
+    sensitiveName: true,
     filters: [
       ...communityFilterConfig(communities, initialCommunity),
       { key: 'ageBand', label: '年龄段', type: 'chips', allLabel: '全部年龄', options: ageGroups },
@@ -410,7 +413,7 @@ export function buildElderlyDrill(communities, scope, initialCommunity = '') {
       { key: 'health', label: '健康随访', allLabel: '全部状态', options: ['生活自理', '慢性病随访', '半失能需帮扶'] }
     ],
     columns: [
-      { key: 'name', label: '姓名' },
+      { key: 'name', label: '姓名', rawKey: 'rawName' },
       { key: 'community', label: '所属社区' },
       { key: 'ageBand', label: '年龄段' },
       { key: 'living', label: '居住状况' },
@@ -430,48 +433,101 @@ export function buildElderlyDrill(communities, scope, initialCommunity = '') {
 // 7. 特殊人群分类建档名册（用于数据中枢 / 驾驶舱：独居高龄 / 低保特困 / 持证残障 / 重点优抚）
 export function buildSpecialGroupDrill(communities, scope, initialCategory = '', initialCommunity = '') {
   const categories = [
-    { key: 'elderAlone', label: '独居高龄', measure: '每周网格员入户探访 + 助餐对接' },
-    { key: 'lowIncome', label: '低保特困', measure: '按月低保核查 + 临时救助绿色通道' },
-    { key: 'disabled', label: '持证残障', measure: '康复辅具适配 + 无障碍改造随访' },
-    { key: 'veteran', label: '重点优抚', measure: '退役军人服务站建档 + 节日走访慰问' }
+    {
+      key: 'elderAlone',
+      label: '独居高龄',
+      measures: [
+        '每周2次入户探访 + 孝善助餐送餐对接',
+        '安装独立联网烟感 + 每日语音平安问候',
+        '家庭医生慢病随访 + 居家适老化防滑改造',
+        '邻里党员结对包保 + 紧急呼叫器24小时响应',
+        '社区助浴理发上门 + 冬季取暖用电安全巡检'
+      ]
+    },
+    {
+      key: 'lowIncome',
+      label: '低保特困',
+      measures: [
+        '按月低保动态核查 + 城乡医疗救助一站结算',
+        '临时急难救助绿色通道 + 慈善暖冬物资发放',
+        '水电暖燃气费用减免对接 + 公益性岗位优先安置',
+        '重病大额自付监测预警 + 社区干部包保定期回访'
+      ]
+    },
+    {
+      key: 'disabled',
+      label: '持证残障',
+      measures: [
+        '康复辅具免费适配 + 家庭无障碍坡道扶手改造',
+        '重度残障护理补贴按月发放 + 上门康复指导',
+        '如康家园日间照料托养 + 辅助性就业对接',
+        '换证上门评残代办 + 网格员半月随访跟踪'
+      ]
+    },
+    {
+      key: 'veteran',
+      label: '重点优抚',
+      measures: [
+        '退役军人服务站建档立卡 + 八一春节走访慰问',
+        '优抚抚恤金按月足额发放 + 崇军医院优诊绿通',
+        '老兵志愿结对联谊 + 困难优抚对象专项帮扶',
+        '光荣牌悬挂维护 + 常态化联系卡一对一包保'
+      ]
+    }
   ]
   const levels = ['一级重点关爱', '二级常态随访', '二级常态随访']
-  const rows = []
+  const buckets = []
 
   communities.forEach((c, cIdx) => {
     categories.forEach((cat, kIdx) => {
       const count = c.special[cat.key] || 0
+      const list = []
       for (let i = 0; i < count; i++) {
         const seed = cIdx * 97 + kIdx * 41 + i * 13 + 7
         const gridIdx = i % c.grids
         const staff = c.name === '德馨社区' && gridIdx === 0 ? '李敏' : makeName(cIdx * 53 + gridIdx * 17 + 11)
-        rows.push({
-          name: makeName(seed + 1200),
+        const rawName = makeName(seed + 1200)
+        const measure = pick(cat.measures, seed + i * 3)
+        list.push({
+          rawName,
+          name: maskValue('name_masked', rawName),
           community: c.name,
           category: cat.label,
           level: pick(levels, seed),
           grid: `第${GRID_NUMS[gridIdx] || 1}网格`,
           staff,
-          measure: cat.measure,
+          measure,
           phone: makePhone(seed + 1201),
-          remark: `${c.name}${cat.label}重点服务对象，落实“${cat.measure}”。`
+          remark: `${c.name}${cat.label}重点服务对象，落实“${measure}”。`
         })
       }
+      if (list.length) buckets.push(list)
     })
   })
 
+  // 轮询交错各社区与四类关怀记录，确保首屏即呈现多样化社区、人群类别与差异化帮扶举措（总数 100% 守恒）
+  const rows = []
+  let maxLen = 0
+  buckets.forEach((b) => { if (b.length > maxLen) maxLen = b.length })
+  for (let i = 0; i < maxLen; i++) {
+    for (let b = 0; b < buckets.length; b++) {
+      if (i < buckets[b].length) rows.push(buckets[b][i])
+    }
+  }
+
   return {
     title: '特殊人群重点关爱建档名册',
-    subtitle: `口径范围：${scope} · 仅限授权岗位核查使用`,
+    subtitle: `口径范围：${scope} · 姓名与联系方式默认脱敏展示，仅限授权岗位核验`,
     summary: `当前范围建档重点关怀对象合计 ${rows.length.toLocaleString()} 人（独居高龄/低保特困/持证残障/重点优抚）`,
     exportName: '长河街道_特殊人群建档名册',
+    sensitiveName: true,
     filters: [
       ...communityFilterConfig(communities, initialCommunity),
       { key: 'category', label: '人群分类', type: 'chips', allLabel: '全部分类', options: categories.map((x) => x.label), defaultValue: initialCategory || '' },
       { key: 'level', label: '关爱等级', allLabel: '全部等级', options: ['一级重点关爱', '二级常态随访'] }
     ],
     columns: [
-      { key: 'name', label: '姓名' },
+      { key: 'name', label: '姓名', rawKey: 'rawName' },
       { key: 'community', label: '所属社区' },
       {
         key: 'category',

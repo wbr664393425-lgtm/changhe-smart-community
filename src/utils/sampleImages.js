@@ -26,16 +26,18 @@ const BASE_PHOTOS = {
   edu1: p('armed-edu-1.webp')
 }
 
-function pickEventPair(text) {
-  const s = String(text || '')
+function matchRule(s) {
   if (/燃气|后厨|面馆|餐饮|油烟|早餐|食品|药房|冷链|超市|商铺.*排查/.test(s)) {
     return [BASE_PHOTOS.kitchenBefore, BASE_PHOTOS.kitchenAfter]
   }
   if (/裸土|防尘网|工地|扬尘|秸秆/.test(s)) {
     return [BASE_PHOTOS.dustBefore, BASE_PHOTOS.dustAfter]
   }
-  if (/雨水|箅子|淤堵|漂浮物|支渠|排灌|河|排水|积水|易涝/.test(s)) {
+  if (/雨水|箅子|淤堵|漂浮物|支渠|排灌|河道|河湖|河岸|水渠|排水沟|积水|易涝/.test(s)) {
     return [BASE_PHOTOS.drainBefore, BASE_PHOTOS.drainAfter]
+  }
+  if (/消防通道|楼道.*堆|连廊|疏散通道|电动车入户|消防栓|灭火器|配电箱/.test(s)) {
+    return [BASE_PHOTOS.fireBefore, BASE_PHOTOS.fireAfter]
   }
   if (/充电棚|照明|非机动车|路灯|停车|门禁|电梯|车库|健身器材/.test(s)) {
     return [BASE_PHOTOS.parkingBefore, BASE_PHOTOS.parkingAfter]
@@ -43,10 +45,22 @@ function pickEventPair(text) {
   if (/林地|林缘|枯枝|杂草|绿化|防火隐患/.test(s)) {
     return [BASE_PHOTOS.forestBefore, BASE_PHOTOS.forestAfter]
   }
-  if (/盲道|占道|堆放建材|摊点|扰民|噪声|纠纷|调解|扶手/.test(s)) {
-    return [BASE_PHOTOS.fireBefore, BASE_PHOTOS.sidewalkAfter]
+  if (/装修|噪声|扰民|渗水|纠纷|调解|扶手/.test(s)) {
+    return [BASE_PHOTOS.visit2, BASE_PHOTOS.visit1]
   }
-  return [BASE_PHOTOS.fireBefore, BASE_PHOTOS.fireAfter]
+  if (/盲道|占道|堆放建材|摊点/.test(s)) {
+    return [BASE_PHOTOS.parkingBefore, BASE_PHOTOS.sidewalkAfter]
+  }
+  return null
+}
+
+function pickEventPair(title, location) {
+  // 优先按事件标题精准匹配，避免楼盘名/道路名（如“云河赋”“长河大道”“岔河路”）触发水系误判
+  return (
+    matchRule(String(title || '')) ||
+    matchRule(`${title || ''} ${location || ''}`) ||
+    [BASE_PHOTOS.fireBefore, BASE_PHOTOS.fireAfter]
+  )
 }
 
 export function buildScenePhoto({
@@ -74,10 +88,15 @@ export function buildScenePhoto({
     return BASE_PHOTOS.edu1
   }
 
-  const [beforeImg, afterImg] = pickEventPair(text)
+  const [beforeImg, afterImg] = pickEventPair(title, location)
   return scene === 'after' ? afterImg : beforeImg
 }
 
 export function isLegacySvgPhoto(url) {
   return typeof url === 'string' && url.startsWith('data:image/svg+xml')
+}
+
+export function isBuiltInScenePhoto(url) {
+  if (isLegacySvgPhoto(url)) return true
+  return typeof url === 'string' && /(?:^|\/)photos\/[a-z0-9-]+\.webp$/i.test(url)
 }

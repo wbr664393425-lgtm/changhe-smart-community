@@ -1,8 +1,12 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import BrandLogo from './BrandLogo.vue'
-import { CHANGHE_OUTER_BOUNDARY, CHANGHE_COMMUNITY_GEO } from '../utils/changheGeo'
-import { LOADER_HQ_LATLNG, LOADER_WATER_COORDS } from '../utils/cockpitLoaderGeo'
+import {
+  SVG_W,
+  SVG_H,
+  CHANGHE_GEO_SVG as geoSvg,
+  computeOuterPointAtRatio
+} from '../utils/changheGeoSvg'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -11,6 +15,7 @@ const props = defineProps({
   minCurtainMs: { type: Number, default: 2500 },
   holdMs: { type: Number, default: 400 },
   dark: { type: Boolean, default: false },
+  fromLogin: { type: Boolean, default: false },
   fallbackNotice: { type: String, default: '' }
 })
 
@@ -18,93 +23,9 @@ const emit = defineEmits(['reveal-ready'])
 
 const STAGES = ['地理底图', '三维楼宇', '水系图层', '光影预热']
 
-const SVG_W = 460
-const SVG_H = 312
-const PAD_X = 38
-const PAD_Y = 24
-const COS_LAT = Math.cos((37.4408 * Math.PI) / 180)
-
-// 一次性将长河街道真实经纬度轮廓、14 社区界线及真实岔河/长河水系等比投影至 SVG 视口（零大 JSON 与 Three.js 依赖）
-const geoSvg = (() => {
-  const toXY = ([lat, lng]) => [lng * COS_LAT, -lat]
-  const rawOuter = CHANGHE_OUTER_BOUNDARY.map(toXY)
-
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-  rawOuter.forEach(([x, y]) => {
-    if (x < minX) minX = x
-    if (x > maxX) maxX = x
-    if (y < minY) minY = y
-    if (y > maxY) maxY = y
-  })
-
-  const spanX = Math.max(1e-6, maxX - minX)
-  const spanY = Math.max(1e-6, maxY - minY)
-  const scale = Math.min((SVG_W - PAD_X * 2) / spanX, (SVG_H - PAD_Y * 2) / spanY)
-  const drawW = spanX * scale
-  const drawH = spanY * scale
-  const offX = (SVG_W - drawW) / 2
-  const offY = (SVG_H - drawH) / 2
-
-  const project = ([lat, lng]) => {
-    const [rx, ry] = toXY([lat, lng])
-    return [
-      Number((offX + (rx - minX) * scale).toFixed(2)),
-      Number((offY + (ry - minY) * scale).toFixed(2))
-    ]
-  }
-
-  const ptsToPath = (coords) => {
-    if (!coords?.length) return ''
-    const p = coords.map(project)
-    return `M ${p[0][0]} ${p[0][1]} ` + p.slice(1).map(([x, y]) => `L ${x} ${y}`).join(' ') + ' Z'
-  }
-
-  const waterPaths = LOADER_WATER_COORDS.map(ptsToPath)
-
-  const outerPts = CHANGHE_OUTER_BOUNDARY.map(project)
-  const closedOuter = [...outerPts, outerPts[0]]
-  const cumLens = [0]
-  let totalLen = 0
-  for (let i = 1; i < closedOuter.length; i++) {
-    const dx = closedOuter[i][0] - closedOuter[i - 1][0]
-    const dy = closedOuter[i][1] - closedOuter[i - 1][1]
-    totalLen += Math.hypot(dx, dy)
-    cumLens.push(totalLen)
-  }
-
-  const hqPt = project(LOADER_HQ_LATLNG)
-
-  // 将 14 社区按自西南向东北依次排序，随进度均匀优雅点亮
-  const commEntries = Object.entries(CHANGHE_COMMUNITY_GEO).map(([name, geo]) => {
-    const cPt = project(geo.center)
-    return {
-      name,
-      shortName: name.replace('社区', ''),
-      path: ptsToPath(geo.polygon),
-      cx: cPt[0],
-      cy: cPt[1],
-      orderScore: cPt[0] * 0.65 - cPt[1] * 0.85
-    }
-  })
-  commEntries.sort((a, b) => a.orderScore - b.orderScore)
-  const communities = commEntries.map((item, idx) => ({
-    ...item,
-    threshold: 8 + Math.round((idx / Math.max(1, commEntries.length - 1)) * 80)
-  }))
-
-  return {
-    outerPath: ptsToPath(CHANGHE_OUTER_BOUNDARY),
-    waterPaths,
-    closedOuter,
-    cumLens,
-    totalLen: Math.max(1, totalLen),
-    hqPt,
-    communities
-  }
-})()
-
 // ── 60fps 零 VDOM Diff 直驱引擎：高频属性由 rAF 直接写入 DOM/合成层，Vue 仅在整数百分比变化时更新 ──
-const displayPct = ref(props.visible ? 0 : 100)
+const startPct = props.fromLogin ? 2 : 0
+const displayPct = ref(props.visible ? startPct : 100)
 const waterLayerRef = ref(null)
 const outerGlowRef = ref(null)
 const outerTraceRef = ref(null)
@@ -113,37 +34,21 @@ const traceTipRef = ref(null)
 const meterFillRef = ref(null)
 const meterTipWrapRef = ref(null)
 
-let smoothVal = props.visible ? 0 : 100
+let smoothVal = props.visible ? startPct : 100
 let startTime = 0
 let lastTime = 0
 let rafId = null
 let holdTimer = null
 let emittedReady = false
 
-function computeTraceHead(pct) {
-  const ratio = pct / 100
-  const target = ratio * geoSvg.totalLen
-  const { closedOuter, cumLens } = geoSvg
-  if (ratio <= 0 || ratio >= 1) return { x: closedOuter[0][0], y: closedOuter[0][1] }
-  let idx = 1
-  while (idx < cumLens.length - 1 && cumLens[idx] < target) idx++
-  const segStart = cumLens[idx - 1]
-  const segLen = Math.max(1e-6, cumLens[idx] - segStart)
-  const t = Math.max(0, Math.min(1, (target - segStart) / segLen))
-  const p0 = closedOuter[idx - 1]
-  const p1 = closedOuter[idx]
-  return {
-    x: p0[0] + (p1[0] - p0[0]) * t,
-    y: p0[1] + (p1[1] - p0[1]) * t
-  }
-}
-
 function paintVisualFrame(pct) {
   const p = Math.max(0, Math.min(100, pct))
   const ratio = p / 100
   const outerOffset = (1000 * (1 - ratio)).toFixed(2)
   const innerOffset = (1000 * (1 - Math.max(0, (p - 3) / 97))).toFixed(2)
-  const waterOp = Math.max(0, Math.min(1, (p - 16) / 56)).toFixed(3)
+  const waterOp = props.fromLogin
+    ? (0.42 + 0.58 * Math.max(0, Math.min(1, (p - 4) / 68))).toFixed(3)
+    : Math.max(0, Math.min(1, (p - 16) / 56)).toFixed(3)
 
   if (outerGlowRef.value) outerGlowRef.value.style.strokeDashoffset = outerOffset
   if (outerTraceRef.value) outerTraceRef.value.style.strokeDashoffset = outerOffset
@@ -156,9 +61,9 @@ function paintVisualFrame(pct) {
   }
   if (traceTipRef.value) {
     if (p > 0.8 && p < 99.8) {
-      const head = computeTraceHead(p)
+      const head = computeOuterPointAtRatio(ratio)
       traceTipRef.value.style.opacity = '1'
-      traceTipRef.value.setAttribute('transform', `translate(${head.x.toFixed(2)}, ${head.y.toFixed(2)})`)
+      traceTipRef.value.style.transform = `translate3d(${head.x.toFixed(2)}px, ${head.y.toFixed(2)}px, 0)`
     } else {
       traceTipRef.value.style.opacity = '0'
     }
@@ -189,8 +94,9 @@ function tick(now) {
 
   // 恒流从容巡航曲线：按真实时间优雅推进，彻底避免因后台阶段停顿造成“走走停停”
   const minMs = Math.max(1200, props.minCurtainMs)
+  const basePct = props.fromLogin ? 2 : 0
   const cruiseRatio = Math.min(1, elapsed / (minMs * 0.94))
-  const cruisePct = 92 * (1 - Math.pow(1 - cruiseRatio, 1.55))
+  const cruisePct = basePct + (92 - basePct) * (1 - Math.pow(1 - cruiseRatio, 1.55))
 
   let desired
   if (!props.sceneReady) {
@@ -201,15 +107,18 @@ function tick(now) {
   } else {
     const minRatio = Math.min(1, elapsed / minMs)
     const easedEnd = 1 - Math.pow(1 - minRatio, 1.45)
-    desired = minRatio < 1 ? Math.max(cur, Math.min(99.4, easedEnd * 100)) : 100
+    desired = minRatio < 1 ? Math.max(cur, Math.min(99.4, basePct + (100 - basePct) * easedEnd)) : 100
   }
 
-  // 时间归一化指数阻尼 + 单帧最大步长限幅（防后台进度跳变产生视觉闪跳）
-  const k = props.sceneReady && elapsed >= minMs ? 0.0095 : 0.0052
+  // 时间归一化指数阻尼 + 连续加速收敛（取消 minMs 处的阶跃跳档）+ 单帧最大步长限幅
+  const finishBlend = props.sceneReady
+    ? Math.min(1, Math.max(0, (elapsed - minMs * 0.72) / (minMs * 0.28)))
+    : 0
+  const k = 0.0056 + finishBlend * 0.0044
   const alpha = 1 - Math.exp(-k * dt)
   const rawDelta = Math.max(0, desired - cur) * alpha
-  const minCruiseStep = props.sceneReady && elapsed >= minMs ? dt * 0.018 : 0
-  const maxStep = dt * (props.sceneReady && elapsed >= minMs ? 0.055 : 0.036)
+  const minCruiseStep = props.sceneReady ? dt * (0.006 + finishBlend * 0.014) : 0
+  const maxStep = dt * (0.038 + finishBlend * 0.022)
   const step = Math.min(maxStep, Math.max(rawDelta, desired > cur ? minCruiseStep : 0))
   smoothVal = Math.min(desired, cur + step)
 
@@ -254,8 +163,9 @@ onMounted(() => {
 watch(() => props.visible, (vis) => {
   if (vis) {
     emittedReady = false
-    smoothVal = 0
-    displayPct.value = 0
+    const resumePct = props.fromLogin ? 2 : 0
+    smoothVal = resumePct
+    displayPct.value = resumePct
     startTicker()
   } else {
     stopTicker()
@@ -293,7 +203,7 @@ function isCommFresh(comm) {
     <div
       v-if="visible"
       class="ck-loader-curtain"
-      :class="{ 'is-dark': dark, 'is-complete': isComplete }"
+      :class="{ 'is-dark': dark, 'is-complete': isComplete, 'is-from-login': fromLogin }"
       role="status"
       aria-live="polite"
       :aria-label="`驾驶舱资源加载中 ${displayPct}%`"
@@ -345,7 +255,6 @@ function isCommFresh(comm) {
               ref="waterLayerRef"
               class="ck-geo-water"
               clip-path="url(#ckLoaderOuterClip)"
-              style="opacity: 0"
             >
               <g v-once>
                 <path
@@ -381,7 +290,6 @@ function isCommFresh(comm) {
               pathLength="1000"
               class="ck-geo-outer-glow"
               stroke="url(#ckLoaderTraceGrad)"
-              style="stroke-dashoffset: 1000"
             />
             <path
               ref="outerTraceRef"
@@ -389,14 +297,12 @@ function isCommFresh(comm) {
               pathLength="1000"
               class="ck-geo-outer-trace"
               stroke="url(#ckLoaderTraceGrad)"
-              style="stroke-dashoffset: 1000"
             />
             <path
               ref="innerSilkRef"
               :d="geoSvg.outerPath"
               pathLength="1000"
               class="ck-geo-inner-silk"
-              style="stroke-dashoffset: 1000"
             />
 
             <!-- 14 社区中心脉络点与简称微水印（改用 CSS transform scale 替代 SVG 半径重排） -->
@@ -428,7 +334,7 @@ function isCommFresh(comm) {
             </g>
 
             <!-- 街道指挥中心印标（100% 时荡开细金涟漪） -->
-            <g class="ck-geo-hq" :class="{ 'is-lit': hqLit, 'is-complete': isComplete }">
+            <g class="ck-geo-hq" :class="{ 'is-from-login': fromLogin, 'is-lit': hqLit, 'is-complete': isComplete }">
               <circle v-if="isComplete" :cx="geoSvg.hqPt[0]" :cy="geoSvg.hqPt[1]" r="10" class="ck-geo-hq-ripple" />
               <circle :cx="geoSvg.hqPt[0]" :cy="geoSvg.hqPt[1]" r="10.5" class="ck-geo-hq-ring" />
               <circle :cx="geoSvg.hqPt[0]" :cy="geoSvg.hqPt[1]" r="4.2" class="ck-geo-hq-core" />
@@ -438,14 +344,13 @@ function isCommFresh(comm) {
             <g
               ref="traceTipRef"
               class="ck-geo-tip"
-              style="opacity: 0"
             >
               <circle r="7" class="ck-geo-tip-halo" />
               <circle r="2.6" class="ck-geo-tip-dot" />
             </g>
           </svg>
 
-          <div class="ck-map-meta num">
+          <div class="ck-map-meta num" :class="{ 'is-handoff-in': fromLogin }">
             <span>长河街道实景疆域</span>
             <i aria-hidden="true"></i>
             <span>已点亮 {{ litCommunitiesCount }}/14 社区</span>
@@ -455,7 +360,7 @@ function isCommFresh(comm) {
         </div>
 
         <!-- 品牌主标 -->
-        <div class="ck-loader-brand">
+        <div class="ck-loader-brand" :class="{ 'is-handoff-in': fromLogin }">
           <div class="ck-loader-logo">
             <BrandLogo :size="34" />
           </div>
@@ -469,7 +374,7 @@ function isCommFresh(comm) {
         </div>
 
         <!-- 高定细长光轨进度区 -->
-        <div class="ck-loader-meter">
+        <div class="ck-loader-meter" :class="{ 'is-handoff-in': fromLogin }">
           <div class="ck-meter-head">
             <span class="ck-meter-stage">
               <i class="ck-stage-pulse" aria-hidden="true"></i>
@@ -482,8 +387,8 @@ function isCommFresh(comm) {
             <span class="ck-track-tick" style="left: 25%"></span>
             <span class="ck-track-tick" style="left: 50%"></span>
             <span class="ck-track-tick" style="left: 75%"></span>
-            <div ref="meterFillRef" class="ck-meter-fill" style="transform: scaleX(0)"></div>
-            <div ref="meterTipWrapRef" class="ck-meter-tip-wrap" style="transform: translate3d(0%, 0, 0); opacity: 0" aria-hidden="true">
+            <div ref="meterFillRef" class="ck-meter-fill"></div>
+            <div ref="meterTipWrapRef" class="ck-meter-tip-wrap" aria-hidden="true">
               <i class="ck-meter-tip"></i>
             </div>
           </div>
@@ -512,19 +417,19 @@ function isCommFresh(comm) {
 <style scoped>
 .ck-loader-curtain {
   --ck-loader-bg: var(--ck-frame, #f3f0eb);
-  --ck-loader-bg-inner: color-mix(in srgb, var(--ck-panel-solid, #ffffff) 74%, var(--ck-frame, #f3f0eb));
+  --ck-loader-bg-inner: color-mix(in oklab, var(--ck-panel-solid, #ffffff) 74%, var(--ck-frame, #f3f0eb));
   --ck-loader-ink: var(--ck-ink, #1a1817);
   --ck-loader-muted: var(--ck-muted, #5c5652);
   --ck-loader-faint: var(--ck-faint, #8a837e);
   --ck-loader-line: var(--ck-line, rgba(36, 28, 24, 0.1));
   --ck-loader-stroke-a: var(--primary, #b81c28);
   --ck-loader-stroke-b: var(--ck-accent, var(--primary, #b81c28));
-  --ck-loader-stroke-c: color-mix(in srgb, var(--primary, #b81c28) 42%, #d8ae58);
+  --ck-loader-stroke-c: color-mix(in oklab, var(--primary, #b81c28) 42%, #d8ae58);
   --ck-loader-fill-core: var(--primary, #b81c28);
   --ck-loader-fill-edge: var(--ck-accent, #b58d42);
   --ck-loader-water-fill: rgba(45, 122, 134, 0.18);
   --ck-loader-water-stroke: rgba(45, 122, 134, 0.36);
-  --ck-loader-track: color-mix(in srgb, var(--ck-ink, #1a1817) 10%, transparent);
+  --ck-loader-track: color-mix(in oklab, var(--ck-ink, #1a1817) 10%, transparent);
 
   position: fixed;
   inset: 0;
@@ -541,7 +446,7 @@ function isCommFresh(comm) {
 
 .ck-loader-curtain.is-dark {
   --ck-loader-bg: var(--ck-frame, #0c0d11);
-  --ck-loader-bg-inner: color-mix(in srgb, var(--ck-panel-solid, #171820) 86%, var(--ck-frame, #0c0d11));
+  --ck-loader-bg-inner: color-mix(in oklab, var(--ck-panel-solid, #171820) 86%, var(--ck-frame, #0c0d11));
   --ck-loader-ink: var(--ck-ink, #f7f5f2);
   --ck-loader-muted: var(--ck-muted, #beb9b4);
   --ck-loader-faint: var(--ck-faint, #8c8784);
@@ -595,6 +500,7 @@ function isCommFresh(comm) {
   flex-direction: column;
   align-items: center;
   gap: 20px;
+  contain: layout style;
 }
 
 /* 中央疆域 SVG 区 */
@@ -624,7 +530,12 @@ function isCommFresh(comm) {
 }
 
 .ck-geo-water {
+  opacity: 0;
   will-change: opacity;
+}
+
+.ck-loader-curtain.is-from-login .ck-geo-water {
+  opacity: 0.42;
 }
 
 .ck-geo-water-poly {
@@ -685,8 +596,8 @@ function isCommFresh(comm) {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-dasharray: 1000;
+  stroke-dashoffset: 1000;
   opacity: 0.2;
-  transition: stroke-dashoffset 140ms linear;
 }
 
 .ck-geo-outer-trace {
@@ -695,7 +606,12 @@ function isCommFresh(comm) {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-dasharray: 1000;
-  transition: stroke-dashoffset 140ms linear;
+  stroke-dashoffset: 1000;
+}
+
+.ck-loader-curtain.is-from-login .ck-geo-outer-glow,
+.ck-loader-curtain.is-from-login .ck-geo-outer-trace {
+  stroke-dashoffset: 980;
 }
 
 .ck-geo-inner-silk {
@@ -705,8 +621,8 @@ function isCommFresh(comm) {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-dasharray: 1000;
+  stroke-dashoffset: 1000;
   opacity: 0.65;
-  transition: stroke-dashoffset 140ms linear;
 }
 
 .ck-geo-comm-dot {
@@ -759,6 +675,10 @@ function isCommFresh(comm) {
   transition: opacity 0.48s ease;
 }
 
+.ck-geo-hq.is-from-login:not(.is-lit) {
+  opacity: 0.45;
+}
+
 .ck-geo-hq.is-lit {
   opacity: 1;
 }
@@ -796,6 +716,7 @@ function isCommFresh(comm) {
 }
 
 .ck-geo-tip {
+  opacity: 0;
   will-change: transform, opacity;
 }
 
@@ -870,6 +791,7 @@ function isCommFresh(comm) {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  contain: layout style;
 }
 
 .ck-meter-head {
@@ -946,35 +868,26 @@ function isCommFresh(comm) {
   height: 100%;
   border-radius: 999px;
   transform-origin: left center;
+  transform: scaleX(0);
   will-change: transform;
   overflow: hidden;
-  transition: transform 160ms linear;
   background: linear-gradient(90deg, var(--ck-loader-stroke-a) 0%, var(--ck-loader-stroke-b) 68%, var(--ck-loader-stroke-c) 100%);
   box-shadow: 0 0 10px color-mix(in srgb, var(--ck-loader-stroke-a) 32%, transparent);
   z-index: 2;
 }
 
-.ck-meter-fill::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.55) 50%, transparent 100%);
-  transform: translate3d(-100%, 0, 0);
-  will-change: transform;
-  animation: ckMeterShimmer 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-}
-
-@keyframes ckMeterShimmer {
-  0% { transform: translate3d(-100%, 0, 0); }
-  100% { transform: translate3d(100%, 0, 0); }
+.ck-loader-curtain.is-from-login .ck-meter-fill {
+  transform: scaleX(0.02);
 }
 
 .ck-meter-tip-wrap {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  transform: translate3d(0%, 0, 0);
+  opacity: 0;
   will-change: transform, opacity;
-  transition: transform 160ms linear, opacity 0.2s ease;
+  transition: opacity 0.2s ease;
   z-index: 3;
 }
 
@@ -1033,6 +946,30 @@ function isCommFresh(comm) {
   background: var(--ck-loader-stroke-b);
 }
 
+/* 登录页承接进入驾驶舱时：背景、标尺与疆域 0ms 零跳动接棒，图注/标题/进度轨三段错峰柔浮 */
+.ck-map-meta.is-handoff-in {
+  animation: ckHandoffRise 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ck-loader-brand.is-handoff-in {
+  animation: ckHandoffRise 0.3s cubic-bezier(0.22, 1, 0.36, 1) 0.045s both;
+}
+
+.ck-loader-meter.is-handoff-in {
+  animation: ckHandoffRise 0.32s cubic-bezier(0.22, 1, 0.36, 1) 0.09s both;
+}
+
+@keyframes ckHandoffRise {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
 @media (max-width: 640px) {
   .ck-loader-frame { inset: 12px; }
   .ck-loader-titles h1 { font-size: 17px; gap: 6px; }
@@ -1045,12 +982,10 @@ function isCommFresh(comm) {
 @media (prefers-reduced-motion: reduce) {
   .ck-stage-pulse,
   .ck-geo-hq-ripple,
-  .ck-meter-fill::after { animation: none; }
-  .ck-meter-fill,
-  .ck-meter-tip-wrap,
-  .ck-geo-outer-glow,
-  .ck-geo-outer-trace,
-  .ck-geo-inner-silk { transition: none; }
+  .ck-map-meta.is-handoff-in,
+  .ck-loader-brand.is-handoff-in,
+  .ck-loader-meter.is-handoff-in { animation: none; }
+  .ck-meter-tip-wrap { transition: none; }
   .ck-loader-reveal-leave-active { transition: opacity 0.24s ease; }
   .ck-loader-reveal-leave-to { transform: none; }
 }

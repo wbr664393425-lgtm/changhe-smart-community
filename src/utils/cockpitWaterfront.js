@@ -94,7 +94,8 @@ function createWater(geometry, shoreDistance, compact) {
         float rippleStrength = mix(1., .39, isRiver);
         vec3 lake = bodyColor * (1.0 + .08*gust + rippleStrength*(.085*wave + .048*ripples));
         float glint = smoothstep(.23, .86, wave) * (.45 + .55*smoothstep(-.6,1.,gust));
-        lake += mix(vec3(.09,.14,.14),vec3(.015,.055,.075),uNight)*rippleStrength*(.40*glint*windPatch + .95*streak);
+        vec3 glintColor = mix(vec3(.09,.14,.14),vec3(.015,.055,.075),uNight);
+        lake += glintColor*rippleStrength*(.40*glint*windPatch + .95*streak);
         diffuseColor.rgb = mix(lake, diffuseColor.rgb * (.98 + .065*wave), uSatellite*.81);`)
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
         vec3 slope = vec3(.037*crossWave + .024*capillary, 0., .054*longWave + .065*ripples);
@@ -107,8 +108,9 @@ function createWater(geometry, shoreDistance, compact) {
         vec3 reflectedShade = clamp(mirrored / max(uSky, vec3(.055)), vec3(.09), vec3(1.18));
         float fTerm = 1.0 - clamp(dot(normal, normalize(vViewPosition)), 0., 1.);
         float fresnel = fTerm * fTerm;
-        if (uNight > 0.5) {
-          outgoingLight += lake * (.67 + .14 * wave) + vec3(.002, .006, .009);
+        float nightEmit = smoothstep(0.35, 0.85, uNight);
+        if (nightEmit > 0.001) {
+          outgoingLight += (lake * (.67 + .14 * wave) + vec3(.002, .006, .009)) * nightEmit;
         }
         outgoingLight *= mix(vec3(1.), reflectedShade, .59 - .27*uSatellite);
         outgoingLight = mix(outgoingLight, mirrored, (.065 + .16*fresnel)*(1.-.52*uSatellite)*mix(1.,.68,isRiver));
@@ -117,25 +119,44 @@ function createWater(geometry, shoreDistance, compact) {
 
   const renderReflection = mesh.onBeforeRender
   const lastView = new THREE.Matrix4(), lastProjection = new THREE.Matrix4()
-  let dirty = true, lastUpdate = -Infinity, reflectionPaused = false
+  const nightWaterTint = new THREE.Color('#71839a')
+  let dirty = true, softDirty = false, lastUpdate = -Infinity, reflectionPaused = false, suppressDirty = false
   mesh.onBeforeRender = function(renderer, scene, camera) {
-    if (reflectionPaused && !dirty) return
+    if (reflectionPaused && (suppressDirty || !dirty)) return
     const now = performance.now()
-    if (!dirty && (now - lastUpdate < 70 ||
-        (matricesClose(lastView, camera.matrixWorld, 1e-4) && matricesClose(lastProjection, camera.projectionMatrix, 1e-5)))) return
+    if (!dirty) {
+      if (now - lastUpdate < 70) return
+      if (!softDirty && matricesClose(lastView, camera.matrixWorld, 1e-4) && matricesClose(lastProjection, camera.projectionMatrix, 1e-5)) return
+    }
     this.getReflectionCamera(camera).layers.set(WATER_REFLECTION_LAYER)
     renderReflection.call(this, renderer, scene, camera)
     lastView.copy(camera.matrixWorld)
     lastProjection.copy(camera.projectionMatrix)
     dirty = false
+    softDirty = false
     lastUpdate = now
   }
   return {
     mesh,
     advance(seconds) { uniforms.uTime.value = seconds },
-    setReflectionPaused(paused) {
+    setReflectionPaused(paused, forceSuppress = false) {
       reflectionPaused = Boolean(paused)
+      suppressDirty = Boolean(paused && forceSuppress)
       if (!reflectionPaused) dirty = true
+    },
+    setAtmosphere({ sky, shallow, deep, riverShallow, riverDeep, nightFactor = 0, waterTint, satellite = null, forceReflection = true }) {
+      if (forceReflection) dirty = true
+      else softDirty = true
+      if (sky) uniforms.uSky.value.set(sky)
+      if (shallow) uniforms.uShallow.value.set(shallow)
+      if (deep) uniforms.uDeep.value.set(deep)
+      if (riverShallow) uniforms.uRiverShallow.value.set(riverShallow)
+      if (riverDeep) uniforms.uRiverDeep.value.set(riverDeep)
+      uniforms.uNight.value = nightFactor
+      uniforms.uSatellite.value = satellite ? 1 : 0
+      if (waterTint) material.color.set(waterTint)
+      else material.color.set('#ffffff').lerp(nightWaterTint, nightFactor)
+      if (material.map !== satellite) { material.map = satellite; material.needsUpdate = true }
     },
     setTheme(theme, night, satellite) {
       dirty = true
@@ -382,6 +403,10 @@ export async function createCockpitWaterfrontAsync(xWest, zNorth, xEast, zSouth,
   }
   group.add(water.mesh, bank, bridges.group, groves.group)
   const [west, east] = layout.bridges.find(b => b.name === '东方红路').ends.map(point)
+  let lastVegNight = null
+  const dayBankCol = new THREE.Color('#c7c6af')
+  const nightBankCol = new THREE.Color()
+  const scratchBankCol = new THREE.Color()
   return {
     group,
     bridgeFocus: west.lerp(east, 0.5),
@@ -390,7 +415,27 @@ export async function createCockpitWaterfrontAsync(xWest, zNorth, xEast, zSouth,
     setReflectionPaused: water.setReflectionPaused,
     updateTreeDetail: groves.updateDetail,
     disposeInactive: groves.disposeInactive,
+    setAtmosphere(opts) {
+      water.setAtmosphere(opts)
+      const nf = Math.max(0, Math.min(1, opts.nightFactor || 0))
+      const gf = Math.max(nf, opts.glowFactor || 0)
+      if (opts.bankColor) {
+        scratchBankCol.set(opts.bankColor)
+      } else {
+        scratchBankCol.copy(dayBankCol).lerp(nightBankCol.set(opts.theme?.outerTop || '#2e2636'), nf)
+      }
+      bankMaterial.color.copy(scratchBankCol)
+      const isNight = nf >= 0.5
+      if (opts.theme) {
+        bridges.setAtmosphere(opts.theme, nf, gf)
+      }
+      if (opts.theme && (lastVegNight !== isNight || opts.forceThemeSync)) {
+        lastVegNight = isNight
+        groves.setTheme(opts.theme, isNight)
+      }
+    },
     setTheme(theme, night, satellite) {
+      lastVegNight = Boolean(night)
       water.setTheme(theme, night, satellite)
       bankMaterial.color.set(night ? theme.outerTop : '#c7c6af')
       bridges.setTheme(theme, night)
@@ -418,6 +463,10 @@ export function createCockpitWaterfront(xWest, zNorth, xEast, zSouth, shoreDista
   }
   group.add(water.mesh, bank, bridges.group, groves.group)
   const [west, east] = layout.bridges.find(b => b.name === '东方红路').ends.map(point)
+  let lastVegNight = null
+  const dayBankCol = new THREE.Color('#c7c6af')
+  const nightBankCol = new THREE.Color()
+  const scratchBankCol = new THREE.Color()
   return {
     group,
     bridgeFocus: west.lerp(east, 0.5),
@@ -426,7 +475,27 @@ export function createCockpitWaterfront(xWest, zNorth, xEast, zSouth, shoreDista
     setReflectionPaused: water.setReflectionPaused,
     updateTreeDetail: groves.updateDetail,
     disposeInactive: groves.disposeInactive,
+    setAtmosphere(opts) {
+      water.setAtmosphere(opts)
+      const nf = Math.max(0, Math.min(1, opts.nightFactor || 0))
+      const gf = Math.max(nf, opts.glowFactor || 0)
+      if (opts.bankColor) {
+        scratchBankCol.set(opts.bankColor)
+      } else {
+        scratchBankCol.copy(dayBankCol).lerp(nightBankCol.set(opts.theme?.outerTop || '#2e2636'), nf)
+      }
+      bankMaterial.color.copy(scratchBankCol)
+      const isNight = nf >= 0.5
+      if (opts.theme) {
+        bridges.setAtmosphere(opts.theme, nf, gf)
+      }
+      if (opts.theme && (lastVegNight !== isNight || opts.forceThemeSync)) {
+        lastVegNight = isNight
+        groves.setTheme(opts.theme, isNight)
+      }
+    },
     setTheme(theme, night, satellite) {
+      lastVegNight = Boolean(night)
       water.setTheme(theme, night, satellite)
       bankMaterial.color.set(night ? theme.outerTop : '#c7c6af')
       bridges.setTheme(theme, night)
