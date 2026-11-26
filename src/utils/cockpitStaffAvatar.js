@@ -1,25 +1,61 @@
-import { BufferGeometry, CanvasTexture, Color, Float32BufferAttribute, MeshLambertMaterial, Uint8BufferAttribute, Vector3 } from 'three'
+import { BufferGeometry, CanvasTexture, Color, Float32BufferAttribute, MeshStandardMaterial, SRGBColorSpace, Uint8BufferAttribute } from 'three'
 
 const paint = {
-  vest: 0x31556b, yoke: 0x416980, binding: 0x253e51, seam: 0x718897,
-  reflector: 0xc7d7cf, shirt: 0xe8e4d8, cuff: 0xf3ede1, shirtShade: 0xc9c6b8,
-  pants: 0x354653, boots: 0x374149, sole: 0x242e35,
-  card: 0xf1e9d8, cardInk: 0x587e89, clip: 0xa5b2b0,
-  skin: 0xe5b18b, innerEar: 0xc68d70, lip: 0xa5645c, lowerLip: 0xd5937c,
-  eye: 0xe7d7c5, iris: 0x564032, pupil: 0x312927, lid: 0x674a3e,
-  hair: 0x403432, hairTie: 0x293d49, cover: 0x456862, paper: 0xd7d1b9
+  vest: 0x1e4d78,
+  yoke: 0x2b6292,
+  binding: 0x143352,
+  seam: 0x5c8ab5,
+  reflector: 0xe8f4f8,
+  shirt: 0xf2f4f7,
+  shirtShade: 0xd9e0e8,
+  pants: 0x253545,
+  boots: 0x1e252e,
+  sole: 0x3b4652,
+  card: 0xf8fafc,
+  cardInk: 0x1e5ca8,
+  clip: 0xc2cdd8,
+  skin: 0xf2d5bf,
+  skinShade: 0xe4c1a8,
+  hairDark: 0x272326,
+  hairMid: 0x322d31,
+  hairLight: 0x3f383d,
+  hairTie: 0x1a3958,
+  deviceBody: 0x1c2530,
+  deviceScreen: 0x8bc9e8,
+  deviceLed: 0x46e8c8
 }
 
-// 同一个实例材质用顶点色区分面料，夜间只给反光条、浅色衣料和肤色补光。
-const nightResponse = new Map([
-  [paint.reflector, 255], [paint.card, 218], [paint.skin, 181], [paint.shirt, 164],
-  [paint.cuff, 164], [paint.vest, 174], [paint.yoke, 178], [paint.eye, 136]
+// 材质分区表：[nightLift(0-255), roughness(0-255), metalness(0-255)]
+const surfaceProps = new Map([
+  [paint.reflector, [255, 56, 96]],
+  [paint.deviceScreen, [235, 42, 26]],
+  [paint.deviceLed, [255, 46, 20]],
+  [paint.card, [215, 92, 16]],
+  [paint.clip, [180, 62, 175]],
+  [paint.cardInk, [168, 128, 18]],
+  [paint.skin, [186, 148, 4]],
+  [paint.skinShade, [168, 152, 4]],
+  [paint.shirt, [158, 188, 3]],
+  [paint.shirtShade, [146, 194, 3]],
+  [paint.yoke, [152, 200, 6]],
+  [paint.vest, [145, 204, 6]],
+  [paint.seam, [168, 140, 28]],
+  [paint.binding, [118, 210, 6]],
+  [paint.pants, [94, 214, 5]],
+  [paint.boots, [78, 152, 14]],
+  [paint.sole, [92, 188, 8]],
+  [paint.deviceBody, [85, 118, 36]],
+  [paint.hairTie, [110, 178, 10]],
+  [paint.hairDark, [66, 168, 10]],
+  [paint.hairMid, [74, 165, 10]],
+  [paint.hairLight, [84, 160, 12]]
 ])
 
-const circle = Math.PI * 2
+const TAU = Math.PI * 2
 const rounded = (value, exponent) => Math.sign(value) * Math.abs(value) ** exponent
+const lerp = (a, b, t) => a + (b - a) * t
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
 
-// 横截面从脚向上排列，宽、深为半径。曲面和贴在衣服、脸上的细节共用同一截面。
 function section(y, width, depth, x = 0, z = 0) {
   return { y, width, depth, x, z }
 }
@@ -29,90 +65,34 @@ function atHeight(profile, y) {
   for (let i = 1; i < profile.length; i++) {
     const a = profile[i - 1], b = profile[i]
     if (y > b.y) continue
-    const t = (y - a.y) / (b.y - a.y)
-    return section(y, a.width + (b.width - a.width) * t, a.depth + (b.depth - a.depth) * t,
-      a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t)
+    const t = (y - a.y) / Math.max(1e-6, b.y - a.y)
+    return section(
+      y,
+      lerp(a.width, b.width, t),
+      lerp(a.depth, b.depth, t),
+      lerp(a.x, b.x, t),
+      lerp(a.z, b.z, t)
+    )
   }
   return profile[profile.length - 1]
 }
 
 function ringPoint(s, angle, exponent = 1) {
-  return [s.x + s.width * rounded(Math.sin(angle), exponent), s.y,
-    s.z + s.depth * rounded(Math.cos(angle), exponent)]
+  return [
+    s.x + s.width * rounded(Math.sin(angle), exponent),
+    s.y,
+    s.z + s.depth * rounded(Math.cos(angle), exponent)
+  ]
 }
 
-// 将衣片裁在它覆盖的外套三角面内，陡峭的肩线和翻领也能整片贴住。
-function garmentSurface(profile, side, segments, exponent) {
-  const rings = profile.map(s => Array.from({ length: segments }, (_, i) => ringPoint(s, i * circle / segments, exponent)))
-  const normals = new Map()
-  const tangent = new Vector3(), vertical = new Vector3(), origin = new Vector3()
-  rings.forEach((ring, j) => ring.forEach((p, i) => {
-    tangent.fromArray(ring[(i + 1) % segments]).sub(origin.fromArray(ring[(i + segments - 1) % segments]))
-    vertical.fromArray(rings[Math.min(rings.length - 1, j + 1)][i]).sub(origin.fromArray(rings[Math.max(0, j - 1)][i]))
-    normals.set(p, new Vector3().crossVectors(tangent, vertical).normalize())
-  }))
-  const faces = []
-  const cross = (a, b, p) => (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
-  function add(a, b, c) {
-    const area = cross(a, b, c)
-    if (side * area < 1e-8) return
-    faces.push({ corners: [a, b, c], area,
-      minX: Math.min(a[0], b[0], c[0]), maxX: Math.max(a[0], b[0], c[0]),
-      minY: Math.min(a[1], b[1], c[1]), maxY: Math.max(a[1], b[1], c[1]) })
-  }
-  for (let j = 1; j < rings.length; j++) {
-    const lo = rings[j - 1], hi = rings[j]
-    for (let i = 0; i < segments; i++) {
-      const n = (i + 1) % segments
-      add(lo[i], lo[n], hi[i])
-      add(lo[n], hi[n], hi[i])
-    }
-  }
-  return { lay(points, offset, draw) {
-    const xs = points.map(p => p[0]), ys = points.map(p => p[1])
-    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys)
-    for (const { corners, area, minX: left, maxX: right, minY: low, maxY: high } of faces) {
-      if (maxX <= left || minX >= right || maxY <= low || minY >= high) continue
-      let poly = points
-      for (let i = 0; i < 3 && poly.length; i++) {
-        const a = corners[i], b = corners[(i + 1) % 3], clipped = []
-        let last = poly[poly.length - 1], from = cross(a, b, last) * side
-        for (const p of poly) {
-          const to = cross(a, b, p) * side
-          if ((from < 0) !== (to < 0)) {
-            const t = from / (from - to)
-            clipped.push([last[0] + (p[0] - last[0]) * t, last[1] + (p[1] - last[1]) * t])
-          }
-          if (to >= 0) clipped.push(p)
-          last = p
-          from = to
-        }
-        poly = clipped
-      }
-      if (poly.length < 3) continue
-      const [a, b, c] = corners
-      draw(poly, (x, y) => {
-        const p = [x, y]
-        return [x, y, (cross(b, c, p) * a[2] + cross(c, a, p) * b[2] + cross(a, b, p) * c[2]) / area + side * offset]
-      }, (x, y) => {
-        const p = [x, y]
-        return new Vector3().addScaledVector(normals.get(a), cross(b, c, p) / area)
-          .addScaledVector(normals.get(b), cross(c, a, p) / area)
-          .addScaledVector(normals.get(c), cross(a, b, p) / area).normalize()
-      })
-    }
-  } }
-}
-
-/** 正面 +Z，脚底 y=0、发顶 y=1。aStaffSurface 保存肢体类型与夜间补光强度。 */
+/** 正面 +Z，脚底 y=0、发顶 y=1。aStaffSurface = [region(0躯干/1腿/2臂/3男头/4女头), nightLift, roughness, metalness]。 */
 export function createStaffAvatarGeometry(gender = 'male') {
   const female = gender === 'female'
   const positions = [], colors = [], surfaces = [], indices = []
-  const panelNormals = []
   const palette = new Map()
-  let limb = 0 // 0 躯干，1 腿，2 臂；同一实例内按巡查步幅驱动。
+  let limb = 0
 
-  function vertex(point, color) {
+  function vertex(point, color, customProps = null) {
     let rgb = palette.get(color)
     if (!rgb) {
       const tint = new Color(color)
@@ -120,28 +100,30 @@ export function createStaffAvatarGeometry(gender = 'male') {
       palette.set(color, rgb)
     }
     const index = positions.length / 3
-    positions.push(...point)
-    colors.push(...rgb)
-    surfaces.push(limb, nightResponse.get(color) ?? 88)
+    positions.push(point[0], point[1], point[2])
+    colors.push(rgb[0], rgb[1], rgb[2])
+    const props = customProps || surfaceProps.get(color) || [96, 196, 8]
+    surfaces.push(limb, props[0], props[1], props[2])
     return index
   }
 
-  // 同一圈左右共用顶点，肤色与布料有连续法线；鞋底、领片等独立面保留折边。
   function shell(rings, color, closed = true) {
     const count = rings[0].length
     const shade = typeof color === 'function' ? color : () => color
     const rows = rings.map((ring, j) => ring.map((point, i) => vertex(point, shade(j, i))))
     for (let j = 1; j < rows.length; j++) {
       for (let i = 0; i < count; i++) {
-        const n = (i + 1) % count, lo = rows[j - 1], hi = rows[j]
+        const n = (i + 1) % count
+        const lo = rows[j - 1], hi = rows[j]
         indices.push(lo[i], lo[n], hi[i], lo[n], hi[n], hi[i])
       }
     }
     if (!closed) return
     for (const end of [0, rows.length - 1]) {
-      const pts = rings[end], rim = pts.map((point, i) => vertex(point, shade(end, i)))
+      const pts = rings[end]
+      const rim = pts.map((point, i) => vertex(point, shade(end, i)))
       const center = [0, 0, 0]
-      pts.forEach(p => p.forEach((v, axis) => { center[axis] += v / count }))
+      pts.forEach(p => { center[0] += p[0] / count; center[1] += p[1] / count; center[2] += p[2] / count })
       const c = vertex(center, shade(end, 0))
       for (let i = 0; i < count; i++) {
         const n = (i + 1) % count
@@ -151,424 +133,763 @@ export function createStaffAvatarGeometry(gender = 'male') {
     }
   }
 
-  function loft(profile, color, count = 10, exponent = 1) {
-    shell(profile.map(s => Array.from({ length: count }, (_, i) => ringPoint(s, i * circle / count, exponent))), color)
+  function loft(profile, color, count = 14, exponent = 1, closed = true) {
+    shell(profile.map(s => Array.from({ length: count }, (_, i) => ringPoint(s, i * TAU / count, exponent))), color, closed)
   }
 
-  function surface(profile, exponent = 1, side = 1) {
-    return (x, y, offset = 0) => {
-      const s = atHeight(profile, y)
-      const u = Math.min(1, Math.abs((x - s.x) / s.width))
-      const depth = (1 - u ** (2 / exponent)) ** (exponent / 2)
-      return [x, y, s.z + side * (s.depth * depth + offset)]
-    }
-  }
-
-  // 衣片与五官按实际曲面投影。小片独立着色，不增加材质或绘制批次。
-  function patch(points, project, color, offset = 0.0008, side = 1, normalAt) {
-    if (project.lay) {
-      project.lay(points, offset, (polygon, onFace, normal) => patch(polygon, onFace, color, 0, side, normal))
-      return
-    }
-    const area = points.reduce((sum, [x, y], i) => {
-      const next = points[(i + 1) % points.length]
-      return sum + x * next[1] - next[0] * y
-    }, 0)
-    if (Math.abs(area) < 1e-11) return
-    const order = points.map(([x, y]) => {
-      const index = vertex(project(x, y, offset), color)
-      if (normalAt) panelNormals.push([index, normalAt(x, y)])
-      return index
+  function addBox(cx, cy, cz, hx, hy, hz, color, rotX = 0, rotY = 0, rotZ = 0) {
+    const corners = [
+      [-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
+      [-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz]
+    ]
+    const cx0 = Math.cos(rotX), sx0 = Math.sin(rotX)
+    const cy0 = Math.cos(rotY), sy0 = Math.sin(rotY)
+    const cz0 = Math.cos(rotZ), sz0 = Math.sin(rotZ)
+    const world = corners.map(([x, y, z]) => {
+      const x1 = x * cz0 - y * sz0, y1 = x * sz0 + y * cz0, z1 = z
+      const y2 = y1 * cx0 - z1 * sx0, z2 = y1 * sx0 + z1 * cx0, x2 = x1
+      const x3 = x2 * cy0 + z2 * sy0, z3 = -x2 * sy0 + z2 * cy0, y3 = y2
+      return [cx + x3, cy + y3, cz + z3]
     })
-    if (area * side < 0) order.reverse()
-    for (let i = 1; i < order.length - 1; i++) indices.push(order[0], order[i], order[i + 1])
-  }
-
-  // 每个采样为 [x, 下沿高度, 上沿高度]，使宽胸带和细眼睑都服帖于底面。
-  function ribbon(samples, project, color, offset, side = 1) {
-    for (let i = 1; i < samples.length; i++) {
-      const [x, lo, hi] = samples[i - 1], [nx, nlo, nhi] = samples[i]
-      patch([[x, lo], [nx, nlo], [nx, nhi], [x, hi]], project, color, offset, side)
+    const faces = [
+      [0, 3, 2, 1], [4, 5, 6, 7],
+      [0, 1, 5, 4], [2, 3, 7, 6],
+      [0, 4, 7, 3], [1, 2, 6, 5]
+    ]
+    for (const face of faces) {
+      const idx = face.map(k => vertex(world[k], color))
+      indices.push(idx[0], idx[1], idx[2], idx[0], idx[2], idx[3])
     }
   }
 
-  const shoulders = female ? 0.92 : 1
+  function addCoatBand(profile, exponent, thetaStart, thetaEnd, yBot, yTop, radialOffset, thickness, color, segs = 16) {
+    const outerBot = [], outerTop = [], innerBot = [], innerTop = []
+    for (let i = 0; i <= segs; i++) {
+      const theta = lerp(thetaStart, thetaEnd, i / segs)
+      const sBot = atHeight(profile, yBot)
+      const sTop = atHeight(profile, yTop)
+      const pBot = ringPoint(sBot, theta, exponent)
+      const pTop = ringPoint(sTop, theta, exponent)
+      const nx = Math.sin(theta), nz = Math.cos(theta)
+      outerBot.push([pBot[0] + nx * (radialOffset + thickness), pBot[1], pBot[2] + nz * (radialOffset + thickness)])
+      outerTop.push([pTop[0] + nx * (radialOffset + thickness), pTop[1], pTop[2] + nz * (radialOffset + thickness)])
+      innerBot.push([pBot[0] + nx * radialOffset, pBot[1], pBot[2] + nz * radialOffset])
+      innerTop.push([pTop[0] + nx * radialOffset, pTop[1], pTop[2] + nz * radialOffset])
+    }
+    const pushQuad = (a, b, c, d) => {
+      const ia = vertex(a, color), ib = vertex(b, color), ic = vertex(c, color), id = vertex(d, color)
+      indices.push(ia, ib, ic, ia, ic, id)
+    }
+    for (let i = 0; i < segs; i++) {
+      pushQuad(outerBot[i], outerBot[i + 1], outerTop[i + 1], outerTop[i])
+      pushQuad(outerTop[i], outerTop[i + 1], innerTop[i + 1], innerTop[i])
+      pushQuad(innerBot[i], innerBot[i + 1], outerBot[i + 1], outerBot[i])
+    }
+    pushQuad(innerBot[0], outerBot[0], outerTop[0], innerTop[0])
+    pushQuad(outerBot[segs], innerBot[segs], innerTop[segs], outerTop[segs])
+  }
+
+  const shoulders = female ? 0.91 : 1.0
+  const hipHalf = female ? 0.056 : 0.058
+
+  // ── 1. 双腿与巡查鞋（y = 0.000 ~ 0.488，约 5.75 头身修长比例） ──
   for (const sign of [-1, 1]) {
-    const hip = sign * 0.055, foot = sign * 0.065, rest = sign * 0.036
+    const footX = sign * 0.062
+    const hipX = sign * hipHalf
+    const footZ = 0.012
     limb = 1
     loft([
-      section(0, .043, .072, foot, rest + .017),
-      section(.012, .045, .074, foot, rest + .017)
-    ], paint.sole, 10, .74)
+      section(0.000, 0.039, 0.066, footX, footZ + 0.014),
+      section(0.014, 0.041, 0.068, footX, footZ + 0.014)
+    ], paint.sole, 14, 0.78)
     loft([
-      section(.010, .044, .072, foot, rest + .017), section(.025, .043, .070, foot, rest + .018),
-      section(.043, .039, .050, foot, rest + .004), section(.061, .034, .036, foot, rest - .001)
-    ], paint.boots, 10, .80)
+      section(0.012, 0.040, 0.066, footX, footZ + 0.014),
+      section(0.028, 0.039, 0.062, footX, footZ + 0.012),
+      section(0.046, 0.035, 0.046, footX, footZ + 0.002),
+      section(0.064, 0.032, 0.035, footX, -0.002)
+    ], paint.boots, 14, 0.82)
     loft([
-      section(.052, .036, .040, foot, rest), section(.084, .037, .041, foot, rest - .002),
-      section(.195, .045, .047, foot - sign * .002, rest * .67 - .002),
-      section(.251, .045, .049, hip + sign * .007, rest * .52 + .007),
-      section(.350, .054, .060, hip + sign * .002, rest * .26),
-      section(.464, .062, .068, hip, -.003)
-    ], paint.pants, 10, .88)
+      section(0.054, 0.034, 0.038, footX, -0.002),
+      section(0.095, 0.036, 0.039, footX, -0.002),
+      section(0.215, 0.043, 0.045, lerp(footX, hipX, 0.42), 0.002),
+      section(0.280, 0.045, 0.048, lerp(footX, hipX, 0.64), 0.004),
+      section(0.382, 0.052, 0.056, lerp(footX, hipX, 0.86), 0.001),
+      section(0.486, 0.058, 0.064, hipX, -0.003)
+    ], paint.pants, 14, 0.88)
 
+    // ── 2. 手臂与手掌（limb = 2） ──
     limb = 2
-    const hand = sign * (sign < 0 ? .138 : .151) * shoulders, elbow = sign * .162 * shoulders
+    const wristX = sign * (female ? 0.132 : 0.145)
+    const elbowX = sign * (female ? 0.146 : 0.160)
+    const shX = sign * 0.126 * shoulders
+    const armForward = sign < 0 ? 0.028 : 0.014
+    const elbowZ = sign < 0 ? 0.004 : -0.006
+
     loft([
-      section(.410, .009, .013, hand - sign * .003, -rest + .015),
-      section(.426, .017, .023, hand, -rest + .013),
-      section(.451, .018, .026, hand + sign * .002, -rest + .007),
-      section(.475, .016, .019, hand, -rest + .002),
-      section(.548, .024, .028, elbow, -rest * .52 - .009)
-    ], paint.skin, 10)
-    loft([
-      section(.433, .006, .008, hand - sign * .009, -rest + .033),
-      section(.449, .009, .011, hand - sign * .012, -rest + .030),
-      section(.463, .010, .011, hand - sign * .010, -rest + .020)
-    ], paint.skin, 8)
+      section(0.410, 0.010, 0.014, wristX - sign * 0.003, armForward + 0.006),
+      section(0.428, 0.015, 0.021, wristX, armForward + 0.004),
+      section(0.456, 0.017, 0.022, wristX + sign * 0.002, armForward),
+      section(0.478, 0.015, 0.017, wristX + sign * 0.003, armForward * 0.7),
+      section(0.538, 0.022, 0.024, elbowX, elbowZ)
+    ], paint.skin, 12, 0.92)
+
     if (sign < 0) {
-      // 薄巡查记录夹贴着手掌，拇指压住封面，随同一只手自然摆动。
-      const corners = [[-.042, -.0038], [.042, -.0038], [.042, .0038], [-.042, .0038]]
-      const pageRing = y => corners.map(([along, across]) => [
-        hand - .013 + along * .82 + across * .572, y + along * .10,
-        -rest + .035 + along * .572 - across * .82 + (.447 - y) * .14
-      ])
-      const lower = pageRing(.332), upper = pageRing(.445)
-      for (let i = 0; i < 4; i++) {
-        const n = (i + 1) % 4
-        const sideColor = i === 1 ? paint.paper : paint.cover
-        const [a, b, c, d] = [lower[i], lower[n], upper[n], upper[i]].map(p => vertex(p, sideColor))
-        indices.push(a, b, c, a, c, d)
-      }
-      const pages = upper.map(p => vertex(p, paint.paper)), bottom = lower.map(p => vertex(p, paint.cover))
-      indices.push(pages[0], pages[1], pages[2], pages[0], pages[2], pages[3], bottom[0], bottom[2], bottom[1], bottom[0], bottom[3], bottom[2])
+      const pdaX = wristX + 0.008
+      const pdaY = 0.440
+      const pdaZ = armForward + 0.015
+      addBox(pdaX, pdaY, pdaZ, 0.018, 0.033, 0.0038, paint.deviceBody, -0.18, 0.95, 0.06)
+      addBox(pdaX + 0.0022, pdaY + 0.0008, pdaZ + 0.0014, 0.014, 0.027, 0.0014, paint.deviceScreen, -0.18, 0.95, 0.06)
     }
+
     loft([
-      section(.526, .025, .029, elbow, -rest * .60), section(.553, .029, .031, elbow, -rest * .45 - .004),
-      section(.581, .032, .034, elbow + sign * .001, -rest * .40 - .010)
-    ], paint.cuff, 10)
+      section(0.530, 0.024, 0.026, elbowX, elbowZ),
+      section(0.554, 0.027, 0.029, elbowX, elbowZ - 0.003),
+      section(0.580, 0.029, 0.031, elbowX + sign * 0.001, elbowZ - 0.006)
+    ], paint.shirtShade, 14, 0.90)
     loft([
-      section(.554, .028, .031, elbow, -rest * .5 - .004),
-      section(.606, .035, .036, elbow, -rest * .30 - .012),
-      section(.680, .038, .043, sign * .146 * shoulders, -.008),
-      section(.727, .044, .051, sign * .133 * shoulders, -.002),
-      section(.749, .032, .044, sign * .128 * shoulders, -.001),
-      section(.759, .013, .030, sign * .115 * shoulders, 0)
-    ], paint.shirt, 12)
+      section(0.568, 0.028, 0.030, elbowX, elbowZ - 0.005),
+      section(0.618, 0.032, 0.034, lerp(elbowX, shX, 0.42), -0.007),
+      section(0.684, 0.035, 0.039, lerp(elbowX, shX, 0.80), -0.005),
+      section(0.726, 0.038, 0.044, shX, -0.002),
+      section(0.749, 0.026, 0.036, shX - sign * 0.010, -0.002),
+      section(0.759, 0.011, 0.022, shX - sign * 0.020, -0.002)
+    ], paint.shirt, 14, 0.90)
   }
+
+  // ── 3. 躯干：真内衬衬衫 + 真 3D 立体小翻领 + 真开襟政务蓝马甲 ──
   limb = 0
 
-  const coat = [
-    section(.454, .103, .065, 0, -.005), section(.468, .114, .071, 0, -.005),
-    section(.523, .111, .069, 0, -.004), section(.584, female ? .096 : .104, .067),
-    section(.663, .126, .075, 0, .002), section(.721, .133, .074),
-    section(.750, .127, .064, 0, -.003), section(.767, .101, .054, 0, -.003),
-    section(.779, .047, .041, 0, -.002)
-  ].map(s => ({ ...s, width: s.width * shoulders }))
-  loft(coat, paint.vest, 20, .80)
-  const front = garmentSurface(coat, 1, 20, .80), back = garmentSurface(coat, -1, 20, .80)
-  const w = shoulders
-  for (const side of [1, -1]) {
-    const project = side === 1 ? front : back
-    const strip = []
-    for (let i = -4; i <= 4; i++) {
-      const x = i / 4, y = (side === 1 ? .698 : .687) + .010 * Math.abs(x)
-      strip.push([x * .117 * w, y, y + .006])
+  const shirtInner = [
+    section(0.632, 0.095 * shoulders, 0.060, 0, 0.002),
+    section(0.686, 0.106 * shoulders, 0.064, 0, 0.002),
+    section(0.733, 0.104 * shoulders, 0.056, 0, -0.001),
+    section(0.764, 0.078 * shoulders, 0.045, 0, -0.001),
+    section(0.779, 0.038, 0.034, 0, -0.001)
+  ]
+  loft(shirtInner, paint.shirt, 24, 0.84)
+
+  for (const sign of [-1, 1]) {
+    const collarSegs = 8
+    const outerTop = [], outerBot = [], innerTop = [], innerBot = []
+    for (let i = 0; i <= collarSegs; i++) {
+      const t = i / collarSegs
+      const theta = sign * lerp(0.28, Math.PI * 0.92, t)
+      const yTop = lerp(0.770, 0.794, Math.sin(t * Math.PI * 0.65))
+      const yTip = lerp(0.730, 0.772, Math.pow(t, 0.68))
+      const rx = 0.036 + 0.004 * (1 - t)
+      const rz = 0.034 + 0.005 * (1 - t)
+      const nx = Math.sin(theta), nz = Math.cos(theta)
+      innerTop.push([nx * rx, yTop, nz * rz])
+      outerTop.push([nx * (rx + 0.0055), yTop + 0.001, nz * (rz + 0.0055)])
+      const tipSpread = lerp(0.015, 0.007, t)
+      outerBot.push([nx * (rx + tipSpread), yTip, nz * (rz + tipSpread)])
+      innerBot.push([nx * (rx + tipSpread - 0.0045), yTip + 0.001, nz * (rz + tipSpread - 0.0045)])
     }
-    if (side === -1) {
-      ribbon(strip.map(([x, y]) => [x, y + .006, .751]), back, paint.yoke, .0010, -1)
-      ribbon(strip, back, paint.reflector, .0016, -1)
-    } else {
-      for (const band of [strip.slice(0, 4), strip.slice(5)]) {
-        ribbon(band.map(([x, y]) => [x, y + .006, .747]), project, paint.yoke, .0010)
-        ribbon(band, project, paint.reflector, .0016)
+    const q = (a, b, c, d, col) => {
+      const ia = vertex(a, col), ib = vertex(b, col), ic = vertex(c, col), id = vertex(d, col)
+      indices.push(ia, ib, ic, ia, ic, id)
+    }
+    for (let i = 0; i < collarSegs; i++) {
+      if (sign > 0) {
+        q(outerBot[i], outerBot[i + 1], outerTop[i + 1], outerTop[i], paint.shirt)
+        q(outerTop[i], outerTop[i + 1], innerTop[i + 1], innerTop[i], paint.shirt)
+        q(innerBot[i], outerBot[i], outerBot[i + 1], innerBot[i + 1], paint.shirtShade)
+      } else {
+        q(outerBot[i + 1], outerBot[i], outerTop[i], outerTop[i + 1], paint.shirt)
+        q(outerTop[i + 1], outerTop[i], innerTop[i], innerTop[i + 1], paint.shirt)
+        q(outerBot[i], innerBot[i], innerBot[i + 1], outerBot[i + 1], paint.shirtShade)
       }
     }
+    if (sign > 0) q(innerBot[0], outerBot[0], outerTop[0], innerTop[0], paint.shirtShade)
+    else q(outerBot[0], innerBot[0], innerTop[0], outerTop[0], paint.shirtShade)
   }
 
-  // 开领浅衬衫、布面包边、中缝拉链与平贴证件夹。
-  for (const sign of [-1, 1]) {
-    const strip = [[0, .686], [.018 * sign, .720], [.040 * sign, .753], [.048 * sign, .774]]
-    for (let i = 1; i < strip.length; i++) {
-      const [x, y] = strip[i - 1], [nx, ny] = strip[i]
-      patch([[0, y], [x, y], [nx, ny], [0, ny]], front, paint.shirt, .0017)
-      patch([[x, y], [x + .005 * sign, y], [nx + .005 * sign, ny], [nx, ny]], front, paint.binding, .0024)
+  const coatProfile = [
+    section(0.462, 0.095, 0.063, 0, -0.004),
+    section(0.494, 0.107, 0.069, 0, -0.004),
+    section(0.554, 0.103, 0.066, 0, -0.003),
+    section(0.610, female ? 0.092 : 0.101, 0.064, 0, -0.001),
+    section(0.666, 0.114, 0.071, 0, 0.002),
+    section(0.708, 0.123, 0.071, 0, 0.001),
+    section(0.742, 0.118, 0.061, 0, -0.002),
+    section(0.762, 0.096, 0.052, 0, -0.002),
+    section(0.775, 0.048, 0.040, 0, -0.001)
+  ].map(s => ({ ...s, width: s.width * shoulders }))
+
+  const coatExp = 0.80
+  const coatSegs = 28
+  const vBottomY = 0.658
+  const coatOuterRings = []
+  const coatInnerRings = []
+  for (let j = 0; j < coatProfile.length; j++) {
+    const s = coatProfile[j]
+    const vProgress = clamp((s.y - vBottomY) / (0.775 - vBottomY), 0, 1)
+    const openHalf = s.y <= vBottomY ? 0.015 : lerp(0.025, 0.44, Math.pow(vProgress, 0.82))
+    const outerRing = []
+    const innerRing = []
+    for (let i = 0; i <= coatSegs; i++) {
+      const theta = lerp(openHalf, TAU - openHalf, i / coatSegs)
+      const pOut = ringPoint(s, theta, coatExp)
+      const nx = Math.sin(theta), nz = Math.cos(theta)
+      outerRing.push(pOut)
+      innerRing.push([pOut[0] - nx * 0.0045, pOut[1], pOut[2] - nz * 0.0045])
     }
-    const pocket = [[.052, .512, .516], [.074, .532, .537], [.093, .548, .554]]
-    ribbon(pocket.map(([x, lo, hi]) => [x * sign * w, lo, hi]), front, paint.binding, .0016)
+    coatOuterRings.push(outerRing)
+    coatInnerRings.push(innerRing)
   }
-  patch([[-.027, .779], [.027, .779], [0, .743]], front, paint.skin, .0023)
-  for (const sign of [-1, 1]) {
-    patch([[sign * .024, .778], [sign * .051, .762], [sign * .039, .738], [sign * .014, .751]],
-      front, paint.shirtShade, .0027)
-    patch([[sign * .024, .778], [sign * .049, .763], [sign * .038, .741], [sign * .014, .753]],
-      front, paint.cuff, .0033)
-  }
-  for (let i = 1; i < coat.length && coat[i - 1].y < .686; i++) {
-    const a = coat[i - 1].y, b = Math.min(.686, coat[i].y)
-    patch([[-.003, a], [.003, a], [.003, b], [-.003, b]], front, paint.binding, .0014)
-    patch([[-.0008, a], [.0008, a], [.0008, b], [-.0008, b]], front, paint.seam, .0017)
-  }
-  patch([[.035, .650], [.071, .650], [.071, .678], [.035, .678]], front, paint.card, .0020)
-  patch([[.038, .655], [.047, .655], [.047, .668], [.038, .668]], front, paint.cardInk, .0025)
-  ribbon([[.051, .664, .666], [.066, .664, .666]], front, paint.seam, .0026)
-  patch([[.049, .674], [.058, .674], [.058, .682], [.049, .682]], front, paint.clip, .0028)
 
+  const coatColorAt = (y) => (y >= 0.706 ? paint.yoke : paint.vest)
+  const coatRows = coatOuterRings.map((ring, j) => ring.map(p => vertex(p, coatColorAt(coatProfile[j].y))))
+  for (let j = 1; j < coatRows.length; j++) {
+    for (let i = 0; i < coatSegs; i++) {
+      const lo = coatRows[j - 1], hi = coatRows[j]
+      indices.push(lo[i], lo[i + 1], hi[i], lo[i + 1], hi[i + 1], hi[i])
+    }
+  }
+  for (const [ring, inRing, flip] of [
+    [coatOuterRings[0], coatInnerRings[0], true],
+    [coatOuterRings[coatOuterRings.length - 1], coatInnerRings[coatInnerRings.length - 1], false]
+  ]) {
+    const col = flip ? paint.binding : coatColorAt(ring[0][1])
+    for (let i = 0; i < coatSegs; i++) {
+      const a = vertex(ring[i], col), b = vertex(ring[i + 1], col)
+      const c = vertex(inRing[i + 1], col), d = vertex(inRing[i], col)
+      if (flip) indices.push(a, d, c, a, c, b)
+      else indices.push(a, b, c, a, c, d)
+    }
+  }
+  for (let j = 1; j < coatOuterRings.length; j++) {
+    for (const sideIdx of [0, coatSegs]) {
+      const p0Out = coatOuterRings[j - 1][sideIdx], p1Out = coatOuterRings[j][sideIdx]
+      const p0In = coatInnerRings[j - 1][sideIdx], p1In = coatInnerRings[j][sideIdx]
+      const a = vertex(p0Out, paint.binding), b = vertex(p1Out, paint.binding)
+      const c = vertex(p1In, paint.binding), d = vertex(p0In, paint.binding)
+      if (sideIdx === 0) indices.push(a, b, c, a, c, d)
+      else indices.push(a, d, c, a, c, b)
+    }
+  }
+  addCoatBand(coatProfile, coatExp, -0.016, 0.016, 0.474, 0.658, 0.0005, 0.0018, paint.binding, 2)
+  addCoatBand(coatProfile, coatExp, -0.005, 0.005, 0.476, 0.656, 0.0012, 0.0016, paint.seam, 2)
+
+  // 双道安全反光条
+  addCoatBand(coatProfile, coatExp, 0.28, 0.86, 0.665, 0.679, 0.0008, 0.0022, paint.reflector, 10)
+  addCoatBand(coatProfile, coatExp, -0.86, -0.28, 0.665, 0.679, 0.0008, 0.0022, paint.reflector, 10)
+  addCoatBand(coatProfile, coatExp, 2.24, TAU - 2.24, 0.684, 0.698, 0.0008, 0.0022, paint.reflector, 16)
+  addCoatBand(coatProfile, coatExp, 0.06, TAU - 0.06, 0.540, 0.555, 0.0008, 0.0022, paint.reflector, 26)
+  addCoatBand(coatProfile, coatExp, 0.36, 0.78, 0.498, 0.506, 0.0006, 0.0016, paint.binding, 6)
+  addCoatBand(coatProfile, coatExp, -0.78, -0.36, 0.498, 0.506, 0.0006, 0.0016, paint.binding, 6)
+
+  const cardSurface = atHeight(coatProfile, 0.626)
+  const cardZ = ringPoint(cardSurface, 0.44, coatExp)[2] + 0.004
+  const cardX = 0.048 * shoulders
+  addBox(cardX, 0.626, cardZ, 0.017, 0.015, 0.0020, paint.card, 0, 0.32, 0)
+  addBox(cardX - 0.005, 0.626, cardZ + 0.0018, 0.0042, 0.0085, 0.0012, paint.cardInk, 0, 0.32, 0)
+  addBox(cardX, 0.643, cardZ, 0.0055, 0.0035, 0.0025, paint.clip, 0, 0.32, 0)
+
+  const micX = -0.068 * shoulders
+  const micZ = ringPoint(atHeight(coatProfile, 0.726), -0.58, coatExp)[2] + 0.005
+  addBox(micX, 0.727, micZ, 0.010, 0.015, 0.0045, paint.deviceBody, -0.18, -0.45, 0)
+  addBox(micX - 0.0015, 0.734, micZ + 0.0042, 0.0028, 0.0028, 0.0015, paint.deviceLed, -0.18, -0.45, 0)
+
+  // ── 4. 颈部与头部（约 5.75 头身：y = 0.822 ~ 0.990，搭配高清贴图面部） ──
   loft([
-    section(.753, .031, .031, 0, .001), section(.776, .031, .032, 0, .003),
-    section(.802, .029, .032, 0, .007), section(.825, .037, .039, 0, .008)
-  ], paint.skin, 14)
+    section(0.764, 0.030, 0.030, 0, 0.001),
+    section(0.788, 0.028, 0.029, 0, 0.004),
+    section(0.815, 0.029, 0.031, 0, 0.007),
+    section(0.838, 0.035, 0.037, 0, 0.008)
+  ], paint.skinShade, 16, 0.96)
 
-  const fw = female ? .95 : 1
-  const head = [
-    section(.803, female ? .014 : .022, .023, 0, .026), section(.812, female ? .032 : .040, .038, 0, .021),
-    section(.827, female ? .047 : .055, .049, 0, .016), section(.841, female ? .053 : .061, .058, 0, .011),
-    section(.858, female ? .063 : .067, .066, 0, .009), section(.872, .071, .070, 0, .007),
-    section(.885, .073, .071, 0, .005), section(.901, .073, .070, 0, .004),
-    section(.912, .073, .071, 0, .002),
-    section(.930, .072, .070, 0, .001), section(.952, .067, .066, 0, -.001),
-    section(.970, .051, .055, 0, -.004), section(.983, .025, .029, 0, -.004)
+  const fw = female ? 0.94 : 1.0
+  const headProfile = [
+    section(0.822, female ? 0.018 : 0.024, 0.023, 0, 0.023),
+    section(0.834, female ? 0.036 : 0.043, 0.038, 0, 0.019),
+    section(0.850, female ? 0.051 : 0.057, 0.050, 0, 0.014),
+    section(0.870, female ? 0.059 : 0.064, 0.058, 0, 0.010),
+    section(0.892, female ? 0.066 : 0.070, 0.065, 0, 0.007),
+    section(0.914, 0.071, 0.068, 0, 0.005),
+    section(0.934, 0.072, 0.069, 0, 0.003),
+    section(0.954, 0.068, 0.067, 0, 0.001),
+    section(0.972, 0.057, 0.059, 0, -0.002),
+    section(0.985, 0.035, 0.038, 0, -0.003),
+    section(0.992, 0.010, 0.012, 0, -0.004)
   ].map(s => ({ ...s, width: s.width * fw }))
-  // 颧骨、眼窝和下巴直接起在头部曲面上，表情随光向与镜头角度自然变化。
-  function faceDepth(x, y) {
-    const bump = (cx, cy, rx, ry) => Math.exp(-(((Math.abs(x) - cx) / rx) ** 2 + ((y - cy) / ry) ** 2))
-    return .0055 * bump(.042, .868, .021, .014) - .0042 * bump(.027, .888, .016, .009)
-      + .0033 * bump(.027, .901, .022, .009) + .0036 * bump(0, .819, .025, .012)
-      + .0022 * bump(0, .842, .021, .011)
+
+  // 头部表面设置独立标记（3=男头，4=女头），供着色器精准投射高清五官贴图
+  limb = female ? 4 : 3
+  function sculptFaceZ(x, y, cosAngle) {
+    if (cosAngle <= 0.05) return 0
+    const mask = Math.pow(cosAngle, 1.4)
+    const noseBridge = 0.0048 * Math.exp(-((x / 0.011) ** 2 + ((y - 0.884) / 0.022) ** 2))
+    const chinSoft = 0.0022 * Math.exp(-((x / 0.024) ** 2 + ((y - 0.836) / 0.014) ** 2))
+    return mask * (noseBridge + chinSoft)
   }
-  const faceBase = surface(head, .95)
-  const face = (x, y, offset) => faceBase(x, y, offset + faceDepth(x, y))
-  shell(head.map(s => Array.from({ length: 28 }, (_, i) => {
-    const a = i * circle / 28, p = ringPoint(s, a, .95)
-    if (Math.cos(a) > 0) p[2] += faceDepth(p[0], p[1])
+
+  const headSegs = 28
+  shell(headProfile.map(s => Array.from({ length: headSegs }, (_, i) => {
+    const a = i * TAU / headSegs
+    const p = ringPoint(s, a, 0.94)
+    p[2] += sculptFaceZ(p[0], p[1], Math.cos(a))
     return p
-  })), paint.skin)
+  })), (j) => (j <= 1 ? paint.skinShade : paint.skin))
+  limb = 0
+
   for (const sign of [-1, 1]) {
-    const earX = sign * .070 * fw
-    loft([section(.851, .003, .005, earX, .002), section(.858, .010, .010, earX, .002),
-      section(.875, .012, .012, earX, .001), section(.886, .007, .010, earX, -.001),
-      section(.889, .001, .004, earX, -.002)], paint.skin, 10)
-    loft([section(.861, .002, .003, sign * .078 * fw, .008),
-      section(.871, .004, .007, sign * .078 * fw, .005),
-      section(.880, .002, .003, sign * .077 * fw, .003)], paint.innerEar, 8)
-
-    // 杏形眼的内外眼角收尖，上眼睑压住虹膜；眉尾随头部轮廓渐细。
-    const eyeY = female ? .888 : .886
-    const eyeShape = [[.012, .000, .0006], [.019, -.0023, .0038], [.027, -.0028, female ? .0054 : .0045],
-      [.035, -.0014, .0043], [.042, female ? .0024 : .0013, female ? .0030 : .0023]]
-    const eyeSamples = eyeShape.map(([x, lo, hi]) => [sign * x * fw, eyeY + lo, eyeY + hi])
-    ribbon(eyeSamples, face, paint.eye, .00145)
-    const irisX = .026 * fw
-    const irisSamples = [[-.0062, -.0008, .0022], [-.0044, -.0024, .0040],
-      [.000, -.0028, .0044], [.0044, -.0023, .0041], [.0062, -.0004, .0026]]
-    ribbon(irisSamples.map(([x, lo, hi]) => [sign * (irisX + x), eyeY + lo, eyeY + hi]), face, paint.iris, .0020)
-    patch([[irisX - .0025, eyeY - .0014], [irisX + .0022, eyeY - .0014],
-      [irisX + .0022, eyeY + .003], [irisX - .0025, eyeY + .003]].map(([x, y]) => [sign * x, y]),
-    face, paint.pupil, .0023)
-    patch([[sign * irisX - .0017, eyeY + .0023], [sign * irisX - .0004, eyeY + .0018],
-      [sign * irisX, eyeY + .0034], [sign * irisX - .0013, eyeY + .0037]], face, paint.eye, .0027)
-    ribbon(eyeSamples.map(([x, , hi], i) => [x, hi - .0002, hi + (i === 0 || i === 4 ? .0003 : .0013)]),
-      face, paint.lid, .0026)
-    const browY = eyeY + (female ? .011 : .010)
-    const brow = female
-      ? [[.012, .000, .0016], [.021, .0022, .0044], [.030, .0039, .0064], [.036, .0041, .0057], [.045, .0011, .0016]]
-      : [[.011, .0001, .0020], [.020, .0016, .0050], [.030, .0024, .0061], [.037, .0023, .0051], [.044, .0003, .0010]]
-    ribbon(brow.map(([x, a, b]) => [sign * x * fw, browY + a, browY + b]), face, paint.hair, .0016)
+    const earX = sign * 0.069 * fw
+    loft([
+      section(0.876, 0.003, 0.004, earX, 0.002),
+      section(0.884, 0.008, 0.009, earX, 0.002),
+      section(0.902, 0.009, 0.010, earX, 0.000),
+      section(0.916, 0.005, 0.008, earX, -0.001),
+      section(0.920, 0.001, 0.003, earX, -0.002)
+    ], paint.skinShade, 10, 0.95)
   }
 
-  // 鼻梁与鼻翼连续起伏，侧面有清楚的鼻尖，正面以自然光影塑形。
-  const nose = [
-    [.854, .008, .0018], [.857, .013, .0075], [.862, .012, female ? .012 : .014],
-    [.869, .0088, .0096], [.882, .007, .005], [.894, .009, .001]
-  ]
-  const noseRows = nose.map(([y, width, rise]) => [-1, -.54, 0, .54, 1].map(k =>
-    vertex(face(k * width, y, .0004 + (1 - k * k) * rise), paint.skin)))
-  for (let j = 1; j < noseRows.length; j++) {
-    for (let i = 0; i < 4; i++) {
-      const a = noseRows[j - 1], b = noseRows[j]
-      indices.push(a[i], a[i + 1], b[i], a[i + 1], b[i + 1], b[i])
-    }
-  }
-  const smile = female ? .8434 : .8425
-  const mouth = [[-.018, smile - .0007, smile], [-.010, .8394, .8412], [-.004, .8384, .8419],
-    [0, .8383, .8408], [.004, .8384, .8419], [.010, .8394, .8412], [.018, smile - .0007, smile]]
-  ribbon(mouth.map(([x, lo]) => [x, lo - .0027 * (1 - Math.abs(x) / .018), lo + .0002]), face, paint.lowerLip, .0010)
-  ribbon(mouth, face, paint.lip, .0013)
+  // ── 5. 立体发型（与 5.75 头身轮廓精确贴合） ──
+  const hairProfile = [
+    section(0.862, 0.060, 0.061, 0, 0.006),
+    section(0.888, 0.072, 0.072, 0, 0.004),
+    section(0.916, 0.076, 0.074, 0, 0.002),
+    section(0.942, 0.076, 0.074, 0, 0.000),
+    section(0.962, female ? 0.072 : 0.074, 0.072, -0.002, -0.001),
+    section(0.978, female ? 0.060 : 0.064, 0.062, -0.004, -0.003),
+    section(0.991, female ? 0.040 : 0.046, 0.045, -0.006, -0.004),
+    section(1.000, 0.004, 0.004, -0.006, -0.004)
+  ].map(s => ({ ...s, width: s.width * fw, x: female ? -s.x * 0.35 : s.x }))
 
-  // 发际线依次贴合额角、鬓角、耳上和后颈。顶面的偏分从额头转向发旋。
-  const hair = [
-    section(.845, .060, .062, 0, .008), section(.863, .071, .072, 0, .005),
-    section(.894, .076, .077, 0, .002), section(.926, .077, .076, 0, .000),
-    section(.948, .075, .074, -.001, -.001), section(.966, female ? .069 : .072, .072, -.004, -.002),
-    section(.981, female ? .052 : .060, .059, -.010, -.004), section(.992, female ? .030 : .039, .037, -.014, -.006),
-    section(1, .0018, .002, -.016, -.008)
-  ].map(s => ({ ...s, width: s.width * fw, x: female ? -s.x * .45 : s.x }))
   const hairline = female
-    ? [[0, .949], [.44, .947], [.85, .928], [1.18, .904], [1.33, .878], [1.52, .893], [1.78, .899], [2.22, .870], [Math.PI, .857]]
-    : [[0, .934], [.44, .937], [.86, .927], [1.15, .918], [1.32, .874], [1.49, .890], [1.76, .895], [2.26, .869], [Math.PI, .854]]
-  // 发束的起伏与明暗直接刻进头发表面，侧面和逆光下都保持连续的轮廓。
-  const hairTones = [0x342e2d, 0x393130, 0x3e3330, 0x443832, 0x4a3c35, 0x514039, 0x55433b]
-  function strandAt(theta, t) {
-    const part = female ? -.28 : .49
-    const flow = Math.tanh((part - theta) * 2.6)
-    const sweep = flow * (female ? .52 : .75) * Math.sin(t * 1.7) * Math.max(.22, 1 - Math.abs(theta) / 3)
-    const u = theta - sweep
-    return (.5 + .5 * Math.cos(11 * u + .72 * Math.sin(3 * u + t))) ** 1.35
-  }
-  function hairAt(angle, t) {
+    ? [[0, 0.938], [0.45, 0.937], [0.88, 0.926], [1.22, 0.906], [1.38, 0.884], [1.56, 0.898], [1.85, 0.902], [2.30, 0.878], [Math.PI, 0.866]]
+    : [[0, 0.936], [0.46, 0.938], [0.88, 0.928], [1.18, 0.916], [1.34, 0.884], [1.52, 0.898], [1.80, 0.900], [2.28, 0.874], [Math.PI, 0.862]]
+
+  const hairSegs = 40
+  const hairLevels = [0, 0.14, 0.32, 0.54, 0.78, 1]
+  function hairPoint(angle, t) {
     const theta = Math.atan2(Math.sin(angle), Math.cos(angle))
     const a = Math.abs(theta)
     let i = 1
     while (i < hairline.length - 1 && a > hairline[i][0]) i++
     const [ax, ay] = hairline[i - 1], [bx, by] = hairline[i]
-    const sweep = (female ? -.009 : .010) * Math.sin(theta * 2.4) * Math.max(0, 1 - a / 1.6)
-    const base = ay + (by - ay) * (a - ax) / (bx - ax) + sweep
-    const y = base + (1 - base) * Math.sin(t * Math.PI / 2)
-    const point = ringPoint(atHeight(hair, y), theta, .96)
-    const lift = .0022 * strandAt(theta, t) * Math.sin(Math.PI * t)
-    point[0] += lift * Math.sin(theta)
-    point[1] += lift * t * .40
-    point[2] += lift * Math.cos(theta)
-    return point
+    const partSweep = (female ? -0.008 : 0.009) * Math.sin(theta * 2.2) * Math.max(0, 1 - a / 1.5)
+    const baseY = lerp(ay, by, (a - ax) / Math.max(1e-5, bx - ax)) + partSweep
+    const y = lerp(baseY, 1.0, Math.sin(t * Math.PI / 2))
+    const pt = ringPoint(atHeight(hairProfile, y), theta, 0.95)
+    const crownLift = 0.0024 * Math.sin(Math.PI * t) * (female ? 0.9 : 1.05)
+    pt[0] += crownLift * Math.sin(theta)
+    pt[1] += crownLift * t * 0.45
+    pt[2] += crownLift * Math.cos(theta)
+    return pt
   }
-  const hairSegments = 48
-  const levels = [0, .11, .25, .43, .62, .81, 1]
-  const scalp = levels.map(t =>
-    Array.from({ length: hairSegments }, (_, i) => hairAt(i * circle / hairSegments, t)))
-  // 下沿收进头部以贴住皮肤；顶部小面闭合发旋。
-  const roots = scalp[0].map(([x, y, z]) => [x * .94, y + .001, z * .94])
-  shell([roots, ...scalp], (j, i) => {
-    const t = levels[Math.max(0, j - 1)]
-    const angle = i * circle / hairSegments
-    const theta = Math.atan2(Math.sin(angle), Math.cos(angle))
-    const light = .17 + .57 * strandAt(theta, t) * Math.sin(Math.PI * t) + .16 * t
-    return hairTones[Math.round((hairTones.length - 1) * light)]
+
+  const scalp = hairLevels.map(t => Array.from({ length: hairSegs }, (_, i) => hairPoint(i * TAU / hairSegs, t)))
+  const hairRoots = scalp[0].map(([x, y, z]) => [x * 0.92, y + 0.001, z * 0.92])
+  shell([hairRoots, ...scalp], (j) => {
+    if (j <= 1) return paint.hairDark
+    if (j <= 4) return paint.hairMid
+    return paint.hairLight
   })
 
-  // 额前发束从分缝展开，发梢落在皮肤上；短发向一侧扫，扎发从额头向耳后收。
-  const hairFront = surface(hair, .96)
-  const forelocks = female
-    ? [
-        [[-.030,.970,.976],[-.012,.955,.972],[.006,.946,.966],[.027,.934,.955],[.044,.921,.941],[.057,.906,.923],[.063,.894,.897]],
-        [[-.058,.917,.922],[-.048,.931,.947],[-.039,.944,.958],[-.031,.958,.969],[-.028,.969,.972]]
-      ]
-    : [
-        [[-.057,.914,.918],[-.047,.917,.932],[-.032,.924,.943],[-.014,.935,.960],[.006,.943,.971],[.026,.955,.973],[.036,.965,.967]],
-        [[-.051,.912,.914],[-.040,.916,.928],[-.026,.921,.937],[-.011,.931,.946],[.005,.940,.950],[.019,.949,.951]]
-      ]
-  for (const strand of forelocks) {
-    ribbon(strand.map(([x, lo, hi]) => [x * fw, lo, hi]), hairFront, paint.hair, .0016)
-  }
-  if (female) {
-    for (const sign of [-1, 1]) {
-      const bottom = sign > 0 ? .855 : .876
-      loft([section(bottom, .002, .002, sign * .068 * fw, .033),
-        section(bottom + .011, .005, .006, sign * .069 * fw, .035),
-        section(.900, .008, .009, sign * .069 * fw, .034),
-        section(.919, .009, .011, sign * .065 * fw, .038),
-        section(.934, .006, .010, sign * .061 * fw, .039)], paint.hair, 10)
-    }
-    // 在后颈扎拢，马尾自然垂到衣领一侧，从街区头像与跟拍背面都能辨认。
+  if (!female) {
     loft([
-      section(.761, .005, .008, .067, -.083), section(.776, .017, .018, .066, -.097),
-      section(.802, .025, .024, .059, -.109), section(.832, .028, .030, .047, -.115),
-      section(.855, .021, .023, .032, -.110), section(.869, .016, .020, .023, -.097)
-    ], paint.hair, 12)
-    loft([section(.860, .019, .021, .025, -.105), section(.871, .021, .023, .021, -.098)],
-      paint.hairTie, 12)
-    loft([section(.869, .017, .022, .021, -.099), section(.884, .031, .034, .014, -.086),
-      section(.904, .030, .031, .007, -.073), section(.918, .014, .018, .006, -.066)], paint.hair, 12)
+      section(0.940, 0.012, 0.006, 0.024, 0.065),
+      section(0.953, 0.030, 0.010, 0.006, 0.069),
+      section(0.968, 0.036, 0.012, -0.012, 0.066),
+      section(0.983, 0.023, 0.010, -0.022, 0.054)
+    ], paint.hairMid, 12, 0.92)
+  } else {
+    // 温婉斜分前额发束，柔和过渡额角
+    loft([
+      section(0.926, 0.010, 0.005, -0.044 * fw, 0.052),
+      section(0.938, 0.022, 0.008, -0.022 * fw, 0.064),
+      section(0.952, 0.028, 0.010, 0.004 * fw, 0.068),
+      section(0.968, 0.022, 0.009, 0.024 * fw, 0.060)
+    ], paint.hairMid, 12, 0.92)
+    for (const sign of [-1, 1]) {
+      const bot = sign > 0 ? 0.876 : 0.890
+      loft([
+        section(bot, 0.002, 0.002, sign * 0.066 * fw, 0.029),
+        section(bot + 0.014, 0.006, 0.007, sign * 0.068 * fw, 0.030),
+        section(0.920, 0.008, 0.009, sign * 0.068 * fw, 0.030),
+        section(0.944, 0.006, 0.008, sign * 0.060 * fw, 0.033)
+      ], paint.hairDark, 10, 0.92)
+    }
+    loft([
+      section(0.772, 0.005, 0.007, 0.054, -0.074),
+      section(0.790, 0.014, 0.015, 0.052, -0.086),
+      section(0.814, 0.021, 0.022, 0.046, -0.096),
+      section(0.838, 0.025, 0.025, 0.038, -0.100),
+      section(0.860, 0.022, 0.023, 0.030, -0.099),
+      section(0.878, 0.016, 0.018, 0.022, -0.094),
+      section(0.892, 0.013, 0.016, 0.015, -0.086)
+    ], paint.hairMid, 16, 0.96)
+    loft([
+      section(0.882, 0.016, 0.018, 0.018, -0.091),
+      section(0.894, 0.017, 0.019, 0.014, -0.085)
+    ], paint.hairTie, 16, 0.96)
+    loft([
+      section(0.891, 0.014, 0.017, 0.014, -0.086),
+      section(0.906, 0.024, 0.026, 0.009, -0.076),
+      section(0.920, 0.023, 0.024, 0.004, -0.068),
+      section(0.932, 0.011, 0.014, 0.003, -0.060)
+    ], paint.hairDark, 14, 0.96)
   }
 
   const geometry = new BufferGeometry()
   geometry.setIndex(indices)
   geometry.setAttribute('position', new Float32BufferAttribute(positions, 3))
   geometry.setAttribute('color', new Uint8BufferAttribute(colors, 3, true))
-  geometry.setAttribute('aStaffSurface', new Uint8BufferAttribute(surfaces, 2))
+  geometry.setAttribute('aStaffSurface', new Uint8BufferAttribute(surfaces, 4))
   geometry.computeVertexNormals()
-  const normal = geometry.getAttribute('normal')
-  for (const [index, v] of panelNormals) normal.setXYZ(index, v.x, v.y, v.z)
   geometry.computeBoundingBox()
-  geometry.boundingBox.min.z = Math.min(geometry.boundingBox.min.z, -.17)
-  geometry.boundingBox.max.z = Math.max(geometry.boundingBox.max.z, .20)
+  geometry.boundingBox.min.z = Math.min(geometry.boundingBox.min.z, -0.22)
+  geometry.boundingBox.max.z = Math.max(geometry.boundingBox.max.z, 0.24)
   geometry.computeBoundingSphere()
-  geometry.boundingSphere.radius += .025
+  geometry.boundingSphere.radius += 0.04
   return geometry
 }
 
-const strideVertex = /* glsl */ `
-  attribute vec2 aStaffSurface;
+// 绘制 1024×512 清淡轻写实政务风男女面部贴图（左半男 0..512，右半女 512..1024）
+function createStaffFaceTexture() {
+  const canvas = document.createElement('canvas')
+  canvas.width = 1024
+  canvas.height = 512
+  const ctx = canvas.getContext('2d')
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+  const paintFace = (female) => {
+    const cxBase = female ? 768 : 256
+    const faceHalfW = female ? 0.061 : 0.065
+    const yMin = 0.822
+    const yMax = 0.954
+    const px = (wx) => cxBase + (wx / faceHalfW) * 256
+    const py = (wy) => 512 * (yMax - wy) / (yMax - yMin)
+    const sx = (dw) => (dw / faceHalfW) * 256
+    const sy = (dh) => (dh / (yMax - yMin)) * 512
+
+    // 1. 柔和颊红气色与眼眶微淡立体感（避免扁平）
+    for (const sign of [-1, 1]) {
+      const cx = px(sign * 0.032)
+      const cy = py(0.871)
+      const r = sx(0.021)
+      const blush = ctx.createRadialGradient(cx, cy, 1, cx, cy, r)
+      blush.addColorStop(0, female ? 'rgba(226, 134, 122, 0.16)' : 'rgba(218, 136, 118, 0.10)')
+      blush.addColorStop(1, 'rgba(226, 134, 122, 0)')
+      ctx.fillStyle = blush
+      ctx.beginPath()
+      ctx.ellipse(cx, cy, r, sy(0.013), 0, 0, TAU)
+      ctx.fill()
+
+      // 眼窝极浅暖影
+      const ex = px(sign * 0.0235)
+      const ey = py(0.896)
+      const orb = ctx.createRadialGradient(ex, ey, 1, ex, ey, sx(0.017))
+      orb.addColorStop(0, 'rgba(176, 126, 98, 0.15)')
+      orb.addColorStop(1, 'rgba(176, 126, 98, 0)')
+      ctx.fillStyle = orb
+      ctx.beginPath()
+      ctx.ellipse(ex, ey, sx(0.016), sy(0.009), 0, 0, TAU)
+      ctx.fill()
+    }
+
+    // 2. 眉与眼（左右对称绘制）
+    for (const sign of [-1, 1]) {
+      // 眉毛（男款沉稳微弓，女款柔和纤细柳叶弧）
+      ctx.save()
+      ctx.fillStyle = female ? 'rgba(54, 42, 39, 0.88)' : 'rgba(46, 36, 34, 0.92)'
+      ctx.beginPath()
+      if (female) {
+        ctx.moveTo(px(sign * 0.0110), py(0.9035))
+        ctx.quadraticCurveTo(px(sign * 0.0235), py(0.9105), px(sign * 0.039), py(0.9035))
+        ctx.quadraticCurveTo(px(sign * 0.0235), py(0.9070), px(sign * 0.0110), py(0.9012))
+      } else {
+        ctx.moveTo(px(sign * 0.0105), py(0.9030))
+        ctx.quadraticCurveTo(px(sign * 0.0235), py(0.9092), px(sign * 0.039), py(0.9030))
+        ctx.quadraticCurveTo(px(sign * 0.0235), py(0.9045), px(sign * 0.0105), py(0.8992))
+      }
+      ctx.closePath()
+      ctx.fill()
+      ctx.restore()
+
+      // 杏仁眼：清澈舒展眼型 + 暖象牙眼白 + 温润深褐虹膜 + 双点柔光
+      const eyeY = female ? 0.8885 : 0.8875
+      const innerX = px(sign * 0.0110)
+      const midX = px(sign * 0.0240)
+      const outerX = px(sign * 0.0372)
+      const topY = py(eyeY + (female ? 0.0086 : 0.0074))
+      const botY = py(eyeY - (female ? 0.0056 : 0.0050))
+      const innerY = py(eyeY - 0.0008)
+      const outerY = py(eyeY + (female ? 0.0012 : 0.0002))
+
+      ctx.save()
+      ctx.beginPath()
+      ctx.moveTo(innerX, innerY)
+      ctx.quadraticCurveTo(midX, topY, outerX, outerY)
+      ctx.quadraticCurveTo(midX, botY, innerX, innerY)
+      ctx.closePath()
+      ctx.fillStyle = '#f5eee6'
+      ctx.fill()
+      ctx.clip()
+
+      // 温润深褐虹膜（尺寸饱满有神）
+      const irisCx = px(sign * 0.0238)
+      const irisCy = py(eyeY + 0.0008)
+      const irisR = sx(female ? 0.0084 : 0.0079)
+      const irisGrad = ctx.createRadialGradient(irisCx, irisCy - 1, 1, irisCx, irisCy, irisR)
+      irisGrad.addColorStop(0, '#1a1210')
+      irisGrad.addColorStop(0.55, '#34221c')
+      irisGrad.addColorStop(1, '#4b3329')
+      ctx.fillStyle = irisGrad
+      ctx.beginPath()
+      ctx.arc(irisCx, irisCy, irisR, 0, TAU)
+      ctx.fill()
+
+      ctx.fillStyle = '#140e0d'
+      ctx.beginPath()
+      ctx.arc(irisCx, irisCy, irisR * 0.48, 0, TAU)
+      ctx.fill()
+
+      // 主高光点 + 右下方柔和反光点
+      ctx.fillStyle = 'rgba(255, 251, 246, 0.92)'
+      ctx.beginPath()
+      ctx.arc(irisCx - sx(0.0022), irisCy - sy(0.0020), sx(0.0022), 0, TAU)
+      ctx.fill()
+      ctx.fillStyle = 'rgba(255, 248, 240, 0.45)'
+      ctx.beginPath()
+      ctx.arc(irisCx + sx(0.0020), irisCy + sy(0.0022), sx(0.0011), 0, TAU)
+      ctx.fill()
+      ctx.restore()
+
+      // 柔和上眼睑线 + 极浅下睑影 + 淡双眼皮线
+      ctx.save()
+      ctx.lineCap = 'round'
+      ctx.strokeStyle = female ? 'rgba(38, 28, 25, 0.92)' : 'rgba(42, 31, 28, 0.88)'
+      ctx.lineWidth = female ? 4.6 : 4.2
+      ctx.beginPath()
+      ctx.moveTo(innerX, innerY)
+      ctx.quadraticCurveTo(midX, topY, outerX + sign * 2.5, outerY - (female ? 1.2 : 0))
+      ctx.stroke()
+
+      ctx.strokeStyle = 'rgba(136, 94, 74, 0.34)'
+      ctx.lineWidth = 1.8
+      ctx.beginPath()
+      ctx.moveTo(innerX + sign * 2, innerY + 1)
+      ctx.quadraticCurveTo(midX, botY, outerX - sign * 1.5, outerY + 1)
+      ctx.stroke()
+
+      ctx.strokeStyle = 'rgba(156, 108, 84, 0.28)'
+      ctx.lineWidth = 1.6
+      ctx.beginPath()
+      ctx.moveTo(innerX + sign * 3, py(eyeY + 0.0068))
+      ctx.quadraticCurveTo(midX, py(eyeY + 0.0106), outerX - sign * 2, py(eyeY + 0.0060))
+      ctx.stroke()
+      ctx.restore()
+    }
+
+    // 3. 轻写实柔鼻影（鼻梁高光 + 鼻底淡弧影，不画硬线）
+    const noseTipY = py(0.864)
+    const noseShadow = ctx.createRadialGradient(px(0), noseTipY + 4, 1, px(0), noseTipY + 4, sx(0.0125))
+    noseShadow.addColorStop(0, 'rgba(166, 114, 86, 0.28)')
+    noseShadow.addColorStop(0.55, 'rgba(176, 126, 98, 0.12)')
+    noseShadow.addColorStop(1, 'rgba(176, 126, 98, 0)')
+    ctx.fillStyle = noseShadow
+    ctx.beginPath()
+    ctx.ellipse(px(0), noseTipY + 4, sx(0.012), sy(0.0052), 0, 0, TAU)
+    ctx.fill()
+
+    // 鼻梁左侧柔和提亮
+    const noseGlow = ctx.createLinearGradient(px(-0.003), py(0.888), px(0.003), py(0.866))
+    noseGlow.addColorStop(0, 'rgba(255, 244, 234, 0)')
+    noseGlow.addColorStop(0.5, 'rgba(255, 244, 234, 0.22)')
+    noseGlow.addColorStop(1, 'rgba(255, 244, 234, 0)')
+    ctx.strokeStyle = noseGlow
+    ctx.lineWidth = 3.0
+    ctx.lineCap = 'round'
+    ctx.beginPath()
+    ctx.moveTo(px(-0.001), py(0.887))
+    ctx.lineTo(px(-0.001), py(0.867))
+    ctx.stroke()
+
+    // 4. 温和微笑唇线（嘴角柔和微扬，男款淡弧自然，女款微带清淡裸豆沙色）
+    const mouthY = 0.8445
+    const mLeft = px(female ? -0.0150 : -0.0160)
+    const mRight = px(female ? 0.0150 : 0.0160)
+    const mMidX = px(0)
+    const mMidY = py(mouthY - 0.0012)
+    const mCornerY = py(mouthY + 0.0014)
+
+    ctx.save()
+    ctx.fillStyle = female ? 'rgba(204, 122, 112, 0.44)' : 'rgba(176, 114, 98, 0.24)'
+    ctx.beginPath()
+    ctx.moveTo(mLeft, mCornerY)
+    ctx.quadraticCurveTo(px(-0.0055), py(mouthY + 0.0026), mMidX, py(mouthY + 0.0014))
+    ctx.quadraticCurveTo(px(0.0055), py(mouthY + 0.0026), mRight, mCornerY)
+    ctx.quadraticCurveTo(mMidX, py(mouthY - 0.0060), mLeft, mCornerY)
+    ctx.closePath()
+    ctx.fill()
+    ctx.restore()
+
+    ctx.save()
+    ctx.strokeStyle = female ? 'rgba(148, 82, 76, 0.84)' : 'rgba(138, 84, 72, 0.80)'
+    ctx.lineWidth = female ? 2.5 : 2.7
+    ctx.lineCap = 'round'
+    ctx.beginPath()
+    ctx.moveTo(mLeft, mCornerY)
+    ctx.quadraticCurveTo(mMidX, mMidY, mRight, mCornerY)
+    ctx.stroke()
+
+    ctx.strokeStyle = 'rgba(164, 112, 88, 0.26)'
+    ctx.lineWidth = 2.0
+    ctx.beginPath()
+    ctx.moveTo(px(-0.0075), py(mouthY - 0.0052))
+    ctx.quadraticCurveTo(mMidX, py(mouthY - 0.0066), px(0.0075), py(mouthY - 0.0052))
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  paintFace(false)
+  paintFace(true)
+
+  const texture = new CanvasTexture(canvas)
+  texture.colorSpace = SRGBColorSpace
+  return texture
+}
+
+// 真实关节圆弧旋转步态：腿绕髋部旋转 + 膝部自然屈曲，臂绕肩部反相摆动，法线同步旋转
+const strideVertexPars = /* glsl */ `
+  attribute vec4 aStaffSurface;
   #ifdef USE_INSTANCING
     attribute float aStridePhase;
     attribute vec2 aStaffFade;
   #endif
   varying float vStaffLightResponse;
+  varying vec2 vStaffPbr;
   varying vec2 vStaffFade;
   varying vec3 vVestPrint;
+  varying vec3 vHeadLocal;
+  varying float vFaceGender;
 
-  // xy = 竖向抬升和前后摆幅，zw = 两项对原始顶点高度的导数，用于同步修正光照法线。
-  vec4 staffStrideOffset(vec3 p) {
+  struct StaffMotion {
+    vec3 pos;
+    float sinAng;
+    float cosAng;
+  };
+
+  StaffMotion evalStaffMotion(vec3 p) {
+    StaffMotion m;
+    m.pos = p;
+    m.sinAng = 0.0;
+    m.cosAng = 1.0;
     #ifdef USE_INSTANCING
-      if (aStridePhase >= 0.0 && aStaffSurface.x > 0.5) {
+      if (aStridePhase >= 0.0) {
+        if (aStaffSurface.x < 0.5 || aStaffSurface.x > 2.5) {
+          m.pos.y += 0.0055 * abs(sin(aStridePhase));
+          return m;
+        }
         bool leg = aStaffSurface.x < 1.5;
-        float side = sign(p.x);
+        float side = p.x >= 0.0 ? 1.0 : -1.0;
         float phase = side * sin(aStridePhase);
         float swingFoot = max(0.0, side * cos(aStridePhase));
-        float span = leg ? 0.405 : 0.283;
-        float reach = clamp(((leg ? 0.464 : 0.733) - p.y) / span, 0.0, 1.0);
-        float slope = reach > 0.0 && reach < 1.0 ? -1.0 / span : 0.0;
-        float sweep = leg ? phase * 0.078 - side * 0.036 : side * 0.036 - phase * 0.060;
-        float knee = leg ? 0.017 * swingFoot : 0.0;
-        float lift = leg ? 0.030 * swingFoot * swingFoot : 0.008 * max(0.0, -phase);
-        return vec4(reach * reach * lift, reach * sweep + 4.0 * reach * (1.0 - reach) * knee,
-          slope * 2.0 * reach * lift, slope * (sweep + 4.0 * (1.0 - 2.0 * reach) * knee));
+        if (leg) {
+          float pivotY = 0.482;
+          float pivotZ = -0.002;
+          float t = clamp((pivotY - p.y) / 0.482, 0.0, 1.0);
+          float hipAng = -phase * 0.34 * smoothstep(0.0, 0.14, t);
+          float kneeMask = smoothstep(0.42, 0.62, t);
+          float kneeAng = swingFoot * 0.44 * kneeMask;
+          float totalAng = hipAng + kneeAng;
+          float c = cos(totalAng), s = sin(totalAng);
+          float dy = p.y - pivotY;
+          float dz = p.z - pivotZ;
+          m.pos.y = pivotY + dy * c - dz * s + 0.016 * swingFoot * t;
+          m.pos.z = pivotZ + dy * s + dz * c;
+          m.sinAng = s;
+          m.cosAng = c;
+          return m;
+        } else {
+          float pivotY = 0.733;
+          float pivotZ = -0.002;
+          float t = clamp((pivotY - p.y) / 0.323, 0.0, 1.0);
+          float armAng = phase * 0.28 * smoothstep(0.0, 0.18, t) - max(0.0, phase) * 0.14 * smoothstep(0.48, 0.72, t);
+          float c = cos(armAng), s = sin(armAng);
+          float dy = p.y - pivotY;
+          float dz = p.z - pivotZ;
+          m.pos.y = pivotY + dy * c - dz * s;
+          m.pos.z = pivotZ + dy * s + dz * c;
+          m.sinAng = s;
+          m.cosAng = c;
+          return m;
+        }
       }
     #endif
-    return vec4(0.0);
+    return m;
   }
 `
 
 /** aStridePhase 由实例提供，单位弧度；负值保持站姿。uLift 可在昼夜切换时直接更新。 */
 export function createStaffAvatarMaterial() {
-  const material = new MeshLambertMaterial({ color: 0xffffff, vertexColors: true })
-  // 背心印字由男女实例共用，随衣料受光并通过 mipmap 在远处自然消失。
+  const material = new MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    roughness: 0.72,
+    metalness: 0.04
+  })
+
+  // 后背「网格员」高清印字纹理
   const label = document.createElement('canvas')
-  label.width = 192
-  label.height = 64
+  label.width = 256
+  label.height = 80
   const ink = label.getContext('2d')
-  ink.font = '600 50px "PingFang SC", "Microsoft YaHei", sans-serif'
+  ink.font = '700 62px "PingFang SC", "Microsoft YaHei", sans-serif'
   ink.textAlign = 'center'
   ink.textBaseline = 'middle'
-  ink.fillStyle = '#fff'
+  ink.fillStyle = '#ffffff'
   ink.fillText('网格员', label.width / 2, label.height / 2)
   const vestPrint = new CanvasTexture(label)
-  material.addEventListener('dispose', () => vestPrint.dispose())
+  const faceMap = createStaffFaceTexture()
+
+  material.addEventListener('dispose', () => {
+    vestPrint.dispose()
+    faceMap.dispose()
+  })
+
   const uLift = { value: 0.12 }
   material.userData.uLift = uLift
+
   material.onBeforeCompile = shader => {
     shader.uniforms.uStaffLift = uLift
     shader.uniforms.uVestPrint = { value: vestPrint }
+    shader.uniforms.uFaceMap = { value: faceMap }
+
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', `#include <common>\n${strideVertex}`)
+      .replace('#include <common>', `#include <common>\n${strideVertexPars}`)
       .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
-        vec4 stride = staffStrideOffset(position);
-        objectNormal.y = (objectNormal.y - stride.w * objectNormal.z) / (1.0 + stride.z);
+        StaffMotion staffMot = evalStaffMotion(position);
+        float nY = objectNormal.y * staffMot.cosAng - objectNormal.z * staffMot.sinAng;
+        float nZ = objectNormal.y * staffMot.sinAng + objectNormal.z * staffMot.cosAng;
+        objectNormal.y = nY;
+        objectNormal.z = nZ;
         #ifdef USE_INSTANCING
           vStaffFade = aStaffFade;
         #else
           vStaffFade = vec2(0.0);
         #endif
         vStaffLightResponse = aStaffSurface.y / 255.0;
-        vVestPrint = vec3(0.5 - position.x / 0.206, 0.5 + (position.y - 0.645) / 0.065,
-          step(position.z, -0.025) * (1.0 - step(0.5, aStaffSurface.x)));`)
+        vStaffPbr = vec2(aStaffSurface.z / 255.0, aStaffSurface.w / 255.0);
+        vHeadLocal = position;
+        vFaceGender = aStaffSurface.x;
+        vVestPrint = vec3(0.5 - position.x / 0.176, 0.5 + (position.y - 0.621) / 0.056,
+          step(position.z, -0.025) * step(aStaffSurface.x, 0.5));`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
-        transformed.yz += stride.xy;`)
+        transformed = staffMot.pos;`)
+
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
         uniform float uStaffLift;
         uniform sampler2D uVestPrint;
+        uniform sampler2D uFaceMap;
         varying vec3 vVestPrint;
+        varying vec3 vHeadLocal;
+        varying float vFaceGender;
         varying float vStaffLightResponse;
+        varying vec2 vStaffPbr;
         varying vec2 vStaffFade;
         float staffBayer2(vec2 p) {
           vec2 bit = mod(floor(p), 2.0);
@@ -576,21 +897,41 @@ export function createStaffAvatarMaterial() {
         }`)
       .replace('#include <color_fragment>', `#include <color_fragment>
         if (vVestPrint.z > 0.5 && all(lessThan(abs(vVestPrint.xy - 0.5), vec2(0.5)))) {
-          float ink = texture2D(uVestPrint, vVestPrint.xy).a;
-          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.72, 0.78, 0.77), 0.88 * ink);
+          float inkAlpha = texture2D(uVestPrint, vVestPrint.xy).a;
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.90, 0.95, 0.98), 0.92 * inkAlpha);
+        }
+        if (vFaceGender > 2.5 && vHeadLocal.z > 0.024) {
+          bool isFemale = vFaceGender > 3.5;
+          float halfW = isFemale ? 0.061 : 0.065;
+          float uLocal = 0.5 + vHeadLocal.x / (2.0 * halfW);
+          float vLocal = (vHeadLocal.y - 0.822) / 0.132;
+          if (uLocal > 0.02 && uLocal < 0.98 && vLocal > 0.01 && vLocal < 0.99) {
+            float uAtlas = isFemale ? (0.5 + 0.5 * uLocal) : (0.5 * uLocal);
+            vec4 faceTex = texture2D(uFaceMap, vec2(uAtlas, vLocal));
+            diffuseColor.rgb = mix(diffuseColor.rgb, faceTex.rgb, faceTex.a);
+          }
         }`)
-      // 有序覆盖率保留人物自身和建筑的深度遮挡；到近景后完整像素正常照明。
       .replace('#include <alphatest_fragment>', `#include <alphatest_fragment>
         if (vStaffFade.x > 0.001) {
           float cutoff = (4.0 * staffBayer2(gl_FragCoord.xy) + staffBayer2(gl_FragCoord.xy * 0.5) + 0.5) / 16.0;
           if (1.0 - vStaffFade.x < cutoff) discard;
         }`)
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+        roughnessFactor = clamp(vStaffPbr.x, 0.08, 0.96);`)
+      .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
+        metalnessFactor = clamp(vStaffPbr.y, 0.0, 0.9);`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
-        totalEmissiveRadiance += diffuseColor.rgb * (uStaffLift * vStaffLightResponse);`)
+        float nightFactor = clamp((uStaffLift - 0.12) / 0.68, 0.0, 1.0);
+        vec3 viewDir = normalize(vViewPosition);
+        float rim = pow(clamp(1.0 - abs(dot(normalize(normal), viewDir)), 0.0, 1.0), 2.6);
+        vec3 rimTint = mix(vec3(0.98, 0.96, 0.92), vec3(0.74, 0.88, 0.98), nightFactor);
+        totalEmissiveRadiance += diffuseColor.rgb * (uStaffLift * vStaffLightResponse * 0.62);
+        totalEmissiveRadiance += rimTint * rim * mix(0.10, 0.30, nightFactor);`)
       .replace('#include <opaque_fragment>', `
-        outgoingLight = mix(outgoingLight, vec3(dot(outgoingLight, vec3(0.2126, 0.7152, 0.0722))) * 0.70, vStaffFade.y * 0.80);
+        outgoingLight = mix(outgoingLight, vec3(dot(outgoingLight, vec3(0.2126, 0.7152, 0.0722))) * 0.72, vStaffFade.y * 0.80);
         #include <opaque_fragment>`)
   }
-  material.customProgramCacheKey = () => 'cockpit-staff-stride-lambert'
+
+  material.customProgramCacheKey = () => 'cockpit-staff-figurine-pbr-v2'
   return material
 }
