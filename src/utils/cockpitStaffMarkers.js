@@ -1,9 +1,10 @@
 import * as THREE from 'three'
+import { WORLD_DIV } from './cityModelCache'
 import badgeAtlasUrl from '../assets/staff-map-badges.png'
 import { createStaffAvatarGeometry, createStaffAvatarMaterial } from './cockpitStaffAvatar'
 import { createStaffScreenLayout, createStaffStatusTexture } from './cockpitStaffOverview'
+import { STAFF_MAP_HEIGHT, STAFF_GROUND_Y } from './cockpitStaffView'
 
-const GROUND_Y = 0.18
 const { clamp, lerp, smoothstep } = THREE.MathUtils
 const TAU = Math.PI * 2
 const STATUS_SIZE = [14, 16, 21]
@@ -11,6 +12,11 @@ const EMPTY = []
 
 export function staffOverviewWeight(viewDistance) {
   return smoothstep(viewDistance, 285, 480)
+}
+
+// 全街道先看社区人数；锁定一个社区时，其人员在社区镜头的落点完整展开。
+export function staffPointOpacity(viewDistance, scoped) {
+  return 1 - (scoped ? smoothstep(viewDistance, 235, 335) : smoothstep(viewDistance, 140, 235))
 }
 
 function createFootprint() {
@@ -124,6 +130,30 @@ export function createStaffMarkers(capacity, onTextureReady) {
   const feet = batch(footprintGeometry, createFootMaterial(), 'staff-footprints')
   feet.renderOrder = 7
 
+  // 跟拍只有一个人。两片三角面给鞋底做接触阴影，沿用整城的静态阴影贴图。
+  const contact = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), new THREE.ShaderMaterial({
+    uniforms: { opacity: { value: 0 } },
+    vertexShader: `
+      varying vec2 groundUv;
+      void main() {
+        groundUv = uv * 2.0 - 1.0;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform float opacity;
+      varying vec2 groundUv;
+      void main() {
+        float soft = 1.0 - smoothstep(0.02, 1.0, length(groundUv));
+        vec2 boots = vec2(abs(groundUv.x) - 0.16, groundUv.y);
+        float sole = 1.0 - smoothstep(0.0, 1.0, length(boots * vec2(9.0, 5.0)));
+        gl_FragColor = vec4(0.035, 0.047, 0.054, opacity * (0.29 * soft * soft + 0.26 * sole));
+        #include <colorspace_fragment>
+      }`,
+    transparent: true, depthWrite: false, toneMapped: false, polygonOffset: true, polygonOffsetFactor: -1
+  }))
+  contact.visible = false
+  group.add(contact)
+
   const lineGeometry = new THREE.BufferGeometry()
   const linePosition = new THREE.BufferAttribute(new Float32Array(capacity * 6), 3).setUsage(THREE.DynamicDrawUsage)
   lineGeometry.setAttribute('position', linePosition)
@@ -141,7 +171,8 @@ export function createStaffMarkers(capacity, onTextureReady) {
   const transform = new THREE.Object3D()
   const view = new THREE.Vector3(), head = new THREE.Vector3(), color = new THREE.Color()
   let camera, width, height, focalPixels, reducedMotion, statusFocus
-  let overview, street, layoutWeight, smoothing, lineCount
+  let overview, street, layoutWeight, layoutStep, obstacles, lineCount
+  let cameraSettleSeconds = 0
 
   function begin(activeCamera, w, h, night, reduceMotion, options = {}) {
     camera = activeCamera
@@ -153,17 +184,23 @@ export function createStaffMarkers(capacity, onTextureReady) {
     if (atlasReady) {
       portraitAvailability = reduceMotion || !(options.dt > 0) ? 1 : Math.min(1, portraitAvailability + options.dt / 0.16)
     }
-    const fallbackDistance = Math.abs(camera.position.y - GROUND_Y) / Math.max(0.1, camera.matrixWorld.elements[9])
+    const fallbackDistance = Math.abs(camera.position.y - STAFF_GROUND_Y) / Math.max(0.1, camera.matrixWorld.elements[9])
     const distance = Number.isFinite(options.viewDistance) ? options.viewDistance : fallbackDistance
     overview = staffOverviewWeight(distance)
     street = 1 - smoothstep(distance, 125, 210)
     layoutWeight = overview + (1 - overview) * 0.30 * smoothstep(distance, 210, 285)
-    smoothing = reduceMotion || !(options.dt > 0) ? 1 : 1 - Math.exp(-options.dt * 20)
+    const frameSeconds = Math.min(0.05, Math.max(0, options.dt || 0))
+    const blocks = options.obstacles || EMPTY
+    const firstLabels = blocks.length > 0 && !obstacles?.length
+    cameraSettleSeconds = options.cameraMoving || firstLabels ? 0.8 : Math.max(0, cameraSettleSeconds - frameSeconds)
+    // 入场或运镜时完成排位。镜头停稳后，人员只随实点移动，拥挤处的微调严格限速。
+    layoutStep = reduceMotion ? Infinity : frameSeconds * (cameraSettleSeconds > 0 ? 110 : 0.3)
     statusFocus = options.statusFocus || 'all'
-    layout.reset(w, h, options.obstacles || EMPTY)
+    obstacles = blocks
     uniformMaterial.userData.uLift.value = night ? 0.80 : 0.12
     lines.material.color.setHex(night ? 0xc5e0d5 : 0x506761)
     lineCount = 0
+    contact.visible = false
     ordered.length = 0
     for (const mesh of group.children) if (mesh.isInstancedMesh) mesh.count = 0
     for (const loc of locations) {
@@ -172,9 +209,9 @@ export function createStaffMarkers(capacity, onTextureReady) {
     }
   }
 
-  function place(st, selected, following, tone) {
+  function place(st, selected, following, tone, opacity = 1) {
     const loc = locations[st.idx]
-    view.set(st.x, GROUND_Y, st.z).applyMatrix4(camera.matrixWorldInverse)
+    view.set(st.x, STAFF_GROUND_Y, st.z).applyMatrix4(camera.matrixWorldInverse)
     const depth = -view.z
     if (depth < camera.near || depth > camera.far || !focalPixels) return false
     const px = width / 2 + focalPixels * view.x / depth
@@ -184,6 +221,7 @@ export function createStaffMarkers(capacity, onTextureReady) {
     loc.person = st
     loc.selected = selected
     loc.following = following
+    loc.opacity = opacity
     loc.tone = tone
     loc.depth = depth
     loc.anchorX = px
@@ -201,48 +239,60 @@ export function createStaffMarkers(capacity, onTextureReady) {
     const st = loc.person
     const worldPerPixel = loc.depth / focalPixels
     const upright = Math.max(0.32, camera.matrixWorldInverse.elements[5])
-    const apparent = 2.65 * upright / worldPerPixel
-    const detail = street * smoothstep(apparent, 8, 17)
-    const figure = loc.row ? detail : 0
-    const portrait = loc.selected ? 26 : loc.column === 2 ? 24 : 22
-    // 三种尺度只由真实镜头或投影驱动，点人和启动跟拍不会在全景切换模型。
+    const apparent = STAFF_MAP_HEIGHT * upright / worldPerPixel
     const targetPixels = loc.following ? 58 : loc.selected ? 52 : clamp(apparent, 28, 40)
-    const scale = clamp(targetPixels * worldPerPixel / upright, 0.85, loc.following ? 4.2 : 5.2)
-    const projectedBody = scale * upright / worldPerPixel
-    const nearBadge = loc.row ? clamp(projectedBody, portrait, 46) : loc.selected ? 36 : 28
+    const modelHeight = clamp(targetPixels * worldPerPixel / upright, 0.85, loc.following ? 4.2 : 5.2)
+    const closeup = loc.selected ? 1 - smoothstep(loc.depth, 0.95, 2.4) : 0
+    loc.figureTop = loc.anchorY
+    loc.figureHeadX = loc.anchorX
+    const detail = street * (loc.following ? 1 : smoothstep(apparent, 8, 17))
+    const hasFigure = loc.row !== 0 || loc.following
+    const figure = hasFigure ? detail : 0
+    const portrait = loc.selected ? 26 : loc.column === 2 ? 24 : 22
+    // 图标和立体人物在同一地面坐标交接，人物按沙盘标记的屏幕尺寸显示。
+    const projectedBody = modelHeight * upright / worldPerPixel
+    const nearBadge = hasFigure ? clamp(projectedBody, portrait, 46) : loc.selected ? 36 : 28
     const size = lerp(lerp(portrait, nearBadge, detail), STATUS_SIZE[loc.column], overview)
-    layout.place(loc, size, layoutWeight, smoothing)
+    layout.place(loc, size, layoutWeight, layoutStep)
     loc.close = figure >= 0.5
     loc.figureWeight = figure
     loc.badgeSize = size
-    loc.figureTop = loc.anchorY
-    loc.figureHeadX = loc.anchorX
     loc.figureHalfWidth = 0
     loc.footRadius = 0
 
     if (figure > 0.002) {
-      transform.position.set(st.x, GROUND_Y, st.z)
+      head.set(st.x, STAFF_GROUND_Y + modelHeight, st.z).project(camera)
+      loc.figureTop = height * (1 - head.y) / 2
+      loc.figureHeadX = width * (1 + head.x) / 2
+      transform.position.set(st.x, STAFF_GROUND_Y, st.z)
       transform.rotation.set(0, st.heading, 0)
-      transform.scale.setScalar(scale)
+      transform.scale.setScalar(modelHeight)
       transform.updateMatrix()
       const body = st.gender === 'female' ? female : male
       const slot = body.mesh.count++
       body.mesh.setMatrixAt(slot, transform.matrix)
-      const walking = !reducedMotion && st.status !== '滞留提醒' && st._speed > 0
-      const cycles = Math.max(1, Math.round(st._total * 8.5 / TAU))
+      const walking = !reducedMotion && st.speedKmh > 0
+      // 一次左右脚循环约走 1.3 米。整数圈保证跨过巡防线路首尾时步相连续。
+      const cycles = Math.max(1, Math.round(st._total * WORLD_DIV / 1.3))
       body.stride.setX(slot, walking && st._total > 0 ? (TAU * cycles * st._dist / st._total) % TAU : -1)
-      body.fade.setXY(slot, 1 - figure, 1 - loc.emphasis)
-      const footprint = scale * (loc.selected ? 0.60 : 0.52)
-      transform.scale.setScalar(footprint)
-      transform.updateMatrix()
-      feet.setMatrixAt(feet.count, transform.matrix)
-      feet.setColorAt(feet.count, color.set(loc.tone))
-      footAlpha.setX(feet.count++, 0.88 * figure * loc.emphasis)
-      head.set(st.x, GROUND_Y + scale, st.z).project(camera)
-      loc.figureTop = height * (1 - head.y) / 2
-      loc.figureHeadX = width * (1 + head.x) / 2
-      loc.figureHalfWidth = Math.max(7, scale / worldPerPixel * 0.27)
-      loc.footRadius = footprint / worldPerPixel * 0.73
+      body.fade.setXY(slot, 1 - figure * loc.opacity, 1 - loc.emphasis)
+      if (closeup > 0.002) {
+        contact.visible = true
+        contact.position.set(st.x, STAFF_GROUND_Y * 0.8, st.z)
+        contact.rotation.y = st.heading
+        contact.scale.set(modelHeight * 0.65, 1, modelHeight * 0.87)
+        contact.material.uniforms.opacity.value = closeup * figure * loc.opacity
+      }
+      if (closeup < 0.998) {
+        const footprint = modelHeight * (loc.selected ? 0.60 : 0.52)
+        transform.scale.setScalar(footprint)
+        transform.updateMatrix()
+        feet.setMatrixAt(feet.count, transform.matrix)
+        feet.setColorAt(feet.count, color.set(loc.tone))
+        footAlpha.setX(feet.count++, 0.88 * figure * loc.emphasis * loc.opacity * (1 - closeup))
+        loc.footRadius = footprint / worldPerPixel * 0.73
+      }
+      loc.figureHalfWidth = Math.max(7, modelHeight / worldPerPixel * 0.27)
     }
 
     if (figure < 0.998) {
@@ -250,11 +300,11 @@ export function createStaffMarkers(capacity, onTextureReady) {
       const axes = camera.matrixWorld.elements
       transform.position.set(
         st.x + (axes[0] * dx - axes[4] * dy) * worldPerPixel,
-        GROUND_Y + (axes[1] * dx - axes[5] * dy) * worldPerPixel,
+        STAFF_GROUND_Y + (axes[1] * dx - axes[5] * dy) * worldPerPixel,
         st.z + (axes[2] * dx - axes[6] * dy) * worldPerPixel
       )
-      if (dx * dx + dy * dy > 16) {
-        linePosition.setXYZ(lineCount * 2, st.x, GROUND_Y, st.z)
+      if (loc.opacity > 0.7 && dx * dx + dy * dy > 16) {
+        linePosition.setXYZ(lineCount * 2, st.x, STAFF_GROUND_Y, st.z)
         linePosition.setXYZ(lineCount * 2 + 1, transform.position.x, transform.position.y, transform.position.z)
         lineCount++
       }
@@ -266,7 +316,7 @@ export function createStaffMarkers(capacity, onTextureReady) {
       const slot = street === 0 && layoutWeight > 0.005 ? ordered.length - 1 - index : index
       badges.setMatrixAt(slot, transform.matrix)
       const symbolMix = 1 - (1 - overview) * portraitAvailability
-      styles.setXYZW(slot, loc.column, loc.row, Math.round(255 * symbolMix), Math.round(255 * (1 - figure) * loc.emphasis))
+      styles.setXYZW(slot, loc.column, loc.row, Math.round(255 * symbolMix), Math.round(255 * (1 - figure) * loc.emphasis * loc.opacity))
     }
     loc.top = lerp(loc.y - size, loc.figureTop, figure)
     loc.headX = lerp(loc.x, loc.figureHeadX, figure)
@@ -276,6 +326,7 @@ export function createStaffMarkers(capacity, onTextureReady) {
   function finish() {
     // 先给选中者、匹配筛选者和滞留点保留原位，其他点再避让。
     if (layoutWeight > 0.005) ordered.sort((a, b) => b.priority - a.priority || a.person.idx - b.person.idx)
+    layout.prepare(ordered, width, height, obstacles, layoutWeight)
     for (const loc of ordered) draw(loc)
     lines.visible = lineCount > 0
     lineGeometry.setDrawRange(0, lineCount * 2)
@@ -299,7 +350,7 @@ export function createStaffMarkers(capacity, onTextureReady) {
   function pick(x, y) {
     let hit = null, best = Infinity
     for (const loc of locations) {
-      if (!loc.visible) continue
+      if (!loc.visible || loc.opacity < 0.35) continue
       let score = Infinity
       if (loc.figureWeight < 0.92) {
         const half = loc.badgeSize / 2 + 2

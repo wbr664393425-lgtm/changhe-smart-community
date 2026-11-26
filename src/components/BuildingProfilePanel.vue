@@ -5,8 +5,6 @@ import {
   Users, Phone, Package, Flame, Droplets, CheckCircle2, MapPin, Navigation, Bell, ChevronLeft
 } from 'lucide-vue-next'
 import NativeDrawer from './NativeDrawer.vue'
-import malePortrait from '../assets/staff-portrait.png'
-import femalePortrait from '../assets/staff-portrait-female.png'
 
 const props = defineProps({
   buildingDetail: { type: Object, default: null },
@@ -254,16 +252,12 @@ const AID_ITEM_META = [
   { key: 'umbrella', label: '便民爱心伞', unit: '把' }
 ]
 
-const staffIdentities = new Map([
-  ['male', { label: '男', portrait: malePortrait }],
-  ['female', { label: '女', portrait: femalePortrait }]
-])
-const staffIdentity = computed(() => {
+const staffGenderLabel = computed(() => {
   const person = props.entityDetail
   if (person?.entityType !== 'staff') return null
   const live = props.liveTelemetry
   const gender = live && live.id === person.id && live.gender !== undefined ? live.gender : person.gender
-  return staffIdentities.get(gender)
+  return gender === 'female' ? '女' : gender === 'male' ? '男' : ''
 })
 const staffLiveStatus = computed(() => props.liveTelemetry?.status || props.entityDetail?.status || '在岗巡查')
 const staffRoadText = computed(() => props.liveTelemetry?.roadLabel || props.entityDetail?.roadLabel || `${props.entityDetail?.community || ''}巡防路段`)
@@ -559,13 +553,9 @@ const staffToneClass = computed(() => {
   <!-- 情形二：3D 治理实体点位调度卡（在岗网格员 / 共享辅助站 / 易涝防火点） -->
   <div v-else-if="entityDetail" class="bp-wrap">
     <div class="bp-head">
-      <span v-if="entityDetail.entityType === 'staff'" class="bp-staff-portrait" aria-hidden="true">
-        <img v-if="staffIdentity" :src="staffIdentity.portrait" alt="" />
-        <Users v-else :size="18" />
-      </span>
       <div class="bp-head-text">
         <span class="bp-title">
-          {{ entityDetail.name }}<small v-if="staffIdentity" class="bp-staff-gender" :aria-label="'登记性别' + staffIdentity.label">{{ staffIdentity.label }}</small>
+          {{ entityDetail.name }}<small v-if="staffGenderLabel" class="bp-staff-gender" :aria-label="'登记性别' + staffGenderLabel">{{ staffGenderLabel }}</small>
         </span>
         <span class="bp-sub">
           {{ entityDetail.entityType === 'staff' ? `${entityDetail.community} · ${entityDetail.grid}` : entityDetail.entityType === 'aid' ? entityDetail.address : `${entityDetail.community} · ${entityDetail.level}` }}
@@ -1023,24 +1013,6 @@ const staffToneClass = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 2px;
-}
-.bp-staff-portrait {
-  width: 32px;
-  height: 32px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  overflow: hidden;
-  border: 1px solid var(--ck-border);
-  border-radius: var(--r-control, 6px);
-  background: var(--ck-panel-solid);
-  color: var(--ck-muted);
-}
-.bp-staff-portrait img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
 }
 .bp-staff-gender {
   margin-left: 6px;

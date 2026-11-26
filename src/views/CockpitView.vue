@@ -85,9 +85,8 @@ const aidTick = ref(0)
 const activeCategoryFilter = ref('')
 const rightFootTab = ref('police') // police | armed
 const tourRunning = ref(false)
-const theaterMode = ref(false)
 const searchOpen = ref(false)
-const staffLayerActive = ref(true)
+const staffLayerActive = ref(false)
 const staffDirectoryOpen = ref(false)
 const staffSearch = ref('')
 const staffStatusFilter = ref('all')
@@ -102,6 +101,16 @@ const staffRosterReady = ref(false)
 let staffEngine = null
 const followStaffId = ref('')
 const followAltitude = ref('low') // low | mid
+const dashboardTheater = ref(false)
+const followTheater = ref(true)
+// 随航默认让出两侧街景；退出时回到进入前的面板布局。
+const theaterMode = computed({
+  get: () => followStaffId.value ? followTheater.value : dashboardTheater.value,
+  set: (wide) => {
+    if (followStaffId.value) followTheater.value = wide
+    else dashboardTheater.value = wide
+  }
+})
 const activeStaffTelemetry = shallowRef(null)
 const hoveredPopSeg = ref('') // '' | 'youth' | 'elder' | 'teen'
 const hoveredTrendIdx = ref(-1)
@@ -934,6 +943,12 @@ const statusLiveStaff = computed(() => staffStatusFilter.value === 'all'
   ? scopedLiveStaff.value
   : scopedLiveStaff.value.filter((st) => st.status === staffStatusFilter.value)
 )
+const staffCommunityCounts = computed(() => {
+  if (!staffLayerActive.value || !staffRosterReady.value) return null
+  const counts = Object.create(null)
+  for (const person of statusLiveStaff.value) counts[person.community] = (counts[person.community] || 0) + 1
+  return counts
+})
 const filteredLiveStaff = computed(() => {
   const term = staffSearch.value.trim().toLowerCase()
   if (!term) return statusLiveStaff.value
@@ -1052,6 +1067,16 @@ function openStaffDirectory(status = 'all') {
   narrowPanel.value = 'events'
 }
 
+async function openCommunityStaff(name) {
+  const status = staffStatusFilter.value
+  if (scope.value !== name) {
+    toggleCommunityLock(name)
+    if (scope.value !== name) return
+    await nextTick() // 辖区切换先清理旧人员，再按刚才查看的状态打开本社区名录。
+  }
+  if (scope.value === name && staffLayerActive.value) openStaffDirectory(status)
+}
+
 function closeStaffDirectory() {
   staffDirectoryOpen.value = false
   staffSearch.value = ''
@@ -1082,7 +1107,7 @@ function viewStaffClose(st) {
   })
 }
 
-function toggleFollowStaff(ent) {
+function toggleFollowStaff(ent, altitude = 'low') {
   if (!ent || ent.entityType !== 'staff') return
   if (!city3dMounted.value) return
   if (followStaffId.value === ent.id) {
@@ -1094,6 +1119,7 @@ function toggleFollowStaff(ent) {
   narrowPanel.value = 'map'
   staffLayerActive.value = true
   radiusActive.value = false
+  followAltitude.value = altitude
   followStaffId.value = ent.id
   activeStaffTelemetry.value = ent
   addAuditLog(`驾驶舱开启对网格员「${ent.name}」的低空实时跟拍`, '实时跟拍')
@@ -1107,7 +1133,7 @@ function stepFollowStaff(dir = 1) {
   const nextSt = pool[nextIdx]
   if (nextSt.id !== followStaffId.value) {
     handleSelectEntity(nextSt)
-    toggleFollowStaff(nextSt)
+    toggleFollowStaff(nextSt, followAltitude.value)
   }
 }
 
@@ -1277,7 +1303,6 @@ function switchToDispatch() {
   resetStaffContext()
   viewMode.value = 'dispatch'
   activeSlice.value = 'safety'
-  staffLayerActive.value = true
 }
 
 function selectChapter(idx) {
@@ -2042,10 +2067,12 @@ onBeforeUnmount(() => {
           :defer-reveal="entrancePhase === 'pre'"
           :labels-visible="city3dLabelsVisible"
           v-model:staff-layer-active="staffLayerActive"
+          :staff-community-counts="staffCommunityCounts"
           :staff-status-focus="staffStatusFilter"
           :follow-staff-id="followStaffId"
           :follow-altitude="followAltitude"
           @select-community="toggleCommunityLock"
+          @select-staff-community="openCommunityStaff"
           @select-event="handleSelectEvent"
           @select-building="handleSelectBuilding"
           @select-entity="handleSelectEntity"
@@ -2079,11 +2106,13 @@ onBeforeUnmount(() => {
           :focus-coord="focusCoord"
           :live-staff="scopedLiveStaff"
           :staff-layer-active="staffLayerActive"
+          :staff-community-counts="staffCommunityCounts"
           :staff-status-focus="staffStatusFilter"
           :selected-staff-id="selectedEntity?.entityType === 'staff' ? selectedEntity.id : ''"
           @select-community="toggleCommunityLock"
           @select-event="handleSelectEvent"
           @select-staff="handleSelectEntity"
+          @select-staff-community="openCommunityStaff"
         />
       </div>
 
@@ -2159,7 +2188,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div
-          v-if="staffLayerActive && mapBase !== 'preview'"
+          v-if="staffLayerActive && mapBase !== 'preview' && !(followStaffId && theaterMode)"
           class="ck-staff-summary"
           role="group"
           aria-label="网格员状态"
@@ -2958,6 +2987,7 @@ onBeforeUnmount(() => {
             :class="{ 'is-alert': followStaffObj.status === '滞留提醒', 'is-busy': followStaffObj.status === '在办处置' }"
           ></i>
           <strong>{{ followStaffObj.name }}</strong>
+          <span class="ck-fc-status">{{ followStaffObj.status === '滞留提醒' && followStaffObj.stayMinutes ? '滞留' + followStaffObj.stayMinutes + '分钟' : followStaffObj.status }}</span>
           <span class="ck-fc-grid">{{ shortName(followStaffObj.community) }} · {{ followStaffObj.grid }}</span>
           <span class="ck-fc-sep" aria-hidden="true"></span>
           <span class="ck-fc-road" :title="followStaffObj.roadLabel">{{ followStaffObj.roadLabel }}</span>
@@ -6061,6 +6091,7 @@ button.ck-mini-stat:hover {
   white-space: nowrap;
   flex-shrink: 0;
 }
+.ck-fc-status,
 .ck-fc-grid {
   font-size: 11px;
   color: var(--ck-muted);
@@ -6135,7 +6166,8 @@ button.ck-mini-stat:hover {
   }
 }
 @media (max-width: 1100px) {
-  .ck-follow-capsule {
+  .ck-follow-capsule,
+  .ck-shell.is-theater .ck-follow-capsule {
     bottom: 68px;
     max-width: calc(100vw - 20px);
     flex-wrap: wrap;

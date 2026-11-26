@@ -13,6 +13,8 @@ import { COMMUNITY_STAFF_SEEDS, COMMUNITY_ESTATES, getStaffGender } from './cock
 import { createPatrolGroundRouter, createPatrolGroundRouterAsync } from './cockpitPatrolGround'
 
 export const TRAIL_LEN = 8
+const KMH_PER_WORLD_UNIT_PER_SECOND = 3.6 * WORLD_DIV
+const TRAIL_SPACING = 2 / WORLD_DIV
 
 const ROAD_SEEDS = [
   { name: '天衢东路', coords: [[37.4547, 116.326], [37.4526, 116.3494], [37.4519, 116.382]] },
@@ -270,7 +272,8 @@ function createCommunityBuilder(ctx, comm, commIdx) {
       }
     }
 
-    const pathXZ = buildGroundLoop(rawLoop, inCommunity)
+    const visitIndices = []
+    const pathXZ = buildGroundLoop(rawLoop, inCommunity, visitIndices)
     if (!pathXZ.length) return
     const { cum, total } = buildLoopCumulativeLengths(pathXZ)
     let startDist = ((h % 1000) / 1000) * total
@@ -298,7 +301,10 @@ function createCommunityBuilder(ctx, comm, commIdx) {
     const roadName = findNearestRoadName(sample0.x, sample0.z)
     const roadLabel = nearEst ? `${roadName}沿线 · 近${nearEst}` : `${roadName}沿线`
 
-    const speed = status === '滞留提醒' ? 0 : status === '在办处置' ? 0.68 : 0.44 + (h % 5) * 0.055
+    const patrolKmh = (24 + (h % 5) * 2) / 10
+    const speedKmh = status === '在岗巡查' && pathXZ.length > 1 ? patrolKmh : 0
+    const visitDistances = visitIndices.map(index => cum[index])
+    const nextVisit = visitDistances.findIndex(distance => distance > startDist)
     const mustTotal = patrol?.mustPointsTotal || 8
     const mustDone = isPrimary && patrol
       ? patrol.mustPointsDone
@@ -314,7 +320,7 @@ function createCommunityBuilder(ctx, comm, commIdx) {
 
     // 初始化最近一小段足迹，首次选中移动人员就能看到行进方向。
     const trail = []
-    const stepBack = status === '滞留提醒' ? 0.04 : 1.05
+    const stepBack = speedKmh > 0 ? TRAIL_SPACING : 0
     for (let ti = TRAIL_LEN - 1; ti >= 0; ti--) {
       const sBack = sampleLoopAtDistance(pathXZ, cum, total, startDist - ti * stepBack)
       trail.push([sBack.x, sBack.z])
@@ -339,7 +345,7 @@ function createCommunityBuilder(ctx, comm, commIdx) {
       stayMinutes,
       openAssigned,
       roadLabel,
-      speedKmh: status === '滞留提醒' ? 0 : +(speed * 3.6 * 1.4).toFixed(1),
+      speedKmh,
       x: sample0.x,
       z: sample0.z,
       lat,
@@ -351,7 +357,12 @@ function createCommunityBuilder(ctx, comm, commIdx) {
       _cum: cum,
       _total: total,
       _dist: startDist,
-      _speed: speed,
+      _patrolKmh: patrolKmh,
+      _visits: visitDistances,
+      _nextVisit: Math.max(0, nextVisit),
+      _waitSeconds: 0,
+      _visitSeconds: 25 + h % 36,
+      _livePosition: false,
       _trailAccum: 0,
       _roadCheckAccum: (h % 10) * 0.12
     })
@@ -381,25 +392,51 @@ function createEngineHandle(list, estatesByComm) {
     st.roadLabel = nearEst ? `${roadName}沿线 · 近${nearEst}` : `${roadName}沿线`
   }
 
+  function applyDutyStatus(st, status) {
+    if (st.status !== status) st._waitSeconds = 0
+    st.status = status
+    if (!st._livePosition) {
+      st.speedKmh = status === '在岗巡查' && st._pathXZ.length > 1 && !st._waitSeconds ? st._patrolKmh : 0
+    } else if (status === '滞留提醒') {
+      st.speedKmh = 0
+    }
+  }
+
   function step(dt, maxDelta = 0.05) {
     if (!(dt > 0) || !(maxDelta > 0)) return
     const clampedDt = Math.min(maxDelta, dt)
     for (let i = 0; i < list.length; i++) {
       const st = list[i]
-      if (st.status === '滞留提醒' || st._speed <= 0) {
-        continue
+      if (st.status !== '在岗巡查' || st._livePosition || st._pathXZ.length < 2) continue
+      const waiting = Math.min(st._waitSeconds, clampedDt)
+      st._waitSeconds -= waiting
+      const movingSeconds = clampedDt - waiting
+      if (movingSeconds <= 0) continue
+
+      const unitsPerSecond = st._patrolKmh / KMH_PER_WORLD_UNIT_PER_SECOND
+      let distance = unitsPerSecond * movingSeconds
+      st.speedKmh = st._patrolKmh
+      const stop = st._visits[st._nextVisit]
+      const toStop = stop === undefined ? Infinity : (stop > st._dist ? stop - st._dist : st._total - st._dist + stop)
+      if (distance >= toStop) {
+        distance = toStop
+        st._dist = stop
+        st._nextVisit = (st._nextVisit + 1) % st._visits.length
+        st._waitSeconds = Math.max(0, st._visitSeconds - (movingSeconds - distance / unitsPerSecond))
+        st.speedKmh = 0
+      } else {
+        st._dist = (st._dist + distance) % st._total
       }
-      st._dist = (st._dist + st._speed * clampedDt) % st._total
       const s = sampleLoopAtDistance(st._pathXZ, st._cum, st._total, st._dist)
       st.x = s.x
       st.z = s.z
       st.heading = lerpAngle(st.heading, s.heading, Math.min(1, clampedDt * 5.2))
 
       // 复用最近八个位置。只有当前选中人员会提交轨迹几何。
-      st._trailAccum += st._speed * clampedDt
+      st._trailAccum += distance
       let head = st.trail[st.trail.length - 1]
-      if (st._trailAccum >= 0.90) {
-        st._trailAccum = 0
+      if (st._trailAccum >= TRAIL_SPACING) {
+        st._trailAccum %= TRAIL_SPACING
         head = st.trail.shift()
         st.trail.push(head)
       }
@@ -478,18 +515,11 @@ function createEngineHandle(list, estatesByComm) {
   function setStatus(id, nextStatus, extra = {}) {
     const st = list.find((s) => s.id === id)
     if (!st) return null
-    st.status = nextStatus
+    applyDutyStatus(st, nextStatus)
     if (extra.task) st.task = extra.task
-    if (nextStatus === '滞留提醒') {
-      st._speed = 0
-      st.speedKmh = 0
-    } else if (nextStatus === '在办处置') {
-      st._speed = 0.72
-      st.speedKmh = 3.6
+    if (nextStatus === '在办处置') {
       st.openAssigned = Math.max(1, st.openAssigned + 1)
-    } else {
-      st._speed = 0.52
-      st.speedKmh = 2.6
+    } else if (nextStatus === '在岗巡查') {
       st.stayMinutes = 0
     }
     return toSnapshot(st)
@@ -503,18 +533,34 @@ function createEngineHandle(list, estatesByComm) {
     updates.forEach((u) => {
       const st = list.find((s) => s.id === u.id)
       if (!st) return
-      if (typeof u.lat === 'number' && typeof u.lng === 'number') {
+      if (Number.isFinite(u.lat) && Number.isFinite(u.lng)) {
         const [nx, nz] = latLngToWorldXZ(u.lat, u.lng)
-        st.heading = Math.atan2(nx - st.x, nz - st.z)
+        if (st._livePosition) {
+          const dx = nx - st.x, dz = nz - st.z
+          if (dx || dz) {
+            st.heading = Math.atan2(dx, dz)
+            st._dist = (st._dist + Math.hypot(dx, dz)) % st._total
+            const head = st.trail.shift()
+            head[0] = nx
+            head[1] = nz
+            st.trail.push(head)
+          }
+        } else {
+          // 首次实测定位接管坐标，清除演示线路的尾迹。
+          for (const point of st.trail) {
+            point[0] = nx
+            point[1] = nz
+          }
+        }
+        st._livePosition = true
+        st.speedKmh = Number.isFinite(u.speedKmh) && u.speedKmh >= 0 ? u.speedKmh : 0
         st.x = nx
         st.z = nz
         st.lat = u.lat
         st.lng = u.lng
-        st.trail.shift()
-        st.trail.push([nx, nz])
         refreshRoadLabel(st)
       }
-      if (u.status) st.status = u.status
+      applyDutyStatus(st, u.status || st.status)
     })
   }
 

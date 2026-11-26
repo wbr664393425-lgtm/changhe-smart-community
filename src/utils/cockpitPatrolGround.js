@@ -153,7 +153,7 @@ function createRouterFromBlocked(blocked) {
     return route
   }
 
-  return function buildLoop(waypoints, inCommunity) {
+  return function buildLoop(waypoints, inCommunity, visitIndices) {
     const anchors = waypoints.map(point => nearestGround(point, inCommunity)).filter(cell => cell >= 0)
     if (!anchors.length) return []
     // 报到点可能在封闭院落中；保留同一可达片区内最多的原巡查点。
@@ -183,7 +183,10 @@ function createRouterFromBlocked(blocked) {
         route.push(...(home.length ? home.slice(0, -1) : route.slice(1, -1).reverse()))
       }
     }
-    return route.map(cellCenter)
+    return route.map((cell, index) => {
+      if (visitIndices && anchors.includes(cell)) visitIndices.push(index)
+      return cellCenter(cell)
+    })
   }
 }
 

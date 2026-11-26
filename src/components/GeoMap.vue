@@ -31,11 +31,12 @@ const props = defineProps({
   focusCoord: { type: Array, default: null },
   liveStaff: { type: Array, default: () => [] },
   staffLayerActive: { type: Boolean, default: false },
+  staffCommunityCounts: { type: Object, default: null },
   staffStatusFocus: { type: String, default: 'all' },
   selectedStaffId: { type: String, default: '' }
 })
 
-const emit = defineEmits(['select-community', 'select-event', 'select-point', 'select-staff', 'box-selected', 'update:baseMode'])
+const emit = defineEmits(['select-community', 'select-event', 'select-point', 'select-staff', 'select-staff-community', 'box-selected', 'update:baseMode'])
 
 const mapEl = ref(null)
 const internalBase = ref(props.baseMode === 'vector' ? 'gov' : props.baseMode)
@@ -60,6 +61,7 @@ const staffIcon = L.divIcon({
 })
 let initialFitTimer = 0
 let portraitBlend = -1
+let showStreetStaff = false
 let boxRectLayer = null
 let dragStartLatLng = null
 let resizeObserver = null
@@ -773,19 +775,25 @@ function renderDataLayers(shouldFitView = true) {
       const barColor = isSel ? '#f3d7a0' : (props.slice === 'safety' ? dotCol : toneBar)
       const bw = Math.round(shortName.length * 11.5 + (isGov ? chipText.length * 9.5 + 24 : 18))
       const bh = isGov ? 26 : 22
+      const staffCountSlot = props.mode === 'cockpit' ? '<span class="geo-staff-count" hidden></span>' : ''
 
       const marker = L.marker(pos, {
         interactive: true,
         zIndexOffset: isSel ? 540 : 140,
         icon: L.divIcon({
           className: '',
-          html: `<div style="display:flex;justify-content:center;width:100%"><div style="display:inline-flex;flex-direction:column;gap:2px;background:${labelBg};color:${labelFg};border:1px solid ${labelBorder};border-left:3px solid ${barColor};padding:2.5px 7px 3px 6px;border-radius:5px;font-size:11px;font-weight:680;white-space:nowrap;box-shadow:0 3px 10px rgba(0,0,0,${isDark ? 0.45 : 0.16})"><div style="display:flex;align-items:center;gap:4px"><span>${shortName}</span>${isGov ? `<em style="font-style:normal;font-size:9.5px;font-weight:650;color:${chipColor};padding-left:4px;border-left:1px solid ${isSel ? 'rgba(255,255,255,0.28)' : 'rgba(128,128,128,0.26)'}">${chipText}</em>` : ''}</div>${isGov ? `<span style="display:block;width:100%;height:2px;border-radius:2px;background:${isSel ? 'rgba(255,255,255,0.22)' : 'rgba(128,128,128,0.16)'};overflow:hidden"><i style="display:block;height:100%;width:${barPct}%;background:${barColor};border-radius:2px"></i></span>` : ''}</div></div>`,
+          html: `<div style="display:flex;justify-content:center;width:100%"><div style="display:inline-flex;flex-direction:column;gap:2px;background:${labelBg};color:${labelFg};border:1px solid ${labelBorder};border-left:3px solid ${barColor};padding:2.5px 7px 3px 6px;border-radius:5px;font-size:11px;font-weight:680;white-space:nowrap;box-shadow:0 3px 10px rgba(0,0,0,${isDark ? 0.45 : 0.16})"><div style="display:flex;align-items:center;gap:4px"><span>${shortName}</span>${isGov ? `<em style="font-style:normal;font-size:9.5px;font-weight:650;color:${chipColor};padding-left:4px;border-left:1px solid ${isSel ? 'rgba(255,255,255,0.28)' : 'rgba(128,128,128,0.26)'}">${chipText}</em>` : ''}${staffCountSlot}</div>${isGov ? `<span style="display:block;width:100%;height:2px;border-radius:2px;background:${isSel ? 'rgba(255,255,255,0.22)' : 'rgba(128,128,128,0.16)'};overflow:hidden"><i style="display:block;height:100%;width:${barPct}%;background:${barColor};border-radius:2px"></i></span>` : ''}</div></div>`,
           iconSize: [bw, bh],
           iconAnchor: [Math.round(bw / 2), Math.round(bh / 2)]
         })
-      }).on('click', () => emit('select-community', c.name)).addTo(dataGroup)
-
-      communityLabelItems.push({ marker, baseLatLng: pos, bw, bh, isSel })
+      }).addTo(dataGroup)
+      const item = {
+        marker, baseLatLng: pos, bw, bh, isSel, community: c.name, baseWidth: bw,
+        countEl: staffCountSlot ? marker.getElement().querySelector('.geo-staff-count') : null,
+        staffCount: 0
+      }
+      marker.on('click', () => emit(item.staffCount ? 'select-staff-community' : 'select-community', c.name))
+      communityLabelItems.push(item)
     })
   }
 
@@ -938,6 +946,7 @@ function renderDataLayers(shouldFitView = true) {
   }
 
   // 8. 执行社区标牌屏幕像素防重叠排布
+  updateCommunityStaffCounts()
   layoutCommunityLabels()
 }
 
@@ -1005,6 +1014,12 @@ function handleFullscreenOrResize() {
 
 function updateStaffZoom(zoom) {
   if (props.mode !== 'cockpit' || !mapEl.value) return
+  // 全街道自动取景上限为 14 级，拉近街区后才展开个人。
+  const street = zoom >= 14.75
+  if (street !== showStreetStaff) {
+    showStreetStaff = street
+    renderStaffLayer()
+  }
   const fraction = Math.max(0, Math.min(1, (zoom - 14) / 1.5))
   const blend = Math.round(fraction * fraction * (3 - 2 * fraction) * 32) / 32
   if (blend === portraitBlend) return
@@ -1050,6 +1065,9 @@ onMounted(() => {
   updateStaffZoom(map.getZoom())
   map.on('zoom', () => updateStaffZoom(map.getZoom()))
   map.on('zoomanim', e => updateStaffZoom(e.zoom))
+  map.on('moveend', () => {
+    if (showStreetStaff && props.staffLayerActive) renderStaffLayer()
+  })
   map.on('zoomend', () => {
     updateScaleBar()
     layoutCommunityLabels()
@@ -1125,22 +1143,61 @@ watch(
   }
 )
 
+function updateCommunityStaffCounts() {
+  if (props.mode !== 'cockpit') return false
+  const totals = props.staffLayerActive && !showStreetStaff ? props.staffCommunityCounts : null
+  const focus = props.staffStatusFocus
+  let resized = false
+  for (const item of communityLabelItems) {
+    const chip = item.countEl
+    if (!chip) continue
+    const count = totals?.[item.community] || 0
+    if (count === item.staffCount && (!count || focus === item.staffFocus)) continue
+    item.staffCount = count
+    item.staffFocus = focus
+    chip.hidden = !count
+    chip.textContent = count ? `${count}人` : ''
+    const el = item.marker.getElement()
+    if (count) {
+      const label = `${item.community}，${focus === 'all' ? '网格员' : focus}${count}人，查看人员名录`
+      el.title = label
+      el.setAttribute('aria-label', label)
+    } else {
+      el.removeAttribute('title')
+      el.removeAttribute('aria-label')
+    }
+    const width = item.baseWidth + (count ? 18 + String(count).length * 6 : 0)
+    if (width !== item.bw) {
+      item.bw = width
+      el.style.width = `${width}px`
+      el.style.marginLeft = `-${Math.round(width / 2)}px`
+      resized = true
+    }
+  }
+  return resized
+}
+
 function renderStaffLayer() {
   if (!map || !staffGroup) return
-  if (props.mode !== 'cockpit' || !props.staffLayerActive) {
+  if (updateCommunityStaffCounts()) layoutCommunityLabels()
+  if (props.mode !== 'cockpit' || !props.staffLayerActive || (!showStreetStaff && !props.selectedStaffId)) {
     if (staffMarkers.size) staffGroup.clearLayers()
     staffMarkers.clear()
     return
   }
+  const bounds = showStreetStaff ? map.getBounds().pad(0.10) : null
   const visible = new Set()
   for (const st of props.liveStaff) {
     if (!Number.isFinite(st.lat) || !Number.isFinite(st.lng)) continue
+    const selected = props.selectedStaffId === st.id
+    if (!selected && (!bounds?.contains([st.lat, st.lng]) ||
+      (props.staffStatusFocus !== 'all' && props.staffStatusFocus !== st.status))) continue
     visible.add(st.id)
     let entry = staffMarkers.get(st.id)
     if (!entry) {
       const tooltip = document.createElement('span')
       const marker = L.marker([st.lat, st.lng], { icon: staffIcon, autoPanOnFocus: false })
-      entry = { marker, tooltip, staff: null, selected: false, muted: false }
+      entry = { marker, tooltip, staff: null, selected: false }
       marker.bindTooltip(tooltip, { direction: 'top', offset: [0, -23], opacity: 0.96 })
       marker.on('click', () => emit('select-staff', entry.staff))
       marker.addTo(staffGroup)
@@ -1148,20 +1205,17 @@ function renderStaffLayer() {
     } else if (entry.staff.lat !== st.lat || entry.staff.lng !== st.lng) {
       entry.marker.setLatLng([st.lat, st.lng])
     }
-    const selected = props.selectedStaffId === st.id
-    const muted = props.staffStatusFocus !== 'all' && props.staffStatusFocus !== st.status
     const el = entry.marker.getElement()
     if (entry.staff?.gender !== st.gender) {
       el.classList.toggle('is-male', st.gender === 'male')
       el.classList.toggle('is-female', st.gender === 'female')
     }
-    if (entry.staff?.status !== st.status || entry.selected !== selected || entry.muted !== muted) {
+    if (entry.staff?.status !== st.status || entry.selected !== selected) {
       const alert = st.status === '滞留提醒'
       el.classList.toggle('is-alert', alert)
       el.classList.toggle('is-busy', st.status === '在办处置')
       el.classList.toggle('is-selected', selected)
-      el.classList.toggle('is-muted', muted)
-      entry.marker.setZIndexOffset(selected ? 650 : muted ? 370 : alert ? 560 : 480)
+      entry.marker.setZIndexOffset(selected ? 650 : alert ? 560 : 480)
     }
     const label = `${st.name}（${st.community}·${st.grid}）· ${st.status} · ${st.roadLabel || ''}`
     if (entry.tooltip.textContent !== label) {
@@ -1170,7 +1224,6 @@ function renderStaffLayer() {
     }
     entry.staff = st
     entry.selected = selected
-    entry.muted = muted
   }
   for (const [id, entry] of staffMarkers) {
     if (!visible.has(id)) {
@@ -1181,7 +1234,7 @@ function renderStaffLayer() {
 }
 
 watch(
-  () => [props.mode, props.staffLayerActive, props.liveStaff, props.selectedStaffId, props.staffStatusFocus],
+  () => [props.mode, props.staffLayerActive, props.staffCommunityCounts, props.liveStaff, props.selectedStaffId, props.staffStatusFocus],
   renderStaffLayer
 )
 
@@ -1656,6 +1709,15 @@ onBeforeUnmount(() => {
   color: var(--on-primary);
 }
 
+:deep(.geo-staff-count) {
+  padding-left: 4px;
+  border-left: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  font-size: 9.5px;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.76;
+}
+:deep(.geo-staff-count[hidden]) { display: none; }
 :deep(.geo-staff-marker) {
   --staff-status: #16835d;
   --staff-edge: #f9fffc;
@@ -1685,8 +1747,6 @@ onBeforeUnmount(() => {
   inset: 0;
   transition: opacity 140ms ease;
 }
-:deep(.geo-staff-marker.is-muted .geo-staff-pin) { opacity: 0.25; }
-:deep(.geo-staff-marker.is-muted.is-selected .geo-staff-pin) { opacity: 0.50; }
 :deep(.geo-staff-mini),
 :deep(.geo-staff-portrait) {
   position: absolute;
@@ -1700,7 +1760,7 @@ onBeforeUnmount(() => {
   width: 17px;
   height: 19px;
   opacity: calc(1 - var(--staff-portrait-blend, 0));
-  --staff-outline: polygon(35% 6%, 44% 2%, 58% 2%, 66% 8%, 67% 13%, 76% 14%, 76% 19%, 66% 20%, 63% 28%, 58% 32%, 73% 36%, 84% 61%, 74% 65%, 64% 48%, 66% 68%, 70% 98%, 55% 98%, 50% 75%, 44% 98%, 29% 98%, 34% 68%, 36% 48%, 26% 65%, 16% 61%, 28% 36%, 42% 32%, 37% 27%, 34% 20%, 30% 19%, 30% 14%, 34% 13%);
+  --staff-outline: polygon(34% 16%, 35% 10%, 39% 5%, 44% 2%, 51% 1%, 58% 2%, 63% 5%, 66% 10%, 67% 16%, 65% 23%, 62% 28%, 57% 32%, 73% 36%, 84% 61%, 74% 65%, 64% 48%, 66% 68%, 70% 98%, 55% 98%, 50% 75%, 44% 98%, 29% 98%, 34% 68%, 36% 48%, 26% 65%, 16% 61%, 28% 36%, 43% 32%, 38% 28%, 35% 23%);
 }
 :deep(.geo-staff-mini::before),
 :deep(.geo-staff-mini::after) {
@@ -1715,7 +1775,9 @@ onBeforeUnmount(() => {
   transform-origin: center 82%;
 }
 :deep(.geo-staff-mini::after) {
-  background: linear-gradient(to bottom, #183f47 0% 18%, #edc29d 18% 33%, var(--staff-status) 33% 52%, #f4edce 52% 59%, var(--staff-status) 59% 72%, #263b4b 72% 100%);
+  background:
+    radial-gradient(ellipse 24% 17% at 39% 3%, #493a33 68%, transparent 76%),
+    linear-gradient(to bottom, #493a33 0% 10%, #edc29d 10% 33%, var(--staff-status) 33% 52%, #f4edce 52% 59%, var(--staff-status) 59% 72%, #263b4b 72% 100%);
 }
 :deep(.geo-staff-portrait) {
   width: 26px;

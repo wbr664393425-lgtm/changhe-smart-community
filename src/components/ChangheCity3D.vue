@@ -8,6 +8,7 @@ import { createCockpitWaterfrontAsync, WATER_REFLECTION_LAYER } from '../utils/c
 import amapPolyData from '../utils/changheAmapPolygons.json'
 import {
   latLngToWorldXZ,
+  WORLD_DIV,
   CHANGHE_HQ_LATLNG,
   loadChangheAmapAssets,
   ensureAmapTexture,
@@ -24,8 +25,11 @@ import {
   buildCockpitEntities
 } from '../utils/cockpitBuildingIndex'
 import { createStaffLiveEngine, createStaffLiveEngineAsync, TRAIL_LEN } from '../utils/cockpitStaffLive'
-import { createStaffMarkers, staffOverviewWeight } from '../utils/cockpitStaffMarkers'
-import { chooseStaffView, createStaffCameraGlide, fitStaffPanorama } from '../utils/cockpitStaffView'
+import { createStaffMarkers, staffOverviewWeight, staffPointOpacity } from '../utils/cockpitStaffMarkers'
+import {
+  chooseStaffView, createStaffCameraGlide, createStreetCameraGlide, fitCommunityPanorama, getStaffFraming,
+  STAFF_AIM_Y, STAFF_GROUND_Y, STAFF_MIN_VIEW_DISTANCE, STREET_ZOOM
+} from '../utils/cockpitStaffView'
 
 const props = defineProps({
   mode: { type: String, default: 'cockpit' }, // cockpit | login | portal | hub | grid | single | patrol | armed
@@ -60,6 +64,7 @@ const props = defineProps({
   paused: { type: Boolean, default: false },
   // 网格员实时定位与电影级低空跟拍
   staffLayerActive: { type: Boolean, default: false },
+  staffCommunityCounts: { type: Object, default: null },
   staffStatusFocus: { type: String, default: 'all' },
   getStaffEngine: { type: Function, default: null },
   getStaffEngineAsync: { type: Function, default: null },
@@ -69,6 +74,7 @@ const props = defineProps({
 
 const emit = defineEmits([
   'select-community',
+  'select-staff-community',
   'select-event',
   'select-point',
   'select-patrol-step',
@@ -108,7 +114,7 @@ const projectedPatrolLabels = shallowRef([])
 const projectedArmedLabels = shallowRef([])
 const hqScreenPos = shallowRef({ x: 0, y: 0, visible: false })
 
-// 驾驶舱左下角业务图层开关（标杆楼宇与在岗网格员默认点亮，其余随专题或勾选浮现）
+// 标杆楼默认开启，人员巡防由演示者按需展开。
 const cockpitLayers = ref({
   landmarks: true,
   staff: props.staffLayerActive,
@@ -116,6 +122,7 @@ const cockpitLayers = ref({
   eco: false
 })
 const staffLayerVisible = computed(() => cockpitLayers.value.staff || props.staffLayerActive || Boolean(props.followStaffId))
+const streetFollowing = computed(() => props.mode === 'cockpit' && Boolean(props.followStaffId) && props.followAltitude === 'low')
 const focusedOnPersonnel = computed(() => props.mode === 'cockpit' && staffLayerVisible.value && !props.selectedEventId &&
   (props.staffStatusFocus !== 'all' || Boolean(props.followStaffId) || Boolean(props.selectedEntityId && staffLiveEngine?.getRawById(props.selectedEntityId))))
 const layerFilters = computed(() => [
@@ -292,7 +299,7 @@ let staffTrailMesh = null
 let staffTrailGeo = null
 let hoveredStaffId = ''
 let followSmoothedYaw = 0
-let followView = { offset: 0.48, distance: 52, height: 38 }
+let followView = { offset: 0.48, ...getStaffFraming('mid', 900) }
 let nextSightlineCheck = 0
 let lastLabelTickMs = 0
 let lastLiveTickEmitMs = 0
@@ -359,6 +366,7 @@ const bldgUniforms = {
   uLineCol: { value: new THREE.Color('#b6c4d4') },
   uNight: { value: 0 },
   uWindowGlow: { value: 0 },
+  uStreetDetail: { value: 0 },
   uTime: { value: 0 },
   uOuterBottomCol: { value: new THREE.Color('#dde4ec') },
   uOuterTopCol: { value: new THREE.Color('#f2f5f9') },
@@ -413,8 +421,8 @@ let isCamAnimating = false
 let staffGlide = null
 let staffWheelZoom = null
 const staffWheelAnchor = new THREE.Vector3()
-const staffGroundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.18)
-let lastStaffPanorama = null
+const staffGroundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -STAFF_GROUND_Y)
+let lastPanorama = null
 let cameraFlightAnim = null
 let introCamAnim = null
 let introWaveAnim = null
@@ -592,13 +600,14 @@ function focusOnStaff(id) {
   const st = staffLiveEngine?.getRawById(id)
   if (!st || !camera || !controls) return
   const bearing = Math.atan2(camera.position.x - st.x, camera.position.z - st.z)
-  const { offset, distance, height } = chooseStaffView(buildingIndexRef, st, bearing, 65, 27)
+  const framing = getStaffFraming('inspect', hostHeight)
+  const { offset, distance, height } = chooseStaffView(buildingIndexRef, st, bearing, framing.distance, framing.height)
   const yaw = bearing + offset
   cameraPreset.value = ''
   autoOrbit.value = false
   animateCameraTo(
     new THREE.Vector3(st.x + Math.sin(yaw) * distance, height, st.z + Math.cos(yaw) * distance),
-    new THREE.Vector3(st.x, 1.55, st.z), 'inspect', id
+    new THREE.Vector3(st.x, STAFF_AIM_Y, st.z), 'inspect', id
   )
 }
 
@@ -704,7 +713,7 @@ function getCameraPose(preset = 'hero') {
     pos: new THREE.Vector3(isCockpit ? -12 : -24, isCockpit ? 416 : 410, isCockpit ? 556 : 378),
     look: new THREE.Vector3(isCockpit ? 12 : 8, 2, isCockpit ? -14 : 4)
   }
-  if (isCockpit && staffLiveEngine && camera && staffLayerVisible.value) {
+  if (isCockpit && zoneEntries.size && camera) {
     const w = canvasHost.value.clientWidth, h = canvasHost.value.clientHeight
     const narrow = window.innerWidth <= 1100, compactDesk = window.innerWidth <= 1520
     const sidePanels = !narrow && !props.theaterMode
@@ -712,11 +721,11 @@ function getCameraPose(preset = 'hero') {
     const right = sidePanels ? (compactDesk ? 338 : 364) : 8
     const top = sidePanels ? Math.min(h * 0.32, 218) : narrow ? 100 : 60
     const bottom = sidePanels ? 180 : narrow ? 98 : 78
-    fitStaffPanorama(pose.pos, pose.look, staffLiveEngine.list, w, h, camera.fov, {
-      left: left + 18, right: w - right - 18, top: top + 22, bottom: h - bottom - 12
+    fitCommunityPanorama(pose.pos, pose.look, zoneEntries.values(), w, h, camera.fov, {
+      left: left + 38, right: w - right - 38, top: top + 22, bottom: h - bottom - 12
     })
     if (controls) controls.maxDistance = Math.max(880, pose.pos.distanceTo(pose.look) + 40)
-    lastStaffPanorama = pose
+    lastPanorama = pose
   }
   return pose
 }
@@ -854,6 +863,7 @@ function createAmapBuildingMaterial(isInner) {
     shader.uniforms.uLineCol = bldgUniforms.uLineCol
     shader.uniforms.uNight = bldgUniforms.uNight
     shader.uniforms.uWindowGlow = bldgUniforms.uWindowGlow
+    shader.uniforms.uStreetDetail = bldgUniforms.uStreetDetail
     shader.uniforms.uTime = bldgUniforms.uTime
     shader.uniforms.uFocusActive = bldgUniforms.uFocusActive
     if (isInner) {
@@ -914,6 +924,7 @@ function createAmapBuildingMaterial(isInner) {
       uniform vec3 uLineCol;
       uniform float uNight;
       uniform float uWindowGlow;
+      uniform float uStreetDetail;
       uniform float uTime;
       uniform float uFocusActive;
       ${isInner ? 'uniform sampler2D uBldgColorTex;\n      uniform float uUseSemantic;\n      uniform float uFocusBldgId;\n      uniform float uFloorBandActive;\n      uniform float uFloorBandY;\n      uniform float uFloorBandHalfH;\n      uniform vec3 uFloorBandCol;' : ''}
@@ -992,6 +1003,24 @@ function createAmapBuildingMaterial(isInner) {
          float wRing = exp(-(wDelta * wDelta));
          baseCol = mix(baseCol, uWaveColor, wRing * ${isInner ? '0.28' : '0.14'});
        }
+       float horizCoord = abs(vWorldNorm.x) > abs(vWorldNorm.z) ? vWorldPos.z : vWorldPos.x;
+       vec2 winUv = vec2(horizCoord * 2.4, vWorldPos.y * 2.25);
+       // 沿用夜景的窗格尺度，在街面日光下显出窗洞与玻璃的层次。
+       if (uStreetDetail > 0.001 && uNight < 0.98 && vIsRoof < 0.5 && vWorldPos.y > 0.12) {
+         vec2 edge = max(fwidth(winUv), vec2(0.018));
+         float resolved = 1.0 - smoothstep(0.22, 0.65, max(edge.x, edge.y));
+         vec2 pane = fract(winUv);
+         vec2 inside = smoothstep(vec2(0.18, 0.23) - edge, vec2(0.18, 0.23) + edge, pane)
+           * (1.0 - smoothstep(vec2(0.80, 0.78) - edge, vec2(0.80, 0.78) + edge, pane));
+         float sky = smoothstep(0.22, 0.78, pane.y);
+         float shade = bldgHash21(floor(winUv));
+         vec3 glass = mix(baseCol * vec3(0.38, 0.50, 0.60), baseCol * vec3(0.72, 0.86, 0.94), sky);
+         glass *= 0.92 + 0.16 * shade;
+         float frame = 1.0 - smoothstep(0.012, 0.020 + edge.x, abs(pane.x - 0.51));
+         float sill = 1.0 - smoothstep(0.020, 0.032 + edge.y, abs(pane.y - 0.25));
+         glass = mix(glass, baseCol * 0.91, max(frame * 0.76, sill) * (1.0 - smoothstep(0.03, 0.12, max(edge.x, edge.y))));
+         baseCol = mix(baseCol, glass, inside.x * inside.y * resolved * uStreetDetail * (1.0 - uNight) * 0.90);
+       }
        diffuseColor.rgb = baseCol;`
     )
 
@@ -1037,8 +1066,6 @@ function createAmapBuildingMaterial(isInner) {
        }
        // 暮色与暗夜：远近双 LOD 万家灯火（高空全景呈温润楼层灯带与顶冠，近景呈独立错落窗格）
        if (uWindowGlow > 0.01 && vIsRoof < 0.5 && vWorldPos.y > 0.32) {
-         float horizCoord = abs(vWorldNorm.x) > abs(vWorldNorm.z) ? vWorldPos.z : vWorldPos.x;
-         vec2 winUv = vec2(horizCoord * 2.4, vWorldPos.y * 2.25);
          float uvRate = max(fwidth(winUv.x), fwidth(winUv.y));
          float aaWin = 1.0 - smoothstep(0.55, 1.45, uvRate);
          float seedSalt = ${isInner ? 'mod(vBldgId, 97.0) * 0.17' : '0.43'};
@@ -1382,6 +1409,8 @@ function createSkyDome() {
     uniforms: {
       uSkyTop: { value: new THREE.Color('#dfe8f2') },
       uSkyHorizon: { value: new THREE.Color('#ece6dc') },
+      uStreetDetail: bldgUniforms.uStreetDetail,
+      uNight: bldgUniforms.uNight,
       uSunDir: { value: new THREE.Vector3(280, 460, 260).normalize() },
       uSunHaloCol: { value: new THREE.Color('#fff5e0') },
       uSunHaloStr: { value: 0.22 }
@@ -1397,6 +1426,8 @@ function createSkyDome() {
     fragmentShader: `
       uniform vec3 uSkyTop;
       uniform vec3 uSkyHorizon;
+      uniform float uStreetDetail;
+      uniform float uNight;
       uniform vec3 uSunDir;
       uniform vec3 uSunHaloCol;
       uniform float uSunHaloStr;
@@ -1405,6 +1436,9 @@ function createSkyDome() {
         vec3 d = normalize(vWorldDir);
         float h = clamp(d.y, 0.0, 1.0);
         vec3 sky = mix(uSkyHorizon, uSkyTop, pow(h, 0.52));
+        float streetDay = uStreetDetail * (1.0 - uNight) * smoothstep(0.20, 0.58, uSunDir.y);
+        vec3 daylight = mix(vec3(0.87, 0.89, 0.88), vec3(0.47, 0.66, 0.81), smoothstep(0.00, 0.64, h));
+        sky = mix(sky, daylight, streetDay * 0.85);
         float sunDot = max(0.0, dot(d, normalize(uSunDir)));
         float halo = pow(sunDot, 10.0) * 0.45 + pow(sunDot, 42.0) * 0.55;
         sky += uSunHaloCol * (halo * uSunHaloStr);
@@ -1898,13 +1932,48 @@ async function buildAmap3DCity(precomputedGeos = null, yieldFn = null) {
     if (props.mode === 'cockpit' || props.mode === 'login') {
       shader.uniforms.uShore = { value: assetsRef.shoreDistanceTex }
       shader.uniforms.uCorrection = terrainCorrection
+      shader.uniforms.uStreetDetail = bldgUniforms.uStreetDetail
+      shader.uniforms.uGroundMeters = { value: new THREE.Vector2(groundW * WORLD_DIV, groundD * WORLD_DIV) }
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nuniform sampler2D uShore;\nuniform vec2 uCorrection;\nuniform vec3 uFarLand;')
+        .replace('#include <common>', `#include <common>
+          uniform sampler2D uShore;
+          uniform vec2 uCorrection, uGroundMeters;
+          uniform vec3 uFarLand;
+          uniform float uStreetDetail;
+          float surfaceGrain(vec2 cell) {
+            vec3 p = fract(vec3(cell.xyx) * 0.1031);
+            p += dot(p, p.yzx + 33.33);
+            return fract((p.x + p.y) * p.z);
+          }
+          float groundNoise(vec2 point) {
+            vec2 cell = floor(point), blend = fract(point);
+            blend *= blend * (3.0 - 2.0 * blend);
+            return mix(mix(surfaceGrain(cell), surfaceGrain(cell + vec2(1,0)), blend.x),
+                       mix(surfaceGrain(cell + vec2(0,1)), surfaceGrain(cell + vec2(1,1)), blend.x), blend.y);
+          }`)
         .replace('#include <map_fragment>', `#include <map_fragment>
           vec3 mask = texture2D(uShore, vMapUv).rgb;
           vec3 dayLand = mix(vec3(.86,.84,.78), vec3(.23,.39,.24), mask.b);
           vec3 nightLand = mix(vec3(.033,.045,.061), vec3(.027,.060,.048), mask.b);
           diffuseColor.rgb = mix(diffuseColor.rgb, mix(dayLand, nightLand, uCorrection.y), mask.g*uCorrection.x);
+          // 沿用底图的硬质铺地和绿地，仅在街面近景叠加材质；像素覆盖多个纹理单元时渐隐。
+          if (uStreetDetail > 0.001 && uCorrection.x > 0.5) {
+            vec2 meters = (vMapUv - 0.5) * uGroundMeters;
+            vec2 tile = meters / vec2(0.96, 0.62);
+            vec2 aa = max(fwidth(tile), vec2(0.001));
+            float detail = uStreetDetail * (1.0 - smoothstep(0.12, 0.64, max(aa.x, aa.y)));
+            tile.x += 0.5 * mod(floor(tile.y), 2.0);
+            vec2 jointDist = 0.5 - abs(fract(tile) - 0.5);
+            vec2 surface = smoothstep(vec2(0.004) - aa * 0.5, vec2(0.014) + aa * 0.5, jointDist);
+            vec3 color = diffuseColor.rgb;
+            float chroma = max(max(color.r, color.g), color.b) - min(min(color.r, color.g), color.b);
+            float paving = (1.0 - smoothstep(0.05, 0.17, chroma)) * (1.0 - mask.b);
+            float grass = smoothstep(0.012, 0.075, color.g - max(color.r, color.b));
+            vec2 grainAxis = vec2(meters.x + 0.37 * meters.y, meters.y - 0.37 * meters.x);
+            float fine = groundNoise(grainAxis * vec2(27.0, 15.0)) - 0.5;
+            float stone = (surfaceGrain(floor(tile)) - 0.5) * 0.079 - (1.0 - surface.x * surface.y) * 0.20;
+            diffuseColor.rgb *= 1.0 + detail * (paving * stone + (0.035 + grass * 0.14) * fine);
+          }
           float edgeMask = smoothstep(0.0, 0.075, vMapUv.x) * smoothstep(1.0, 0.925, vMapUv.x) * smoothstep(0.0, 0.065, vMapUv.y) * smoothstep(1.0, 0.885, vMapUv.y);
           diffuseColor.rgb = mix(uFarLand, diffuseColor.rgb, edgeMask);`)
     } else {
@@ -2711,12 +2780,10 @@ function rebuildCockpitEntities() {
 
   cockpitEntitiesRef = buildCockpitEntities(store)
   const selComm = props.selectedCommunity
-  const showStaff = cockpitLayers.value.staff || props.cockpitViewMode === 'dispatch' || Boolean(props.emergencyInfo)
   const showAid = cockpitLayers.value.aid || props.slice === 'aid' || Boolean(props.emergencyInfo)
   const showEco = cockpitLayers.value.eco || props.slice === 'eco'
   const showLandmarks = cockpitLayers.value.landmarks
 
-  const emgStaffIds = new Set((props.emergencyInfo?.nearbyStaff || []).map((s) => s.id))
   const emgAidIds = new Set((props.emergencyInfo?.nearbyAids || []).map((a) => a.id))
 
   // 1. 标杆楼宇暖金菱形顶标
@@ -2839,7 +2906,10 @@ function rebuildEmergencyRing() {
     )
   }
 
-  ;(info.nearbyStaff || []).slice(0, 1).forEach((s) => addLinkArc(s.x, s.z, 0x0ea5e9))
+  if (staffLayerVisible.value && info.nearbyStaff?.length) {
+    const person = info.nearbyStaff[0]
+    addLinkArc(person.x, person.z, 0x0ea5e9)
+  }
   ;(info.nearbyAids || []).slice(0, 1).forEach((a) => addLinkArc(a.x, a.z, 0x10b981))
   ;(info.careBuildings || []).slice(0, 3).forEach((cb) => addLinkArc(cb.cx, cb.cz, 0x8b5cf6))
 
@@ -2942,8 +3012,8 @@ function drawStaffTrail(st, tone, opacity) {
     const halfWidth = 0.055 + 0.13 * j / (TRAIL_LEN - 1)
     const nx = -dz / length * halfWidth
     const nz = dx / length * halfWidth
-    positions.setXYZ(j * 2, x + nx, 0.14, z + nz)
-    positions.setXYZ(j * 2 + 1, x - nx, 0.14, z - nz)
+    positions.setXYZ(j * 2, x + nx, STAFF_GROUND_Y, z + nz)
+    positions.setXYZ(j * 2 + 1, x - nx, STAFF_GROUND_Y, z - nz)
   }
   positions.needsUpdate = true
   staffTrailMesh.material.uniforms.uColor.value.set(tone)
@@ -2951,34 +3021,42 @@ function drawStaffTrail(st, tone, opacity) {
   staffTrailMesh.visible = true
 }
 
-function syncStaffLiveFrame(dt) {
+function syncStaffLiveFrame(dt, cameraMoving = false) {
   if (!staffLiveEngine || !staffMarkers || !camera || props.mode !== 'cockpit') return
   if (!prefersReducedMotion && dt > 0) staffLiveEngine.step(dt)
-  const nearby = props.emergencyInfo?.nearbyStaff
   const layerOn = staffLayerVisible.value
-  staffLiveGroup.visible = layerOn || Boolean(nearby?.length)
-  if (!staffLiveGroup.visible) return
-
-  const night = isNightScene.value
+  if (!layerOn && !staffLiveGroup.visible) return
   const scoped = props.selectedCommunity
   const focusedId = props.followStaffId || props.selectedEntityId
   const viewDistance = camera.position.distanceTo(controls.target)
+  const opacity = layerOn ? staffPointOpacity(viewDistance, scoped !== '全街道') : 0
+  const nearby = layerOn ? props.emergencyInfo?.nearbyStaff : null
+  if (!staffLiveGroup.visible && opacity <= 0.006 && !nearby?.length &&
+    !(layerOn && focusedId && staffLiveEngine.getRawById(focusedId))) return
+  const night = isNightScene.value
   const trailOpacity = 1 - staffOverviewWeight(viewDistance)
+  const streetRadius = Math.max(20, viewDistance * 0.8)
   staffMarkers.begin(camera, hostWidth, hostHeight, night, prefersReducedMotion, {
-    viewDistance, statusFocus: props.staffStatusFocus, obstacles: props.labelsVisible ? staffLabelObstacles : [], dt
+    viewDistance, statusFocus: props.staffStatusFocus, obstacles: props.labelsVisible ? staffLabelObstacles : [], dt, cameraMoving
   })
   staffTrailMesh.visible = false
-  for (const st of staffLiveEngine.list) {
+  for (const st of layerOn ? staffLiveEngine.list : []) {
     const following = st.id === props.followStaffId
     const selected = st.id === focusedId
+    if (props.followStaffId && !following) continue
     const emergency = nearby?.some(person => person.id === st.id)
-    if (!layerOn && !emergency) continue
     if (!selected && !emergency && scoped !== '全街道' && st.community !== scoped) continue
+    if (!selected && !emergency && (opacity <= 0.006 || (props.staffStatusFocus !== 'all' && st.status !== props.staffStatusFocus))) continue
+    // 低角度看街道时，视锥会一直延伸到天际；远处几个社区的人不应浮在眼前的楼面上。
+    const localOpacity = selected || emergency ? 1 : opacity * (1 - THREE.MathUtils.smoothstep(
+      Math.hypot(st.x - controls.target.x, st.z - controls.target.z), streetRadius, streetRadius * 1.55))
+    if (localOpacity <= 0.006) continue
     const tone = getStaffToneHex(st.status, selected, night)
-    if (!staffMarkers.place(st, selected, following, tone)) continue
-    if (selected && trailOpacity > 0 && st.status !== '滞留提醒') drawStaffTrail(st, tone, trailOpacity)
+    if (!staffMarkers.place(st, selected, following, tone, localOpacity)) continue
+    if (selected && !streetFollowing.value && trailOpacity > 0 && st.speedKmh > 0) drawStaffTrail(st, tone, trailOpacity)
   }
   staffMarkers.finish()
+  staffLiveGroup.visible = staffMarkers.group.children.some(child => child.visible)
 }
 
 function toggleCockpitLayer(key) {
@@ -3052,6 +3130,7 @@ function updateProjectedLabels() {
   const h = hostHeight || canvasHost.value.clientHeight
   if (!w || !h) return
   labelsDirty = false
+  if (streetFollowing.value) return
 
   const isCockpit = props.mode === 'cockpit'
   const compactDesk = typeof window !== 'undefined' && window.innerWidth <= 1520
@@ -3267,7 +3346,12 @@ function updateProjectedLabels() {
     placed.push({ x: nextHqPos.x, y: nextHqPos.y - 15, bw: 194, bh: 30 })
   }
 
-  const staffOverview = isCockpit && staffLayerVisible.value && props.selectedCommunity === '全街道' && !props.tourRunning
+  const distance = controls ? camera.position.distanceTo(controls.target) : 0
+  const scoped = props.selectedCommunity !== '全街道'
+  const cityOverview = isCockpit && !scoped && !props.tourRunning
+  const overviewWeight = cityOverview ? staffOverviewWeight(distance) : 0
+  const summaryOpacity = isCockpit && staffLayerVisible.value && props.staffCommunityCounts
+    ? 1 - staffPointOpacity(distance, scoped) : 0
   const next = []
   zoneEntries.forEach((entry, name) => {
     const c = entry.community
@@ -3279,8 +3363,10 @@ function updateProjectedLabels() {
     const openHz = c.safety.hazards - c.safety.fixed
     const sName = name.replace('社区', '')
     const chip = getCommunityMetricChip(c, props.slice)
-    const quiet = staffOverview && !isSel && !isHov
-    const bw = quiet ? sName.length * 12 + 14 : Math.round(sName.length * 13.5 + chip.length * 9.5 + 38) * (isSel ? 1.08 : 1)
+    const count = summaryOpacity > 0.01 ? props.staffCommunityCounts[name] || 0 : 0
+    const quiet = count > 0 || (overviewWeight > 0.5 && !isSel && !isHov)
+    const countWidth = count ? String(count).length * 7 + 18 : 0
+    const bw = quiet ? sName.length * 12 + 14 + countWidth : Math.round(sName.length * 13.5 + chip.length * 9.5 + 38) * (isSel ? 1.08 : 1)
     const bh = quiet ? 20 : isSel ? 32 : 28
 
     next.push({
@@ -3288,6 +3374,8 @@ function updateProjectedLabels() {
       shortName: sName,
       quiet,
       chip,
+      count,
+      countOpacity: summaryOpacity,
       health: c.health,
       level: ['lead', 'ok', 'warn', 'bad'][getCommunityLevel(c, 'safety')],
       hasAlert: props.slice === 'safety' && openHz > 0,
@@ -3300,7 +3388,7 @@ function updateProjectedLabels() {
       bw,
       bh,
       zIndex: isSel ? 42 : isHov ? 34 : Math.round((1 - pr.z) * 20),
-      visible: visible && (!isCockpit || !camera || camera.position.y > 135 || isSel)
+      visible: visible && (!isCockpit || camera.position.y > 135 || count > 0 || isSel)
     })
   })
 
@@ -3331,8 +3419,7 @@ function updateProjectedLabels() {
     const emgStaffIds = new Set((props.emergencyInfo?.nearbyStaff || []).map((s) => s.id))
     const emgAidIds = new Set((props.emergencyInfo?.nearbyAids || []).map((a) => a.id))
     const selComm = props.selectedCommunity
-    const buildingLabelOpacity = focusedOnPersonnel.value ? 0 :
-      staffOverview && controls ? 1 - staffOverviewWeight(camera.position.distanceTo(controls.target)) : 1
+    const buildingLabelOpacity = focusedOnPersonnel.value ? 0 : 1 - overviewWeight
 
     if (cockpitLayers.value.landmarks) {
       cockpitEntitiesRef.landmarks.forEach((lm) => {
@@ -3390,7 +3477,7 @@ function updateProjectedLabels() {
     if (staffLiveGroup?.visible && staffMarkers) {
       for (const st of staffLiveEngine.list) {
         const location = staffMarkers.locations[st.idx]
-        if (!location.visible) continue
+        if (!location.visible || location.opacity < 0.35) continue
         const selected = st.id === (props.followStaffId || props.selectedEntityId)
         const hovered = st.id === hoveredStaffId
         const nearby = emgStaffIds.has(st.id)
@@ -3567,7 +3654,7 @@ function pickTarget(clientX, clientY) {
     if (entHit) return { type: 'entity', entity: entHit.object.userData.entityObj }
   }
 
-  if (pickableDynamicTargets.length) {
+  if (dynamicGroup?.visible && pickableDynamicTargets.length) {
     const dynHits = raycaster.intersectObjects(pickableDynamicTargets, false)
     const armedHit = dynHits.find((h) => h.object.userData.armedPoint)
     if (armedHit) return { type: 'armed', point: armedHit.object.userData.armedPoint }
@@ -3612,8 +3699,8 @@ function onStaffWheel(e) {
   if (!staffWheelZoom) controls.dispatchEvent({ type: 'start' })
   const rect = getCanvasRect()
   const x = e.clientX - rect.left, y = e.clientY - rect.top
-  const person = staffMarkers?.pick(x, y)
-  if (person) staffWheelAnchor.set(person.x, 0.18, person.z)
+  const person = staffLiveGroup?.visible && staffMarkers.pick(x, y)
+  if (person) staffWheelAnchor.set(person.x, STAFF_GROUND_Y, person.z)
   else {
     pointer.set(x / rect.width * 2 - 1, 1 - y / rect.height * 2)
     raycaster.setFromCamera(pointer, camera)
@@ -3852,22 +3939,19 @@ function animate(now) {
       camDriven = true
       cameraFlightAnim = null
       isCamAnimating = false
-      if (fSt.status !== '滞留提醒' && fSt._speed > 0) {
+      if (fSt.speedKmh > 0) {
         let diff = ((fSt.heading - followSmoothedYaw + Math.PI) % (Math.PI * 2)) - Math.PI
         if (diff < -Math.PI) diff += Math.PI * 2
         followSmoothedYaw += diff * Math.min(1, dt * 2.6)
       }
-      const isLow = props.followAltitude !== 'mid'
-      const dist = isLow ? 52 : 104
-      const height = isLow ? 38 : 88
-      const lookY = isLow ? 1.65 : 1.4
       const bearing = followSmoothedYaw + Math.PI
       if (now >= nextSightlineCheck && (!staffGlide || nextSightlineCheck === 0)) {
-        followView = chooseStaffView(buildingIndexRef, fSt, bearing, dist, height, followView.offset)
+        const framing = getStaffFraming(props.followAltitude === 'mid' ? 'mid' : 'low', hostHeight)
+        followView = chooseStaffView(buildingIndexRef, fSt, bearing, framing.distance, framing.height, followView.offset)
         nextSightlineCheck = now + 1100
       }
       const chaseYaw = bearing + followView.offset
-      _followGoalLook.set(fSt.x, lookY, fSt.z)
+      _followGoalLook.set(fSt.x, STAFF_AIM_Y, fSt.z)
       _followGoalPos.set(
         fSt.x + Math.sin(chaseYaw) * followView.distance,
         followView.height,
@@ -4010,6 +4094,23 @@ function animate(now) {
 
   let controlsChanged = false
   if (controls) {
+    if (props.mode === 'cockpit') {
+      // 贴近街面时缩短近裁剪距离，街区俯视使用地图的正常投影精度。
+      const streetLens = camera.position.y < 2
+      const detail = streetLens ? 1 - THREE.MathUtils.smoothstep(camera.position.y, 0.4, 3) : 0
+      bldgUniforms.uStreetDetail.value = detail
+      const showOverlays = !streetFollowing.value
+      if (overlayGroup) overlayGroup.visible = showOverlays
+      if (dynamicGroup) dynamicGroup.visible = showOverlays
+      const near = streetLens ? 0.035 : 1
+      const zoom = streetLens ? THREE.MathUtils.lerp(STREET_ZOOM, 1, THREE.MathUtils.smoothstep(camera.position.y, 0.28, 1.9)) : 1
+      if (camera.near !== near || Math.abs(camera.zoom - zoom) > 0.0001) {
+        camera.near = near
+        camera.zoom = zoom
+        camera.updateProjectionMatrix()
+        controls.maxPolarAngle = Math.PI * (streetLens ? 0.53 : 0.45)
+      }
+    }
     controls.autoRotate = autoOrbit.value && !prefersReducedMotion && !comparingImagery.value
     controlsChanged = controls.update()
   }
@@ -4061,7 +4162,7 @@ function animate(now) {
       p.t = (p.t + dt * p.speed) % 1
       p.curve.getPointAt(Math.min(0.999, Math.max(0, p.t)), p.mesh.position)
     })
-    syncStaffLiveFrame(dt)
+    syncStaffLiveFrame(dt, camDriven || controlsChanged)
   } else {
     syncStaffLiveFrame(0)
   }
@@ -4129,8 +4230,8 @@ function handleResize() {
   const w = canvasHost.value.clientWidth
   const h = canvasHost.value.clientHeight
   if (!w || !h) return
-  const wasPanorama = lastStaffPanorama && controls && (w !== hostWidth || h !== hostHeight) &&
-    camera.position.distanceTo(lastStaffPanorama.pos) < 1 && controls.target.distanceTo(lastStaffPanorama.look) < 1
+  const wasPanorama = lastPanorama && controls && (w !== hostWidth || h !== hostHeight) &&
+    camera.position.distanceTo(lastPanorama.pos) < 1 && controls.target.distanceTo(lastPanorama.look) < 1
   hostWidth = w
   hostHeight = h
   halfViewportHeight = h / 2
@@ -4138,6 +4239,7 @@ function handleResize() {
   labelsDirty = true
   staticRenderNeeded = true
   camera.aspect = w / h
+  nextSightlineCheck = 0
   camera.updateProjectionMatrix()
   renderer.setSize(w, h)
   if (wasPanorama) {
@@ -4236,7 +4338,7 @@ async function initScene() {
   controls = new OrbitControls(camera, renderer.domElement)
   controls.enableDamping = true
   controls.dampingFactor = 0.07
-  controls.minDistance = 65
+  controls.minDistance = props.mode === 'cockpit' ? STAFF_MIN_VIEW_DISTANCE : 65
   controls.maxDistance = 880
   controls.minPolarAngle = 0.16
   controls.maxPolarAngle = Math.PI * 0.45
@@ -4757,11 +4859,12 @@ watch(
 watch(focusedOnPersonnel, updateEventEmphasis)
 
 watch(
-  () => [props.staffLayerActive, props.staffStatusFocus],
-  ([active]) => {
+  () => [props.staffLayerActive, props.staffStatusFocus, props.staffCommunityCounts],
+  ([active], [wasActive]) => {
     cockpitLayers.value.staff = Boolean(active)
     if (!active) hoveredStaffId = ''
     syncStaffLiveFrame(0)
+    if (active !== wasActive && props.emergencyInfo) rebuildEmergencyRing()
     labelsDirty = true
     if (props.labelsVisible) updateProjectedLabels()
     staticRenderNeeded = true
@@ -4770,10 +4873,7 @@ watch(
 
 watch(
   () => [props.followStaffId, props.followAltitude],
-  ([id], [previousId]) => {
-    if (controls) {
-      controls.minDistance = id ? 26 : 65
-    }
+  ([id, altitude], [previousId]) => {
     if (id && staffLiveEngine && camera && controls) {
       const fSt = staffLiveEngine.getRawById(id)
       if (fSt) {
@@ -4784,7 +4884,11 @@ watch(
         }
         if (introCamAnim || introWaveAnim) finishIntroVisualsImmediately()
         autoOrbit.value = false
-        staffGlide = prefersReducedMotion ? null : { kind: 'follow', advance: createStaffCameraGlide(camera.position, controls.target, performance.now()) }
+        const street = altitude !== 'mid' || camera.near < 1
+        const now = performance.now()
+        staffGlide = prefersReducedMotion ? null : { kind: 'follow', advance: street
+          ? createStreetCameraGlide(buildingIndexRef, camera.position, controls.target, now)
+          : createStaffCameraGlide(camera.position, controls.target, now) }
         nextSightlineCheck = 0
         cameraFlightAnim = null
         isCamAnimating = false
@@ -4886,7 +4990,7 @@ onBeforeUnmount(() => {
     :class="['preset-' + store.preset, 'mode-' + mode, { dark: isNightScene, compact: compact || (mode !== 'cockpit' && mode !== 'login') }]"
   >
     <div ref="canvasHost" class="city3d-canvas"></div>
-    <div v-if="!comparingImagery" class="city3d-horizon-mist" aria-hidden="true"></div>
+    <div v-if="!comparingImagery && !streetFollowing" class="city3d-horizon-mist" aria-hidden="true"></div>
 
     <!-- 首次载入进度提示（大屏与登录模式由外层接管，子页面保留轻提示） -->
     <div v-if="loading && !externalLoader && mode !== 'login'" class="city3d-loading">
@@ -4902,7 +5006,8 @@ onBeforeUnmount(() => {
       v-if="mode !== 'login'"
       v-show="!loading && !comparingImagery"
       class="city3d-labels"
-      :class="{ 'is-stage-hidden': !labelsVisible, 'has-hover': mode === 'cockpit' && !!hoveredCommunity }"
+      :inert="streetFollowing"
+      :class="{ 'is-stage-hidden': !labelsVisible || streetFollowing, 'has-hover': mode === 'cockpit' && !!hoveredCommunity }"
       aria-label="长河街道三维实景地标"
     >
       <!-- 常规模式：指挥中心与 14 社区铭牌 -->
@@ -4923,17 +5028,18 @@ onBeforeUnmount(() => {
         type="button"
         class="city3d-comm-tag"
         :class="['h-' + lb.health, 'lv-' + lb.level, { active: lb.isSel, hover: lb.isHov, alert: lb.hasAlert, quiet: lb.quiet }]"
-        :aria-label="lb.name + '，' + lb.chip"
+        :aria-label="lb.count ? lb.name + '，' + (staffStatusFocus === 'all' ? '网格员' : staffStatusFocus) + lb.count + '人，查看名录' : lb.name + '，' + lb.chip"
         :style="{
           transform: `translate3d(${lb.x}px, ${lb.y}px, 0) translate(-50%, -100%)`,
           zIndex: lb.zIndex
         }"
         @mouseenter="onLabelHover(lb.name)"
         @mouseleave="onLabelHover('')"
-        @click="emit('select-community', lb.name)"
+        @click="emit(lb.count ? 'select-staff-community' : 'select-community', lb.name)"
       >
         <i v-if="!lb.quiet" class="tag-dot"></i>
         <span class="tag-name">{{ lb.shortName }}</span>
+        <span v-if="lb.count" class="tag-staff-count num" :style="{ opacity: lb.countOpacity }">{{ lb.count }}人</span>
         <em v-if="!lb.quiet && (!compact || lb.isSel || lb.isHov || lb.hasAlert)" class="tag-chip num">{{ lb.chip }}</em>
       </button>
 
@@ -5067,6 +5173,7 @@ onBeforeUnmount(() => {
     <!-- 左下角紧凑 3D 专题图例卡 -->
     <aside
       v-if="!compact && !loading && !comparingImagery && mode !== 'login' && mode !== 'single' && mode !== 'patrol' && mode !== 'armed'"
+      v-show="!streetFollowing || !theaterMode || mobileHudPanel === 'legend'"
       class="city3d-legend"
       :class="{ 'is-cockpit': mode === 'cockpit', 'is-theater': theaterMode, 'is-stage-hidden': !labelsVisible, 'is-mobile-open': mobileHudPanel === 'legend' }"
       aria-label="三维沙盘专题图例"
@@ -5415,6 +5522,16 @@ onBeforeUnmount(() => {
   color: #e5e1d7;
   border-color: rgba(225, 227, 228, 0.25);
 }
+.city3d-comm-tag .tag-staff-count {
+  padding-left: 5px;
+  border-left: 1px solid currentColor;
+  color: #626d65;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+}
+.city3d-root.dark .tag-staff-count { color: #b1c1b6; }
+.city3d-comm-tag.active .tag-staff-count { color: inherit; }
 .city3d-labels.has-hover .city3d-comm-tag:not(.hover):not(.active) {
   opacity: 0.42;
 }
