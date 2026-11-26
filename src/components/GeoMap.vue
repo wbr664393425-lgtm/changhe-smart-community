@@ -33,7 +33,9 @@ const props = defineProps({
   staffLayerActive: { type: Boolean, default: false },
   staffCommunityCounts: { type: Object, default: null },
   staffStatusFocus: { type: String, default: 'all' },
-  selectedStaffId: { type: String, default: '' }
+  selectedStaffId: { type: String, default: '' },
+  theaterMode: { type: Boolean, default: false },
+  hasRightPanel: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['select-community', 'select-event', 'select-point', 'select-staff', 'select-staff-community', 'box-selected', 'update:baseMode'])
@@ -94,7 +96,7 @@ const SLICE_PALETTES = {
   safety: {
     title: '治理体检 · 隐患态势',
     unit: '社区等级',
-    ticks: ['标杆', '稳健', '关注', '督办'],
+    ticks: ['标杆', '平稳', '关注', '督办'],
     light: ['#cbe4d6', '#e6efe0', '#f5d79b', '#e8947d'],
     dark: ['#174d41', '#1c3844', '#6e4d18', '#7a2622'],
     selStroke: ['#a81b26', '#f3d7a0']
@@ -1276,7 +1278,7 @@ onBeforeUnmount(() => {
     <aside
       v-if="effectiveBase === 'gov' && mode !== 'single' && mode !== 'patrol'"
       class="geo-legend-card"
-      :class="{ 'is-cockpit': mode === 'cockpit' }"
+      :class="{ 'is-cockpit': mode === 'cockpit', 'is-theater': theaterMode }"
       aria-label="地图专题图例"
     >
       <div class="geo-legend-head">
@@ -1300,7 +1302,13 @@ onBeforeUnmount(() => {
     <div
       v-if="effectiveBase === 'gov' && mode !== 'single'"
       class="geo-compass-scale"
-      :class="{ 'is-cockpit': mode === 'cockpit' }"
+      :class="{
+        'is-cockpit': mode === 'cockpit',
+        'is-theater': theaterMode,
+        'has-staff-bar': staffLayerActive && !theaterMode,
+        'is-staff-on': staffLayerActive,
+        'has-right-panel': hasRightPanel
+      }"
       aria-hidden="true"
     >
       <div class="geo-compass">
@@ -1502,6 +1510,10 @@ onBeforeUnmount(() => {
   left: 332px;
   bottom: 84px;
 }
+.geo-legend-card.is-cockpit.is-theater {
+  left: 16px;
+  bottom: 18px;
+}
 .geo-legend-head {
   display: flex;
   align-items: baseline;
@@ -1607,6 +1619,19 @@ onBeforeUnmount(() => {
   bottom: auto;
   right: 356px;
 }
+.geo-compass-scale.is-cockpit.has-staff-bar {
+  top: 226px;
+}
+.geo-compass-scale.is-cockpit.is-theater {
+  top: 16px;
+  right: 16px;
+}
+.geo-compass-scale.is-cockpit.is-theater.is-staff-on {
+  top: 56px;
+}
+.geo-compass-scale.is-cockpit.is-theater.has-right-panel {
+  right: 356px;
+}
 .geo-compass {
   display: inline-flex;
   align-items: center;
@@ -1642,14 +1667,20 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 1520px) {
-  .geo-legend-card.is-cockpit {
+  .geo-legend-card.is-cockpit:not(.is-theater) {
     left: 308px;
     bottom: 82px;
     width: 196px;
     padding: 6px 8px;
   }
-  .geo-compass-scale.is-cockpit {
+  .geo-compass-scale.is-cockpit:not(.is-theater) {
     top: 168px;
+    right: 328px;
+  }
+  .geo-compass-scale.is-cockpit.has-staff-bar {
+    top: 208px;
+  }
+  .geo-compass-scale.is-cockpit.is-theater.has-right-panel {
     right: 328px;
   }
 }

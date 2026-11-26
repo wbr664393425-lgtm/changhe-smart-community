@@ -267,6 +267,7 @@ const staffCoordText = computed(() => {
   if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return ''
   return `${Number(lat).toFixed(4)}°N, ${Number(lng).toFixed(4)}°E`
 })
+const showBackToDirectory = computed(() => props.staffFromDirectory && props.entityDetail?.entityType === 'staff')
 const staffToneClass = computed(() => {
   if (staffLiveStatus.value === '滞留提醒') return 'is-alert'
   if (staffLiveStatus.value === '在办处置') return 'is-busy'
@@ -561,9 +562,9 @@ const staffToneClass = computed(() => {
           {{ entityDetail.entityType === 'staff' ? `${entityDetail.community} · ${entityDetail.grid}` : entityDetail.entityType === 'aid' ? entityDetail.address : `${entityDetail.community} · ${entityDetail.level}` }}
         </span>
       </div>
-      <button type="button" class="bp-icon-btn" :title="staffFromDirectory ? '返回网格员名录' : '关闭详情'"
-        :aria-label="staffFromDirectory ? '返回网格员名录' : '关闭详情'" @click="emit('close')">
-        <component :is="staffFromDirectory ? ChevronLeft : X" :size="14" />
+      <button type="button" class="bp-icon-btn" :title="showBackToDirectory ? '返回网格员名录' : '关闭详情'"
+        :aria-label="showBackToDirectory ? '返回网格员名录' : '关闭详情'" @click="emit('close')">
+        <component :is="showBackToDirectory ? ChevronLeft : X" :size="14" />
       </button>
     </div>
 

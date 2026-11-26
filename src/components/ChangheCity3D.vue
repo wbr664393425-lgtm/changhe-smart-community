@@ -114,12 +114,12 @@ const projectedPatrolLabels = shallowRef([])
 const projectedArmedLabels = shallowRef([])
 const hqScreenPos = shallowRef({ x: 0, y: 0, visible: false })
 
-// 标杆楼默认开启，人员巡防由演示者按需展开。
+// 标杆楼默认开启，人员巡防由演示者按需展开；辅助站/汛火点随当前专题切片同步初值并可自由开关。
 const cockpitLayers = ref({
   landmarks: true,
   staff: props.staffLayerActive,
-  aid: false,
-  eco: false
+  aid: props.slice === 'aid',
+  eco: props.slice === 'eco'
 })
 const staffLayerVisible = computed(() => cockpitLayers.value.staff || props.staffLayerActive || Boolean(props.followStaffId))
 const streetFollowing = computed(() => props.mode === 'cockpit' && Boolean(props.followStaffId) && props.followAltitude === 'low')
@@ -128,8 +128,8 @@ const focusedOnPersonnel = computed(() => props.mode === 'cockpit' && staffLayer
 const layerFilters = computed(() => [
   { key: 'landmarks', label: '标杆楼', active: cockpitLayers.value.landmarks },
   { key: 'staff', label: '网格员', active: staffLayerVisible.value },
-  { key: 'aid', label: '辅助站', active: cockpitLayers.value.aid || props.slice === 'aid' },
-  { key: 'eco', label: '汛火点', active: cockpitLayers.value.eco || props.slice === 'eco' }
+  { key: 'aid', label: '辅助站', active: cockpitLayers.value.aid },
+  { key: 'eco', label: '汛火点', active: cockpitLayers.value.eco }
 ])
 const activeLegendLevel = ref(-1) // -1 表示全部，0..3 表示按图例聚焦某一重点类型
 
@@ -2780,8 +2780,8 @@ function rebuildCockpitEntities() {
 
   cockpitEntitiesRef = buildCockpitEntities(store)
   const selComm = props.selectedCommunity
-  const showAid = cockpitLayers.value.aid || props.slice === 'aid' || Boolean(props.emergencyInfo)
-  const showEco = cockpitLayers.value.eco || props.slice === 'eco'
+  const showAid = cockpitLayers.value.aid || Boolean(props.emergencyInfo)
+  const showEco = cockpitLayers.value.eco
   const showLandmarks = cockpitLayers.value.landmarks
 
   const emgAidIds = new Set((props.emergencyInfo?.nearbyAids || []).map((a) => a.id))
@@ -2814,7 +2814,7 @@ function rebuildCockpitEntities() {
     cockpitEntitiesRef.aidStations.forEach((aid) => {
       const inEmg = emgAidIds.has(aid.id)
       if (!inEmg && selComm !== '全街道' && aid.community !== selComm) return
-      if (!cockpitLayers.value.aid && props.slice !== 'aid' && !inEmg) return
+      if (!cockpitLayers.value.aid && !inEmg) return
       const isSel = props.selectedEntityId === aid.id
       const h = isSel || inEmg ? 14 : 9.5
       const box = new THREE.Mesh(
@@ -3504,7 +3504,7 @@ function updateProjectedLabels() {
       }
     }
 
-    const showAidLbl = cockpitLayers.value.aid || props.slice === 'aid' || Boolean(props.emergencyInfo)
+    const showAidLbl = cockpitLayers.value.aid || Boolean(props.emergencyInfo)
     if (showAidLbl) {
       cockpitEntitiesRef.aidStations.forEach((aid) => {
         const inEmg = emgAidIds.has(aid.id)
@@ -3531,7 +3531,7 @@ function updateProjectedLabels() {
       })
     }
 
-    if (cockpitLayers.value.eco || props.slice === 'eco') {
+    if (cockpitLayers.value.eco) {
       cockpitEntitiesRef.ecoRisks.forEach((pt) => {
         if (selComm !== '全街道' && pt.community !== selComm) return
         const isSel = props.selectedEntityId === pt.id
@@ -4731,6 +4731,14 @@ watch(
 )
 
 watch(
+  () => props.slice,
+  (newSlice) => {
+    cockpitLayers.value.aid = newSlice === 'aid'
+    cockpitLayers.value.eco = newSlice === 'eco'
+  }
+)
+
+watch(
   () => [props.slice, eventsVisualSig.value, props.cockpitViewMode, props.selectedEventId],
   ([newSlice, newEvSig, newViewMode, newSelEv], [oldSlice, oldEvSig, oldViewMode, oldSelEv] = []) => {
     const needDyn = props.mode !== 'cockpit' || newEvSig !== oldEvSig || newViewMode !== oldViewMode || newSelEv !== oldSelEv
@@ -5772,7 +5780,7 @@ onBeforeUnmount(() => {
 
 @media (min-width: 1101px) and (max-width: 1520px) {
   .city3d-ctrl.is-cockpit:not(.is-theater) {
-    max-width: calc(100% - 680px);
+    max-width: calc(100% - 880px);
     flex-wrap: wrap;
     justify-content: flex-end;
   }
@@ -5782,11 +5790,11 @@ onBeforeUnmount(() => {
   .city3d-legend.is-cockpit:not(.is-theater) {
     left: 308px;
     bottom: 82px;
-    width: 246px;
+    width: 228px;
     padding: 6px 8px;
   }
   .city3d-legend.is-cockpit:not(.is-theater) .c3d-lg-layers button {
-    padding: 0 3px;
+    padding: 0 2px;
     font-size: 9.5px;
     gap: 2px;
   }
@@ -5796,6 +5804,17 @@ onBeforeUnmount(() => {
   }
   .city3d-ctrl.is-cockpit button {
     padding: 0 5px;
+  }
+}
+
+@media (min-width: 1101px) and (max-width: 1360px) {
+  .city3d-legend.is-cockpit:not(.is-theater) {
+    left: 300px;
+    width: 222px;
+  }
+  .city3d-ctrl.is-cockpit:not(.is-theater) {
+    right: 318px;
+    max-width: calc(100% - 856px);
   }
 }
 

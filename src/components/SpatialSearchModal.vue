@@ -6,7 +6,8 @@ import { COMMUNITIES, store, getCurrentRole } from '../store/appStore'
 const props = defineProps({
   open: { type: Boolean, default: false },
   dark: { type: Boolean, default: false },
-  loadBldgIdx: { type: Function, required: true }
+  loadBldgIdx: { type: Function, required: true },
+  liveStaff: { type: Array, default: () => [] }
 })
 
 const emit = defineEmits(['close', 'select'])
@@ -96,21 +97,26 @@ const pool = computed(() => {
   })
 
   // 3. 在岗网格员与重点点位
-  if (entitiesCache.value) {
-    entitiesCache.value.gridStaff.forEach((st) => {
+  const staffPool = props.liveStaff?.length ? props.liveStaff : entitiesCache.value?.gridStaff
+  if (staffPool?.length) {
+    staffPool.forEach((st) => {
       if (!allowComm(st.community)) return
+      const subText = st.roadLabel ? `${st.grid} · ${st.roadLabel} · ${st.task}` : `${st.grid} · ${st.task}`
+      const isAlert = st.status === '滞留提醒'
       items.push({
         id: `st-${st.id}`,
         kind: 'staff',
         title: `${st.name}（${st.community}）`,
-        sub: `${st.grid} · ${st.task}`,
-        badge: st.status,
-        tone: st.status === '滞留提醒' ? 'warn' : 'info',
-        searchText: `${st.name} ${st.community} ${st.grid} ${st.task} 网格员`,
-        priority: 76,
+        sub: subText,
+        badge: isAlert && st.stayMinutes ? `滞留${st.stayMinutes}分` : st.status,
+        tone: isAlert ? 'warn' : st.status === '在办处置' ? 'accent' : 'info',
+        searchText: `${st.name} ${st.community} ${st.grid} ${st.task} ${st.roadLabel || ''} ${st.status} 网格员`,
+        priority: isAlert ? 88 : 76,
         payload: st
       })
     })
+  }
+  if (entitiesCache.value) {
     entitiesCache.value.aidStations.forEach((aid) => {
       if (!allowComm(aid.community)) return
       items.push({

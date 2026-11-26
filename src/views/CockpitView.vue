@@ -1055,7 +1055,7 @@ function onStaffLiveTick(snap) {
   }
 }
 
-function openStaffDirectory(status = 'all') {
+function openStaffDirectory(status = 'all', switchNarrowPanel = true) {
   stopTour()
   if (mapBase.value === 'preview') mapBase.value = 'gov'
   staffLayerActive.value = true
@@ -1064,15 +1064,35 @@ function openStaffDirectory(status = 'all') {
   closeRightPenetration()
   selectedEvent.value = null
   staffDirectoryOpen.value = true
-  narrowPanel.value = 'events'
+  if (switchNarrowPanel) narrowPanel.value = 'events'
 }
 
-async function openCommunityStaff(name) {
+function setStaffLayerActive(active, switchNarrowPanel = false) {
+  const next = Boolean(active)
+  if (!next) {
+    staffLayerActive.value = false
+    return
+  }
+  stopTour()
+  if (mapBase.value === 'preview') mapBase.value = 'gov'
+  staffLayerActive.value = true
+  if (!followStaffId.value && selectedEntity.value?.entityType !== 'staff') {
+    closeRightPenetration()
+    selectedEvent.value = null
+    staffDirectoryOpen.value = true
+    if (switchNarrowPanel) narrowPanel.value = 'events'
+  }
+}
+
+function toggleStaffLayer(switchNarrowPanel = false) {
+  setStaffLayerActive(!staffLayerActive.value, switchNarrowPanel)
+}
+
+function openCommunityStaff(name) {
   const status = staffStatusFilter.value
   if (scope.value !== name) {
     toggleCommunityLock(name)
     if (scope.value !== name) return
-    await nextTick() // 辖区切换先清理旧人员，再按刚才查看的状态打开本社区名录。
   }
   if (scope.value === name && staffLayerActive.value) openStaffDirectory(status)
 }
@@ -1092,7 +1112,22 @@ function resetStaffContext() {
   stopFollowStaff()
 }
 
-watch(scope, resetStaffContext)
+function onScopeChange() {
+  staffSearch.value = ''
+  if (!staffLayerActive.value) {
+    resetStaffContext()
+    return
+  }
+  const nextScope = scope.value
+  if (followStaffObj.value && nextScope !== '全街道' && followStaffObj.value.community !== nextScope) {
+    stopFollowStaff()
+  }
+  if (selectedEntity.value?.entityType === 'staff' && nextScope !== '全街道' && selectedEntity.value.community !== nextScope) {
+    closeRightPenetration()
+  }
+}
+
+watch(scope, onScopeChange)
 watch(staffLayerActive, (active) => { if (!active) resetStaffContext() })
 
 function viewStaffClose(st) {
@@ -1292,21 +1327,20 @@ function stopTour() {
 }
 
 function switchToReport() {
-  resetStaffContext()
+  stopFollowStaff()
   viewMode.value = 'report'
-  followStaffId.value = ''
   activeSlice.value = CHAPTERS[activeChapter.value]?.slice || 'party'
 }
 
 function switchToDispatch() {
   stopTour()
-  resetStaffContext()
+  stopFollowStaff()
   viewMode.value = 'dispatch'
   activeSlice.value = 'safety'
 }
 
 function selectChapter(idx) {
-  resetStaffContext()
+  stopFollowStaff()
   activeChapter.value = idx
   activeSlice.value = CHAPTERS[idx].slice
   selectedEvent.value = null
@@ -1371,7 +1405,9 @@ function handleSpatialSelect(item) {
   } else if (item.kind === 'staff') {
     const liveMatch = staffEngine?.getById(item.payload?.id) || item.payload
     handleSelectEntity(liveMatch)
-    if (!isStaffTarget && liveMatch?.x != null && liveMatch?.z != null) {
+    if (isStaffTarget) {
+      viewStaffClose(liveMatch)
+    } else if (liveMatch?.x != null && liveMatch?.z != null) {
       nextTick(() => city3dRef.value?.focusOnPointXZ(liveMatch.x, liveMatch.z, 96, 102))
     }
   } else if (item.kind === 'event') {
@@ -1488,7 +1524,8 @@ async function handleSelectBuilding(bldg) {
     return
   }
   stopTour()
-  resetStaffContext()
+  stopFollowStaff()
+  staffDirectoryOpen.value = false
   narrowPanel.value = 'events'
   selectedBuildingIndex.value = bldg.index
   selectedEntity.value = null
@@ -1513,7 +1550,10 @@ function handleSelectEntity(ent) {
     return
   }
   stopTour()
-  if (ent.entityType !== 'staff') resetStaffContext()
+  if (ent.entityType !== 'staff') {
+    stopFollowStaff()
+    staffDirectoryOpen.value = false
+  }
   narrowPanel.value = 'events'
   const resolved = ent.entityType === 'staff'
     ? (staffEngine?.getById(ent.id) || ent)
@@ -1536,7 +1576,8 @@ function handleSelectEntity(ent) {
 function handleSelectEvent(ev) {
   if (!ev) return
   stopTour()
-  resetStaffContext()
+  stopFollowStaff()
+  staffDirectoryOpen.value = false
   narrowPanel.value = 'events'
   selectedEvent.value = ev
   selectedBuildingIndex.value = -1
@@ -1546,18 +1587,24 @@ function handleSelectEvent(ev) {
   radiusActive.value = true
 }
 
-function handleResetPanorama() {
-  resetStaffContext()
+function resetScopeToAll() {
   if (role.value.scope === '全街道') {
     store.selectedCommunity = '全街道'
   }
-  followStaffId.value = ''
-  activeStaffTelemetry.value = null
+  if (selectedEntity.value && selectedEntity.value.entityType !== 'staff') {
+    selectedEntity.value = null
+  }
   selectedBuildingIndex.value = -1
-  selectedEntity.value = null
   selectedEvent.value = null
   focusedFloor.value = null
   radiusActive.value = false
+}
+
+function handleResetPanorama() {
+  staffLayerActive.value = false
+  resetStaffContext()
+  resetScopeToAll()
+  activeStaffTelemetry.value = null
 }
 
 function closeRightPenetration() {
@@ -1844,10 +1891,10 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="ck-btn ck-btn-op ck-btn-staff-entry"
-            :class="{ active: showStaffDirectory }"
-            :aria-expanded="showStaffDirectory"
-            title="查看当前辖区在岗网格员名录"
-            @click="showStaffDirectory ? closeStaffDirectory() : openStaffDirectory()"
+            :class="{ active: staffLayerActive }"
+            :aria-pressed="staffLayerActive"
+            :title="staffLayerActive ? '关闭网格员图层与名录' : '开启网格员图层并查看在岗名录'"
+            @click="toggleStaffLayer(true)"
           >
             <Users :size="15" aria-hidden="true" />
             <span>网格员</span>
@@ -2017,7 +2064,7 @@ onBeforeUnmount(() => {
               class="ck-comm-mini is-all-anchor"
               :class="{ active: scope === '全街道' }"
               :disabled="role.scope !== '全街道'"
-              @click="handleResetPanorama(); mobileCommOpen = false"
+              @click="resetScopeToAll(); mobileCommOpen = false"
             >
               <span>全街道总览</span>
               <strong class="num">{{ COMMUNITIES.length }} 个社区</strong>
@@ -2066,11 +2113,12 @@ onBeforeUnmount(() => {
           :external-loader="loaderVisible || entrancePhase === 'pre'"
           :defer-reveal="entrancePhase === 'pre'"
           :labels-visible="city3dLabelsVisible"
-          v-model:staff-layer-active="staffLayerActive"
+          :staff-layer-active="staffLayerActive"
           :staff-community-counts="staffCommunityCounts"
           :staff-status-focus="staffStatusFilter"
           :follow-staff-id="followStaffId"
           :follow-altitude="followAltitude"
+          @update:staff-layer-active="setStaffLayerActive($event, false)"
           @select-community="toggleCommunityLock"
           @select-staff-community="openCommunityStaff"
           @select-event="handleSelectEvent"
@@ -2109,6 +2157,8 @@ onBeforeUnmount(() => {
           :staff-community-counts="staffCommunityCounts"
           :staff-status-focus="staffStatusFilter"
           :selected-staff-id="selectedEntity?.entityType === 'staff' ? selectedEntity.id : ''"
+          :theater-mode="theaterMode"
+          :has-right-panel="hasRightPenetration"
           @select-community="toggleCommunityLock"
           @select-event="handleSelectEvent"
           @select-staff="handleSelectEntity"
@@ -2204,10 +2254,10 @@ onBeforeUnmount(() => {
             <Users v-else :size="13" aria-hidden="true" />
             {{ item.label }} <b class="num">{{ staffRosterReady ? staffCounts[item.key] : '—' }}</b>
           </button>
-          <button type="button" class="ck-staff-directory-toggle" :aria-expanded="showStaffDirectory"
-            :title="showStaffDirectory ? '收起网格员名录' : '打开网格员名录'"
+          <button type="button" class="ck-staff-directory-toggle" :class="{ active: showStaffDirectory }" :aria-expanded="showStaffDirectory"
+            :title="showStaffDirectory ? '收起网格员名录' : '展开网格员名录'"
             @click="showStaffDirectory ? closeStaffDirectory() : openStaffDirectory(staffStatusFilter)">
-            名录 <ChevronRight :size="12" aria-hidden="true" />
+            {{ showStaffDirectory ? '收起名录' : '展开名录' }} <ChevronRight :size="12" aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -2220,7 +2270,7 @@ onBeforeUnmount(() => {
           class="ck-fab-btn"
           :class="{ active: staffLayerActive }"
           :aria-pressed="staffLayerActive"
-          @click="staffLayerActive = !staffLayerActive"
+          @click="toggleStaffLayer(false)"
         >
           网格员图层
         </button>
@@ -2947,7 +2997,7 @@ onBeforeUnmount(() => {
           class="ck-comm-mini is-all-anchor"
           :class="{ active: scope === '全街道' }"
           :disabled="role.scope !== '全街道'"
-          @click="handleResetPanorama"
+          @click="resetScopeToAll"
         >
           <span>全街道总览</span>
           <strong class="num">{{ COMMUNITIES.length }} 个社区</strong>
@@ -3049,6 +3099,7 @@ onBeforeUnmount(() => {
       :open="searchOpen"
       :dark="isDark"
       :load-bldg-idx="loadBldgIdxMod"
+      :live-staff="liveStaffList"
       @close="searchOpen = false"
       @select="handleSpatialSelect"
     />
@@ -5153,7 +5204,7 @@ button.ck-mini-stat:hover {
   .ck-head-ops {
     gap: 4px;
   }
-  .ck-btn-op {
+  .ck-header .ck-head-ops .ck-btn-op {
     height: 30px;
     padding: 0 7px;
     gap: 4px;
@@ -5166,18 +5217,18 @@ button.ck-mini-stat:hover {
   }
 }
 @media (max-width: 1360px) {
-  .ck-btn-op {
+  .ck-header .ck-head-ops .ck-btn-op {
     padding: 0 8px;
   }
-  .ck-btn-op span {
+  .ck-header .ck-head-ops .ck-btn-op span {
     display: none;
   }
 }
 @media (max-width: 1100px) {
-  .ck-btn-theater {
+  .ck-header .ck-head-ops .ck-btn-theater {
     display: none;
   }
-  .ck-btn-op {
+  .ck-header .ck-head-ops .ck-btn-op {
     height: 30px;
     padding: 0 7px;
   }
@@ -5376,10 +5427,16 @@ button.ck-mini-stat:hover {
   .ck-shell.is-theater.is-following .ck-map-fab {
     right: 16px;
     bottom: 18px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 256px;
   }
   .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-fab {
     right: 356px;
     bottom: 18px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 256px;
   }
   .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-layer :deep(.city3d-ctrl.is-cockpit.is-theater) {
     right: 356px;
@@ -5401,6 +5458,7 @@ button.ck-mini-stat:hover {
     right: 328px;
     bottom: 82px;
   }
+  .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-topbar,
   .ck-shell.is-theater.has-penetration:not(.is-following) .ck-map-fab {
     right: 328px;
   }
@@ -5414,6 +5472,9 @@ button.ck-mini-stat:hover {
 @media (min-width: 1101px) and (max-width: 1280px) {
   .ck-shell:not(.is-theater) .ck-map-fab {
     right: 318px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: calc(100vw - 836px);
   }
 }
 .ck-tb-badge {
@@ -5904,7 +5965,11 @@ button.ck-mini-stat:hover {
 }
 .ck-staff-directory-toggle {
   border-left: var(--hair) solid var(--ck-line);
-  border-radius: 0;
+  border-radius: 0 var(--r-xs) var(--r-xs) 0;
+}
+.ck-staff-directory-toggle.active {
+  color: var(--primary);
+  background: var(--primary-soft);
 }
 .ck-staff-directory-toggle:hover,
 .ck-directory-close:hover { color: var(--ck-ink); }
@@ -6065,7 +6130,7 @@ button.ck-mini-stat:hover {
 }
 .ck-shell.is-theater .ck-follow-capsule {
   bottom: 18px;
-  max-width: min(880px, calc(100vw - 440px));
+  max-width: min(760px, calc(100vw - 560px));
 }
 .ck-fc-who {
   display: flex;
